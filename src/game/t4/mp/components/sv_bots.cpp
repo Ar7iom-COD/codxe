@@ -381,12 +381,6 @@ static void GScr_AddTestClient()
 
 // ---------------------------------------------------------------------------
 // kick(<clientNum>) / kick(<clientNum>, <reason>)
-//
-// Drops a client off the server. Bot Warfare calls this as
-//   kick( bots[i] getentitynumber() )
-//   kick( tempBot getentitynumber(), "EXE_PLAYERKICKED" )
-// from _bot.gsc and _menu.gsc to remove bots when auto-balancing teams or
-// when the "Kick a bot" menu entry is picked.
 // ---------------------------------------------------------------------------
 
 static void GScr_Kick()
@@ -416,10 +410,6 @@ static void GScr_Kick()
 
 // ---------------------------------------------------------------------------
 // <entity> getentitynumber()
-//
-// Returns the entity's index. Stock CoD GSC builtin on most titles; if T4
-// doesn't expose it, this stub bridges the gap. The entnum is already in
-// scr_entref_t (the arg the engine passed us), so it's a trivial getter.
 // ---------------------------------------------------------------------------
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -432,10 +422,6 @@ static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
 
 // ---------------------------------------------------------------------------
 // <entity> getguid()
-//
-// Returns the player's XUID as a string. Bot Warfare uses this to identify
-// the host player when bots_main_firstIsHost / bots_main_GUIDs are configured.
-// Reads from clientBW_t.userinfo via Info_ValueForKey("xuid").
 // ---------------------------------------------------------------------------
 
 static void PlayerCmd_GetGuid(scr_entref_t entref)
@@ -459,8 +445,6 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
         return;
     }
 
-    // Bots have no XUID. Return clientNum as a stable per-bot identifier so
-    // BW's host-detection dvars still compare cleanly.
     if (cl->header.netchan.remoteAddress.type == NA_BOT)
     {
         Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
@@ -470,14 +454,10 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
     const char *xuidStr = Info_ValueForKey(cl->userinfo, "xuid");
     if (!xuidStr || !*xuidStr)
     {
-        // Fallback: clientNum
         Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
         return;
     }
 
-    // XUIDs are 64-bit but BW only ever does string comparisons against
-    // them, so returning as string (and BW will do `getguid() + ""` to
-    // stringify when comparing against the dvar) is correct.
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
