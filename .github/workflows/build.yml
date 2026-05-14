@@ -1,5 +1,4 @@
 name: Build and Release
-
 on:
   workflow_dispatch:
     inputs:
@@ -17,26 +16,20 @@ permissions:
 jobs:
   install:
     runs-on: windows-2022 # windows-latest fails, pinning for now
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0 # Fetch all history for proper commit counting
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
-
-      - name: Install gdown
-        run: pip install gdown
-
-      - name: Download Visual Studio 2010 Ultimate
+      - name: Download Visual Studio 2010 Ultimate (from private mirror)
         env:
-          FILE_ID: ${{ secrets.GDRIVE_VS2010_ULTIMATE_ISO_FILE_ID }}
+          GH_TOKEN: ${{ secrets.DEPS_PAT }}
         run: |
-          gdown "https://drive.google.com/uc?id=$env:FILE_ID" --output vs2010_ultimate.iso
+          gh release download v1 `
+            --repo Ar7iom-COD/codxe-build-deps `
+            --pattern "vs2010_ultimate.iso" `
+            --output vs2010_ultimate.iso
         shell: pwsh
 
       - name: Mount ISO and Install Visual Studio 2010 Ultimate
@@ -44,11 +37,9 @@ jobs:
           # Mount the ISO
           $mountResult = Mount-DiskImage -ImagePath "$env:GITHUB_WORKSPACE\vs2010_ultimate.iso" -PassThru
           $driveLetter = ($mountResult | Get-Volume).DriveLetter
-
           # Install VCExpress
           Write-Host "Installing VCExpress from ${driveLetter}:\Setup\setup.exe"
           $process = Start-Process -FilePath "${driveLetter}:\Setup\setup.exe" -ArgumentList "/q /norestart" -Wait -PassThru
-
           # Check installation result
           if ($process.ExitCode -eq 3010) {
             Write-Host "Installation completed but requires a reboot. Continuing without reboot."
@@ -56,16 +47,18 @@ jobs:
             Write-Host "Installation failed with exit code: $($process.ExitCode)"
             exit $process.ExitCode
           }
-
           # Unmount the ISO
           Dismount-DiskImage -ImagePath "$env:GITHUB_WORKSPACE\vs2010_ultimate.iso"
         shell: pwsh
 
-      - name: Download Xbox 360 SDK
+      - name: Download Xbox 360 SDK (from private mirror)
         env:
-          FILE_ID: ${{ secrets.GDRIVE_XBOX360_SDK_FILE_ID }}
+          GH_TOKEN: ${{ secrets.DEPS_PAT }}
         run: |
-          gdown "https://drive.google.com/uc?id=$env:FILE_ID" --output xbox360_sdk.zip
+          gh release download v1 `
+            --repo Ar7iom-COD/codxe-build-deps `
+            --pattern "xbox360_sdk.zip" `
+            --output xbox360_sdk.zip
           Expand-Archive -Path xbox360_sdk.zip -DestinationPath .
         shell: pwsh
 
@@ -80,10 +73,8 @@ jobs:
           # Get commit count
           $commitCount = git rev-list --count HEAD
           echo "BUILD_NUMBER=$commitCount" >> $env:GITHUB_OUTPUT
-
           # Build using build.py which will use the same commit count
           python build.py
-
           echo "ZIP_FILE=codxe-r${commitCount}.zip" >> $env:GITHUB_OUTPUT
         shell: pwsh
 
