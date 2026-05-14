@@ -157,6 +157,22 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
         return;
 
+    // CRITICAL: On Xenia, the HOST player has xuid == 0 (no XLive XUID), which
+    // means SV_BotFrame's "xuid==0 -> call SV_BotUserMove" logic will fire for
+    // the host. We must NOT inject bot input into the host's connection, or
+    // gametype state machine hangs at "Waiting for players..." because the
+    // host's usercmd stream is replaced with our empty cmd every server tick.
+    //
+    // Real bots are marked via:
+    //   - client_t.isTestClient != 0 (set by SV_AddTestClient at +0xB561C)
+    //   - client_t.header.netchan.remoteAddress.type == NA_BOT
+    // BOTH should be true for an actual bot. If either is false, fall out and
+    // let the engine's normal input path handle this client.
+    if (cl->isTestClient == 0)
+        return;
+    if (cl->header.netchan.remoteAddress.type != NA_BOT)
+        return;
+
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
 
@@ -379,85 +395,62 @@ static void GScr_AddTestClient()
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
 }
 
-// ---------------------------------------------------------------------------
-// kick(<clientNum>) / kick(<clientNum>, <reason>)
-// ---------------------------------------------------------------------------
-
 static void GScr_Kick()
 {
     const int nparam = Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER);
     if (nparam < 1 || nparam > 2)
         Scr_Error_BW("Usage: kick(<clientNum>) or kick(<clientNum>, <reason>)",
                      SCRIPTINSTANCE_SERVER);
-
     const int clientNum = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
         Scr_ParamError_BW(0, va_BW("kick: clientNum %i out of range", clientNum),
                           SCRIPTINSTANCE_SERVER);
-
     const char *reason = "EXE_PLAYERKICKED";
     if (nparam == 2)
     {
         const char *r = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
-        if (r && *r)
-            reason = r;
+        if (r && *r) reason = r;
     }
-
     clientBW_t *cl = BW_GetClient(clientNum);
     if (cl && cl->header.state >= CS_CONNECTED)
         SV_DropClient(cl, reason, true);
 }
 
-// ---------------------------------------------------------------------------
-// <entity> getentitynumber()
-// ---------------------------------------------------------------------------
-
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
 {
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
         Scr_Error_BW("Usage: <entity> getentitynumber()", SCRIPTINSTANCE_SERVER);
-
     Scr_AddInt_BW(static_cast<int>(entref.entnum), SCRIPTINSTANCE_SERVER);
 }
-
-// ---------------------------------------------------------------------------
-// <entity> getguid()
-// ---------------------------------------------------------------------------
 
 static void PlayerCmd_GetGuid(scr_entref_t entref)
 {
     if (entref.classnum != 0)
         Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
-
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
         Scr_Error_BW("Usage: <player> getguid()", SCRIPTINSTANCE_SERVER);
-
     if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
     {
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
         return;
     }
-
     clientBW_t *cl = BW_GetClient(entref.entnum);
     if (!cl)
     {
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
         return;
     }
-
     if (cl->header.netchan.remoteAddress.type == NA_BOT)
     {
         Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
         return;
     }
-
     const char *xuidStr = Info_ValueForKey(cl->userinfo, "xuid");
     if (!xuidStr || !*xuidStr)
     {
         Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
         return;
     }
-
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
