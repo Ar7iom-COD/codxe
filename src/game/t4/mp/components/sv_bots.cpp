@@ -380,6 +380,108 @@ static void GScr_AddTestClient()
 }
 
 // ---------------------------------------------------------------------------
+// kick(<clientNum>) / kick(<clientNum>, <reason>)
+//
+// Drops a client off the server. Bot Warfare calls this as
+//   kick( bots[i] getentitynumber() )
+//   kick( tempBot getentitynumber(), "EXE_PLAYERKICKED" )
+// from _bot.gsc and _menu.gsc to remove bots when auto-balancing teams or
+// when the "Kick a bot" menu entry is picked.
+// ---------------------------------------------------------------------------
+
+static void GScr_Kick()
+{
+    const int nparam = Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER);
+    if (nparam < 1 || nparam > 2)
+        Scr_Error_BW("Usage: kick(<clientNum>) or kick(<clientNum>, <reason>)",
+                     SCRIPTINSTANCE_SERVER);
+
+    const int clientNum = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+        Scr_ParamError_BW(0, va_BW("kick: clientNum %i out of range", clientNum),
+                          SCRIPTINSTANCE_SERVER);
+
+    const char *reason = "EXE_PLAYERKICKED";
+    if (nparam == 2)
+    {
+        const char *r = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
+        if (r && *r)
+            reason = r;
+    }
+
+    clientBW_t *cl = BW_GetClient(clientNum);
+    if (cl && cl->header.state >= CS_CONNECTED)
+        SV_DropClient(cl, reason, true);
+}
+
+// ---------------------------------------------------------------------------
+// <entity> getentitynumber()
+//
+// Returns the entity's index. Stock CoD GSC builtin on most titles; if T4
+// doesn't expose it, this stub bridges the gap. The entnum is already in
+// scr_entref_t (the arg the engine passed us), so it's a trivial getter.
+// ---------------------------------------------------------------------------
+
+static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <entity> getentitynumber()", SCRIPTINSTANCE_SERVER);
+
+    Scr_AddInt_BW(static_cast<int>(entref.entnum), SCRIPTINSTANCE_SERVER);
+}
+
+// ---------------------------------------------------------------------------
+// <entity> getguid()
+//
+// Returns the player's XUID as a string. Bot Warfare uses this to identify
+// the host player when bots_main_firstIsHost / bots_main_GUIDs are configured.
+// Reads from clientBW_t.userinfo via Info_ValueForKey("xuid").
+// ---------------------------------------------------------------------------
+
+static void PlayerCmd_GetGuid(scr_entref_t entref)
+{
+    if (entref.classnum != 0)
+        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> getguid()", SCRIPTINSTANCE_SERVER);
+
+    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    clientBW_t *cl = BW_GetClient(entref.entnum);
+    if (!cl)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    // Bots have no XUID. Return clientNum as a stable per-bot identifier so
+    // BW's host-detection dvars still compare cleanly.
+    if (cl->header.netchan.remoteAddress.type == NA_BOT)
+    {
+        Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    const char *xuidStr = Info_ValueForKey(cl->userinfo, "xuid");
+    if (!xuidStr || !*xuidStr)
+    {
+        // Fallback: clientNum
+        Scr_AddInt_BW(entref.entnum, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    // XUIDs are 64-bit but BW only ever does string comparisons against
+    // them, so returning as string (and BW will do `getguid() + ""` to
+    // stringify when comparing against the dvar) is correct.
+    Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
+}
+
+// ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
 
@@ -389,6 +491,7 @@ static struct
     BuiltinFunction handler;
 } sv_bots_functions[] = {
     {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
 
@@ -397,10 +500,12 @@ static struct
     const char   *name;
     BuiltinMethod handler;
 } sv_bots_methods[] = {
-    {"botmoveto", Scr_BotMoveTo},
-    {"botaction", Scr_BotAction},
-    {"botmirror", Scr_BotMirror},
-    {"botstop",   Scr_BotStop},
+    {"botmoveto",         Scr_BotMoveTo},
+    {"botaction",         Scr_BotAction},
+    {"botmirror",         Scr_BotMirror},
+    {"botstop",           Scr_BotStop},
+    {"getentitynumber",   PlayerCmd_GetEntityNumber},
+    {"getguid",           PlayerCmd_GetGuid},
     {nullptr, nullptr},
 };
 
