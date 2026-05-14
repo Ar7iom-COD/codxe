@@ -35,10 +35,10 @@ namespace bw
 
 // ---- Sanity --------------------------------------------------------------
 
-static constexpr size_t kClientTSize     = 0xB762C;
-static constexpr int    MAX_CLIENTS_BW   = 18;
-static constexpr int    PACKET_BACKUP_BW = 32;
-static constexpr int    T4_PROTOCOL      = 0x5C;
+static const size_t kClientTSize     = 0xB762C;
+static const int    MAX_CLIENTS_BW   = 18;
+static const int    PACKET_BACKUP_BW = 32;
+static const int    T4_PROTOCOL      = 0x5C;
 
 // ---- Enums ---------------------------------------------------------------
 
@@ -199,7 +199,7 @@ static_assert(offsetof(clientBW_t, ping)                               == 0xB562
 
 // ---- gclient_s.isTestClient mirror --------------------------------------
 
-static constexpr ptrdiff_t kGClientIsTestClientOffset = 0x39BC;
+static const ptrdiff_t kGClientIsTestClientOffset = 0x39BC;
 
 inline bool IsTestClient_Fast(const gclient_s *clients, int clientNum)
 {
