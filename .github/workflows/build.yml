@@ -22,14 +22,19 @@ jobs:
         with:
           fetch-depth: 0 # Fetch all history for proper commit counting
 
-      - name: Download Visual Studio 2010 Ultimate (from private mirror)
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Download Visual Studio 2010 Ultimate (Google Drive)
         env:
-          GH_TOKEN: ${{ secrets.DEPS_PAT }}
+          FILE_ID: ${{ secrets.GDRIVE_VS2010_ULTIMATE_ISO_FILE_ID }}
         run: |
-          gh release download v1 `
-            --repo Ar7iom-COD/codxe-build-deps `
-            --pattern "vs2010_ultimate.iso" `
-            --output vs2010_ultimate.iso
+          gdown "https://drive.google.com/uc?id=$env:FILE_ID" --output vs2010_ultimate.iso
         shell: pwsh
 
       - name: Mount ISO and Install Visual Studio 2010 Ultimate
@@ -51,7 +56,7 @@ jobs:
           Dismount-DiskImage -ImagePath "$env:GITHUB_WORKSPACE\vs2010_ultimate.iso"
         shell: pwsh
 
-      - name: Download Xbox 360 SDK (from private mirror)
+      - name: Download Xbox 360 SDK (from private GitHub mirror)
         env:
           GH_TOKEN: ${{ secrets.DEPS_PAT }}
         run: |
