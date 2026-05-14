@@ -65,12 +65,14 @@ jobs:
         env:
           FILE_ID: ${{ secrets.GDRIVE_XBOX360_SDK_FILE_ID }}
         run: |
-          gdown "https://drive.google.com/uc?id=$env:FILE_ID" --output xbox360_sdk.exe
+          gdown "https://drive.google.com/uc?id=$env:FILE_ID" --output xbox360_sdk.zip
+          Expand-Archive -Path xbox360_sdk.zip -DestinationPath .
         shell: pwsh
 
       - name: Install Xbox 360 SDK
         run: |
-          Start-Process -FilePath "xbox360_sdk.exe" -ArgumentList "/U", "/T full" -Wait
+          Start-Process -FilePath "XBOX360 SDK 21256.3.exe" -ArgumentList "/U", "/T full" -Wait
+        shell: pwsh
 
       - name: Build Plugin
         id: build
