@@ -151,27 +151,64 @@ static Detour SV_BotUserMove_Detour;
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
+    {
+        // Pass non-game clients through to engine
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
 
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+    {
+        // Index out of range — let engine handle it
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
 
-    // CRITICAL: On Xenia, the HOST player has xuid == 0 (no XLive XUID), which
-    // means SV_BotFrame's "xuid==0 -> call SV_BotUserMove" logic will fire for
-    // the host. We must NOT inject bot input into the host's connection, or
-    // gametype state machine hangs at "Waiting for players..." because the
-    // host's usercmd stream is replaced with our empty cmd every server tick.
+    // ========================================================================
+    // GEMINI FIX D — diagnostic logging + call-original guards
+    // ------------------------------------------------------------------------
+    // On Xenia, SV_BotFrame calls us for the HOST because host.xuid == 0.
+    // We must NOT inject bot input for the host, OR for any non-bot client.
     //
-    // Real bots are marked via:
-    //   - client_t.isTestClient != 0 (set by SV_AddTestClient at +0xB561C)
-    //   - client_t.header.netchan.remoteAddress.type == NA_BOT
-    // BOTH should be true for an actual bot. If either is false, fall out and
-    // let the engine's normal input path handle this client.
-    if (cl->isTestClient == 0)
-        return;
+    // Defense in depth:
+    //   1. If remoteAddress.type != NA_BOT (host/network client), pass to original.
+    //   2. If isTestClient == 0 (not a test client), pass to original.
+    //
+    // KEY RISK: if our struct offsets are wrong, the host might falsely match
+    // NA_BOT (because uninitialized memory often reads as zero, and NA_BOT == 0).
+    // We log the FIRST 4 invocations to verify our offsets are correct.
+    // ========================================================================
+    static int s_diagCount = 0;
+    if (s_diagCount < 4)
+    {
+        DbgPrint("sv_bots: [BOTMOVE-DIAG #%d] cn=%d remoteAddr.type=%d isTestClient=%d gentity=%p\n",
+                 s_diagCount,
+                 clientNum,
+                 static_cast<int>(cl->header.netchan.remoteAddress.type),
+                 cl->isTestClient,
+                 cl->gentity);
+        s_diagCount++;
+    }
+
+    // Guard 1: real network/host clients should never hit our bot AI
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
+
+    // Guard 2: must be a real test client
+    if (cl->isTestClient == 0)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
+
+    // ========================================================================
+    // PAST THIS POINT: this client is confirmed a real bot we spawned.
+    // Inject GSC-driven usercmd.
+    // ========================================================================
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -510,21 +547,64 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // Module lifecycle
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// DIAGNOSTIC TOGGLES (r283) — per Gemini suggestion
+// ---------------------------------------------------------------------------
+// Set all to FALSE for the first diagnostic build. If WaW pregame works with
+// all three detours OFF, the freeze is conclusively in our detours.
+// Then re-enable ONE at a time across r284, r285, r286 to identify which.
+//
+// Order to test (per Gemini ranking):
+//   r283: all OFF                          — baseline ("does WaW work at all?")
+//   r284: WEAPON_HOOK = true               — Gemini's #1 suspect
+//   r285: USERINFO_HOOK = true             — Gemini's #2 suspect
+//   r286: BOT_USER_MOVE = true             — lowest probability per Gemini
+// ===========================================================================
+static const bool g_enableWeaponHook   = false;
+static const bool g_enableUserinfoHook = false;
+static const bool g_enableBotUserMove  = false;
+
 sv_bots::sv_bots()
 {
     DbgPrint("sv_bots: installing T4 BW detours\n");
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
+             g_enableWeaponHook, g_enableUserinfoHook, g_enableBotUserMove);
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
 
-    G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-    G_SelectWeaponIndex_Detour.Install();
+    if (g_enableWeaponHook)
+    {
+        G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
+        G_SelectWeaponIndex_Detour.Install();
+        DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
+    }
+    else
+    {
+        DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (diagnostic)\n");
+    }
 
-    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    SV_BotUserMove_Detour.Install();
+    if (g_enableBotUserMove)
+    {
+        SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
+        SV_BotUserMove_Detour.Install();
+        DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
+    }
+    else
+    {
+        DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
+    }
 
-    SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
-    SV_UserinfoChanged_Detour.Install();
+    if (g_enableUserinfoHook)
+    {
+        SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
+        SV_UserinfoChanged_Detour.Install();
+        DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
+    }
+    else
+    {
+        DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
+    }
 
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
@@ -533,9 +613,9 @@ sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: removing T4 BW detours\n");
 
-    G_SelectWeaponIndex_Detour.Remove();
-    SV_BotUserMove_Detour.Remove();
-    SV_UserinfoChanged_Detour.Remove();
+    if (g_enableWeaponHook)   G_SelectWeaponIndex_Detour.Remove();
+    if (g_enableBotUserMove)  SV_BotUserMove_Detour.Remove();
+    if (g_enableUserinfoHook) SV_UserinfoChanged_Detour.Remove();
 
     CleanBotArray();
 }
