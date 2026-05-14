@@ -68,9 +68,6 @@ typedef void (*SV_UserinfoChanged_t)(clientBW_t *cl);
 static SV_UserinfoChanged_t SV_UserinfoChanged =
     reinterpret_cast<SV_UserinfoChanged_t>(0x82280690);
 
-// Low-level client drop. Used by GSC kick() to force a bot off the server.
-// Verified address from Ghidra session: function string "Going to CS_ZOMBIE
-// from %i for %s\n". Signature matches Quake3/CoD pattern.
 typedef void (*SV_DropClient_t)(clientBW_t *cl, const char *reason, bool tellThem);
 static SV_DropClient_t SV_DropClient =
     reinterpret_cast<SV_DropClient_t>(0x8227FDE0);
@@ -210,4 +207,3 @@ static G_SelectWeaponIndex_t G_SelectWeaponIndex =
 } // namespace bw
 } // namespace mp
 } // namespace t4
-    
