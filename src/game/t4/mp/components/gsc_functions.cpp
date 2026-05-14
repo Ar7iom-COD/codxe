@@ -6,6 +6,9 @@ namespace t4
 namespace mp
 {
 
+// Forward decl from sv_bots.cpp — registers BW-specific GSC builtins.
+extern "C" BuiltinFunction BW_LookupFunction(const char *name);
+
 /**
  * Checks if a 3D point is contained within an axis-aligned bounding box
  */
@@ -56,6 +59,11 @@ BuiltinFunction Scr_GetFunction_Hook(const char **pName, int *type)
             if (_stricmp(*pName, func->name) == 0)
                 return func->handler;
         }
+
+        // BW dispatch — checked after gsc_functions own table, before
+        // falling through to the engine. Returns nullptr if not a BW name.
+        if (BuiltinFunction bw = BW_LookupFunction(*pName))
+            return bw;
     }
     return Scr_GetFunction_Detour.GetOriginal<decltype(&Scr_GetFunction_Hook)>()(pName, type);
 }
