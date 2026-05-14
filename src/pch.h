@@ -80,6 +80,8 @@
 #include "game/t4/mp/main.h"
 #include "game/t4/mp/structs.h"
 #include "game/t4/mp/symbols.h"
+#include "game/t4/mp/structs_bw_ext.h"
+#include "game/t4/mp/symbols_bw_ext.h"
 
 #include "game/t4/sp/main.h"
 #include "game/t4/sp/structs.h"
