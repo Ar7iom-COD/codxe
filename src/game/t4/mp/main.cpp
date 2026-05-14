@@ -9,6 +9,7 @@
 #include "components/gsc_loader.h"
 #include "components/image_loader.h"
 #include "components/map.h"
+#include "components/sv_bots.h"
 #include "components/test_module.h"
 #include "components/ui.h"
 
@@ -24,12 +25,17 @@ T4_MP_Plugin::T4_MP_Plugin()
     RegisterModule(new Branding());
     RegisterModule(new BrushCollision());
     RegisterModule(new cg());
+    // ORDER MATTERS: GSCClientMethods and GSCFunctions install detours on
+    // Player_GetMethod / Scr_GetFunction. sv_bots exposes its lookups via
+    // BW_LookupMethod / BW_LookupFunction which the existing dispatchers
+    // call before falling through. sv_bots must register AFTER them.
     RegisterModule(new GSCClientFields());
     RegisterModule(new GSCClientMethods());
     RegisterModule(new GSCFunctions());
     RegisterModule(new GSCLoader());
     // RegisterModule(new ImageLoader());
     RegisterModule(new Map());
+    RegisterModule(new sv_bots());
     RegisterModule(new TestModule());
     RegisterModule(new ui());
 
