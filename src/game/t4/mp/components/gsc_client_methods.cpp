@@ -6,6 +6,10 @@ namespace t4
 namespace mp
 {
 
+// Forward decl from sv_bots.cpp — registers BW-specific GSC player methods:
+// botMoveTo, botAction, botMirror, botStop.
+extern "C" BuiltinMethod BW_LookupMethod(const char *name);
+
 int CL_IsKeyPressed(const int localClientNum, const char *keyName)
 {
     const int keynum = Key_StringToKeynum(keyName);
@@ -179,6 +183,11 @@ BuiltinMethod Player_GetMethod_Hook(const char **pName)
             if (_stricmp(*pName, func->name) == 0)
                 return func->handler;
         }
+
+        // BW dispatch — checked after gsc_player_methods own table, before
+        // falling through to the engine. Returns nullptr if not a BW name.
+        if (BuiltinMethod bw = BW_LookupMethod(*pName))
+            return bw;
     }
 
     return Player_GetMethod_Detour.GetOriginal<decltype(Player_GetMethod)>()(pName);
