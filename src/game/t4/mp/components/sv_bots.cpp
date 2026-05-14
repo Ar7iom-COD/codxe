@@ -550,61 +550,58 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ===========================================================================
 // DIAGNOSTIC TOGGLES (r283) — per Gemini suggestion
 // ---------------------------------------------------------------------------
-// Set all to FALSE for the first diagnostic build. If WaW pregame works with
+// Set all to 0 for the first diagnostic build. If WaW pregame works with
 // all three detours OFF, the freeze is conclusively in our detours.
 // Then re-enable ONE at a time across r284, r285, r286 to identify which.
 //
 // Order to test (per Gemini ranking):
-//   r283: all OFF                          — baseline ("does WaW work at all?")
-//   r284: WEAPON_HOOK = true               — Gemini's #1 suspect
-//   r285: USERINFO_HOOK = true             — Gemini's #2 suspect
-//   r286: BOT_USER_MOVE = true             — lowest probability per Gemini
+//   r283: all 0                            — baseline ("does WaW work at all?")
+//   r284: ENABLE_WEAPON_HOOK = 1           — Gemini's #1 suspect
+//   r285: ENABLE_USERINFO_HOOK = 1         — Gemini's #2 suspect
+//   r286: ENABLE_BOTUSERMOVE = 1           — lowest probability per Gemini
+//
+// NOTE: using #define preprocessor macros instead of `static const bool` to
+// avoid VS2010 warning C4127 (conditional expression is constant), which is
+// promoted to error by /WX.
 // ===========================================================================
-static const bool g_enableWeaponHook   = false;
-static const bool g_enableUserinfoHook = false;
-static const bool g_enableBotUserMove  = false;
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK    0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK  0
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE    0
 
 sv_bots::sv_bots()
 {
     DbgPrint("sv_bots: installing T4 BW detours\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
-             g_enableWeaponHook, g_enableUserinfoHook, g_enableBotUserMove);
+             CODXE_DIAG_ENABLE_WEAPON_HOOK,
+             CODXE_DIAG_ENABLE_USERINFO_HOOK,
+             CODXE_DIAG_ENABLE_BOTUSERMOVE);
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
 
-    if (g_enableWeaponHook)
-    {
-        G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-        G_SelectWeaponIndex_Detour.Install();
-        DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
-    }
-    else
-    {
-        DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (diagnostic)\n");
-    }
+#if CODXE_DIAG_ENABLE_WEAPON_HOOK
+    G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
+    G_SelectWeaponIndex_Detour.Install();
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (diagnostic)\n");
+#endif
 
-    if (g_enableBotUserMove)
-    {
-        SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-        SV_BotUserMove_Detour.Install();
-        DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
-    }
-    else
-    {
-        DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
-    }
+#if CODXE_DIAG_ENABLE_BOTUSERMOVE
+    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
+    SV_BotUserMove_Detour.Install();
+    DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
+#endif
 
-    if (g_enableUserinfoHook)
-    {
-        SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
-        SV_UserinfoChanged_Detour.Install();
-        DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
-    }
-    else
-    {
-        DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
-    }
+#if CODXE_DIAG_ENABLE_USERINFO_HOOK
+    SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
+    SV_UserinfoChanged_Detour.Install();
+    DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
+#endif
 
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
@@ -613,9 +610,15 @@ sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: removing T4 BW detours\n");
 
-    if (g_enableWeaponHook)   G_SelectWeaponIndex_Detour.Remove();
-    if (g_enableBotUserMove)  SV_BotUserMove_Detour.Remove();
-    if (g_enableUserinfoHook) SV_UserinfoChanged_Detour.Remove();
+#if CODXE_DIAG_ENABLE_WEAPON_HOOK
+    G_SelectWeaponIndex_Detour.Remove();
+#endif
+#if CODXE_DIAG_ENABLE_BOTUSERMOVE
+    SV_BotUserMove_Detour.Remove();
+#endif
+#if CODXE_DIAG_ENABLE_USERINFO_HOOK
+    SV_UserinfoChanged_Detour.Remove();
+#endif
 
     CleanBotArray();
 }
