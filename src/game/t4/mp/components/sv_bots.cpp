@@ -579,7 +579,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK    0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK  0
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE    0
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE    1
 
 sv_bots::sv_bots()
 {
