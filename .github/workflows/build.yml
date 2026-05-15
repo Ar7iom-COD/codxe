@@ -58,7 +58,7 @@ jobs:
 
       - name: Download Xbox 360 SDK (from private GitHub mirror)
         env:
-          GH_TOKEN: ${{ secrets.DEPS_PAT }}
+          GH_TOKEN: ${{ secrets.SDK_REPO_PAT }}
         run: |
           gh release download v1 `
             --repo Ar7iom-COD/codxe-build-deps `
