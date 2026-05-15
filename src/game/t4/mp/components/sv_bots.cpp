@@ -45,6 +45,19 @@
 #include <cmath>
 #include <cstring>
 
+// MSVC C4505: "unreferenced local function has been removed". Our static
+// hook bodies (G_SelectWeaponIndex_Hook, SV_BotUserMove_Stub,
+// SV_UserinfoChanged_Hook) are address-only references — their function
+// pointers are passed to Detour() but they are never called directly from
+// C++. The optimizer can't see the address-take through the constructor
+// argument, so it complains. /WX promotes this to an error.
+//
+// Disabling at file scope keeps the rest of the project's warnings-as-
+// errors policy intact while letting this file build with the
+// CODXE_DIAG_* toggles turned off (which is exactly when the hooks
+// become statically unreferenced).
+#pragma warning(disable: 4505)
+
 namespace t4
 {
 namespace mp
