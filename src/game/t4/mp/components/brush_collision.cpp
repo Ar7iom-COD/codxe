@@ -130,8 +130,8 @@ void CG_DrawActive_Hook(int localClientNum)
 BrushCollision::BrushCollision()
 {
     DbgPrint("BrushCollision initialized\n");
-    Sleep(1000); // Wait for the game to initialize
-
+ if (!xbox::IsXenia())
+       Sleep(1000); // Wait for the game to initialize (skipped on Xenia)
     noclip_brushes = Dvar_RegisterString("noclip_brushes", "", DVAR_CODINFO,
                                          "Space separated list of brushes to disable collision on.");
 
