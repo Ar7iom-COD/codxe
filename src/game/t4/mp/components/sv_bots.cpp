@@ -325,7 +325,7 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
-#define CODXE_DIAG_ENABLE_CONNECT_PROBES      1  // r291: probe engine bot-spawn path
+#define CODXE_DIAG_ENABLE_CONNECT_PROBES      0  // r291: probe engine bot-spawn path
 
 // ===========================================================================
 // r291 connection-path probes — entry/exit tracing for engine bot-spawn path
