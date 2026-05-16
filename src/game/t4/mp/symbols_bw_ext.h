@@ -269,71 +269,82 @@ static G_SelectWeaponIndex_t G_SelectWeaponIndex =
 
 // ---- Engine globals (Path C slot-finding) -------------------------------
 //
-// Verified from SV_AddTestClient + SV_ClientEnterWorld + SV_SendClientGameState
-// decompiles (TU7 default_mp.xex). Path C uses these DIRECTLY rather than
-// trusting stock codxe T4's svsHeader, which has been wrong about many
-// offsets this session.
+// *** r309: addresses corrected after the r308 SYSTEM REPORT ***
 //
-// Each is the ADDRESS OF a global, not the global's value. The engine code
-// does e.g. `piVar18 = DAT_830afc90;` — a load — so 0x830AFC90 holds a
-// pointer; the clients array base is *(void**)0x830AFC90.
+// The r308 build proved the four addresses we had traced from the
+// SV_AddTestClient decompile (0x830AFC90, 0x82FF7C08, 0x82FF7A08,
+// 0x82FF7A0C) ALL read 0x00000000 — they are empty memory, not the
+// engine globals. They were the only UNVERIFIED items in the address
+// map and the report disproved them outright.
 //
-//   DAT_830afc90  → svs.clients      base pointer   (client_t array)
-//   DAT_82ff7c08  → sv                struct ptr; sv_maxclients at +0xC
-//   DAT_82ff7a08  → g_entities        base pointer  (gentity_s array)
-//   DAT_82ff7a0c  → sizeof(gentity_s) stride        (int)
+// The CORRECT T4 globals come from stock codxe's own T4 source, where
+// they are confirmed by `static_assert` on every struct offset:
+//   - src/game/t4/mp/symbols.h
+//   - src/game/t4/mp/structs.h
 //
-// client_t stride = 0xB762C (verified: SV_AddTestClient `piVar18 += 0x2dd8b`
-// int-steps = 0x2dd8b * 4 = 0xB762C; and EnterWorld `/ 0xb762c`).
+//   svsHeader  = 0x84F85100   serverStaticHeader_t*
+//                  .clients @ +0x0  -> client_t*  (THE client array base)
+//                  .time    @ +0x4  -> int        (server time)
+//   g_entities = 0x82BAD1B0   gentity_s*  (flat array, stride 0x330)
+//
+// client_t : sizeof = 751148 = 0xB762C  (matches structs_bw_ext.h kClientTSize)
+//            .name    @ 0x21328   (structs_bw_ext.h verified)
+//            .gentity @ 0x21324   (structs_bw_ext.h verified via SV_ClientEnterWorld
+//                                  decompile puVar2[0x84c9]; stock codxe's
+//                                  structs.h 0x213F4 is its lastPacketTime)
+//   gentity_s : sizeof = 816 = 0x330  (stock codxe structs.h static_assert)
+//
+// NOTE: client_t field ACCESS goes through clientBW_t in structs_bw_ext.h,
+// which carries its own static_asserts. The addresses below are only for
+// the array bases and the constants used directly in sv_bots.cpp.
 
-// Raw addresses of the engine globals — kept as named constants so the
-// SYSTEM REPORT diagnostic can probe BOTH interpretations (base vs pointer)
-// without re-typing magic numbers.
-static const unsigned int BW_ADDR_SVS_CLIENTS = 0x830AFC90;  // svs.clients
-static const unsigned int BW_ADDR_SV_STRUCT   = 0x82FF7C08;  // sv struct
-static const unsigned int BW_ADDR_G_ENTITIES  = 0x82FF7A08;  // g_entities base
-static const unsigned int BW_ADDR_G_ENT_SIZE  = 0x82FF7A0C;  // sizeof(gentity_s)
+// --- raw addresses (codxe-verified T4) -----------------------------------
+static const unsigned int BW_ADDR_SVSHEADER  = 0x84F85100;  // serverStaticHeader_t*
+static const unsigned int BW_ADDR_G_ENTITIES = 0x82BAD1B0;  // gentity_s array base
 
-// Verified client_t stride (SV_AddTestClient `piVar18 += 0x2dd8b` → ×4).
-static const unsigned int BW_CLIENT_STRIDE = 0xB762C;
+// --- verified struct metrics ---------------------------------------------
+static const unsigned int BW_CLIENT_STRIDE   = 0xB762C;     // sizeof(client_t) = 751148
+static const unsigned int BW_CLIENT_NAME_OFF = 0x21328;     // client_t.name
+static const unsigned int BW_GENTITY_STRIDE  = 0x330;       // sizeof(gentity_s) = 816
 
-// Verified client_t.name offset (SV_SendClientGameState/EnterWorld DPrintf
-// use `param_1 + 0x21328`).
-static const unsigned int BW_CLIENT_NAME_OFF = 0x21328;
+// serverStaticHeader_t is { client_t* clients @0x0; int time @0x4; }.
+// svsHeader is a POINTER to that 2-field struct.
 
 // svs.clients — the client_t array base.
-//
-// CURRENT INTERPRETATION: 0x830AFC90 HOLDS A POINTER to the array (one
-// dereference). This is unverified — the SYSTEM REPORT in sv_bots.cpp dumps
-// both this and the no-deref interpretation so a single run settles it.
+//   svsHeader (0x84F85100) points at serverStaticHeader_t;
+//   .clients is its first member (offset 0), itself a client_t*.
+//   => array base = *(client_t**)(*(serverStaticHeader_t**)0x84F85100 + 0)
+// In practice svsHeader is the struct address, so .clients = *(0x84F85100).
 static inline clientBW_t *BW_svs_clients()
 {
-    return *reinterpret_cast<clientBW_t *const *>(BW_ADDR_SVS_CLIENTS);
+    // svsHeader is the address of the header struct; .clients @ +0x0.
+    const unsigned int hdr = BW_ADDR_SVSHEADER;
+    return *reinterpret_cast<clientBW_t *const *>(hdr + 0x0);
+}
+
+// Server time — serverStaticHeader_t.time @ +0x4.
+static inline int BW_svs_time()
+{
+    return *reinterpret_cast<const int *>(BW_ADDR_SVSHEADER + 0x4);
 }
 
 // sv_maxclients.
 //
 // T4 MP MAX_CLIENTS is a verified constant: 18 (confirmed in-game — the
-// Private Match lobby shows "1/18 Players"). The previous engine-memory
-// read (*(0x82FF7C08) treated as a pointer, then +0xC) returned 0 because
-// 0x82FF7C08 is almost certainly the sv struct BASE, not a pointer to it,
-// and sv's first field reads 0. Rather than guess the indirection, use the
-// constant: Path C's slot loops are bounded by MAX_CLIENTS_BW and check
-// per-slot state, so the constant is safe and correct.
+// Private Match lobby shows "1/18 Players"). T4's sv struct address was
+// never verified; rather than guess, use the constant. Path C's slot
+// loops are bounded by MAX_CLIENTS_BW and check per-slot state, so the
+// constant is safe and correct.
 static inline int BW_sv_maxclients()
 {
     return MAX_CLIENTS_BW;  // = 18
 }
 
-// g_entities[entnum] — base + entnum*stride.
-//
-// CURRENT INTERPRETATION: 0x82FF7A08 / 0x82FF7A0C HOLD the base and stride
-// values (one dereference each). Also dumped by the SYSTEM REPORT.
+// g_entities[entnum] — flat array at a known base, fixed stride.
 static inline gentity_s *BW_g_entity(int entnum)
 {
-    const unsigned int base   = *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENTITIES);
-    const unsigned int stride = *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENT_SIZE);
-    return reinterpret_cast<gentity_s *>(base + static_cast<unsigned int>(entnum) * stride);
+    return reinterpret_cast<gentity_s *>(
+        BW_ADDR_G_ENTITIES + static_cast<unsigned int>(entnum) * BW_GENTITY_STRIDE);
 }
 
 // qport counter the engine itself uses (DAT_82f4b9d0, a ushort). Path C
