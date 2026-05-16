@@ -39,6 +39,8 @@
 //
 // Hand-hunted (not in stock codxe T4 symbols.h):
 //   SV_AddTestClient        0x82281F08
+//   SV_DirectConnect        0x822815B0   (r291: probe point)
+//   ClientDisconnect        0x82208C90   (r291: probe point)
 //   SV_BotUserMove          0x82286D68
 //   SV_UserinfoChanged      0x82280690
 //   SV_IsTestClient         0x8221D1E0
@@ -71,6 +73,28 @@ static SV_UserinfoChanged_t SV_UserinfoChanged =
 typedef void (*SV_DropClient_t)(clientBW_t *cl, const char *reason, bool tellThem);
 static SV_DropClient_t SV_DropClient =
     reinterpret_cast<SV_DropClient_t>(0x8227FDE0);
+
+// ---- Server: connection-path probes (r291 diagnostic) ------------------
+//
+// SV_DirectConnect is called from SV_AddTestClient at 0x82282014.
+// It reads the queued connect packet, parses userinfo, allocates or
+// matches a client slot, calls ClientConnect (GSC layer), and returns.
+// Suspected hang point on Xenia bot spawn.
+//
+// PPC ABI passes 64-bit args in single registers. Disassembly shows:
+//   r3 = netadr_t (8 bytes loaded from r1+0x50; for bots, type=NA_BOT=0)
+//   r4 = qport shifted left 32 (high half of arg2)
+typedef int (*SV_DirectConnect_BW_t)(unsigned long long netadr, unsigned long long qport);
+static SV_DirectConnect_BW_t SV_DirectConnect_BW =
+    reinterpret_cast<SV_DirectConnect_BW_t>(0x822815B0);
+
+// ClientDisconnect is called from inside SV_DirectConnect at 0x82281AD8
+// when an existing client with matching XUID is found. On Xenia where
+// host xuid is 0, this MIGHT trigger a self-disconnect-during-tick
+// deadlock. r291 probes whether this path executes.
+typedef void (*ClientDisconnect_BW_t)(int clientNum);
+static ClientDisconnect_BW_t ClientDisconnect_BW =
+    reinterpret_cast<ClientDisconnect_BW_t>(0x82208C90);
 
 // Real SV_ClientThink. Stock codxe T4 SV_ClientThink (0x82284D50) is wrong.
 // Suffixed `_BW` to avoid linker collision with the stock declaration.
