@@ -33,13 +33,25 @@
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
 //
-// r293 — vanilla bot spawn:
+// r294 — BISECT BUILD
 //
-//   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
-//   it directly, the same way CoD Jumper's GSC does. The Path C bypass
-//   from r292 is removed — it was solving a problem that didn't exist
-//   in practice (the NET_CompareBaseAdr fall-through is real in the
-//   disassembly but doesn't manifest as host corruption on Xenia).
+//   r293 (sv_bots with vanilla SV_AddTestClient + SV_BotUserMove detour +
+//   SV_UserinfoChanged detour) caused CoD Jumper to crash at PC 0x82289310
+//   with r3=0xFFFFFFFF91D8B6B8 (sign-extended bogus pointer) when CoD Jumper
+//   spawned a frozen test client. The crash is downstream of our hook —
+//   we forward a usercmd to SV_ClientThink_BW and the engine dereferences
+//   a corrupted pointer.
+//
+//   r294 disables BOTH driver detours (SV_BotUserMove and SV_UserinfoChanged)
+//   to confirm: (a) vanilla SV_AddTestClient is genuinely safe to call from
+//   GSC on Xenia, and (b) the crash is specifically from our hooks. After
+//   r294 validates spawn, we re-enable SV_BotUserMove with stricter guards
+//   (or detour at a different point) in r295.
+//
+//   Expected r294 behavior:
+//   - CoD Jumper spawns bot, names it Larry-N (engine default), bot stands.
+//   - BW spawns bot via menu, bot appears in scoreboard, bot stands.
+//   - No crash on either path.
 //
 
 #include "pch.h"
@@ -156,6 +168,14 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // ---------------------------------------------------------------------------
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
+//
+// DISABLED IN r294. r293 caused a crash at PC 0x82289310 (deep in engine
+// code, likely inside SV_ClientThink or a callee) with r3=sign-extended
+// garbage pointer. Either our usercmd construction corrupts the client
+// struct, or SV_ClientThink_BW pointer is wrong, or the engine state we
+// expect (gentity, weapon, etc.) isn't valid for freshly-spawned test
+// clients. To be re-enabled in r295 after we understand vanilla
+// SV_BotUserMove's pre-conditions.
 
 static Detour SV_BotUserMove_Detour;
 
@@ -262,6 +282,11 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 // ---------------------------------------------------------------------------
 // SV_UserinfoChanged detour — stamp pending bot name before first parse
 // ---------------------------------------------------------------------------
+//
+// DISABLED IN r294. Bot names will be "Larry 0", "Larry 1", etc. (engine
+// default from .rdata format string at 0x82040A30). BW menu shows these
+// names just fine — cosmetic only. Re-enable after r294 confirms no
+// crash, when we want custom bot names.
 
 static char    s_pendingBotName[32] = {0};
 static Detour  SV_UserinfoChanged_Detour;
@@ -279,11 +304,20 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r293 DIAGNOSTIC TOGGLES
+// r294 DIAGNOSTIC TOGGLES — BISECT BUILD
+// ===========================================================================
+//
+// BOTH AI-driver detours OFF. This proves whether the crash is from our
+// detour code (likely) or from vanilla SV_AddTestClient (unlikely now that
+// CoD Jumper proved it works).
+//
+// Expected r294: spawn works, bot stands still, no crash.
+// If r294 still crashes: vanilla codxe T4 has a different problem, not us.
+// If r294 works: re-enable detours one at a time in r295.
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r294: OFF, bisect crash
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r294: OFF, bisect crash
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -379,8 +413,10 @@ static void Scr_BotMirror(scr_entref_t entref)
 //
 // CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We do the
 // same thing — call it directly, capture the returned entity, push it onto
-// the GSC stack. The optional name argument is stashed and stamped onto
-// the new client's userinfo by our SV_UserinfoChanged_Hook.
+// the GSC stack. The optional name argument is stashed but currently
+// ignored (s_pendingBotName is only consumed by SV_UserinfoChanged_Hook,
+// which is disabled in r294). Bot names will be engine defaults like
+// "Larry 0", "Larry 1", etc.
 
 static void GScr_AddTestClient()
 {
@@ -408,9 +444,8 @@ static void GScr_AddTestClient()
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
 
-    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
-    // the slot's userinfo during the engine's first userinfo-changed call
-    // for the new bot.
+    // Stash the requested name even though our hook is disabled in r294 —
+    // harmless write, future-proof for when SV_UserinfoChanged is re-enabled.
     std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
     s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
 
@@ -547,7 +582,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r294 BISECT — driver detours OFF)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
@@ -561,7 +596,7 @@ sv_bots::sv_bots()
     G_SelectWeaponIndex_Detour.Install();
     DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (bisect)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
@@ -569,7 +604,7 @@ sv_bots::sv_bots()
     SV_BotUserMove_Detour.Install();
     DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (bisect)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
@@ -577,7 +612,7 @@ sv_bots::sv_bots()
     SV_UserinfoChanged_Detour.Install();
     DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (bisect)\n");
 #endif
 
     // SV_CalcPings deliberately NOT detoured — see file header.
