@@ -316,6 +316,81 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
 
+// ===========================================================================
+// r291 DIAGNOSTIC TOGGLES
+// ===========================================================================
+// Set CONNECT_PROBES=1 to probe SV_DirectConnect and ClientDisconnect entry/exit.
+// Keep BOTUSERMOVE=1 — that detour is proven safe and gives us baseline coverage.
+// ===========================================================================
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
+#define CODXE_DIAG_ENABLE_CONNECT_PROBES      1  // r291: probe engine bot-spawn path
+
+// ===========================================================================
+// r291 connection-path probes — entry/exit tracing for engine bot-spawn path
+// ===========================================================================
+//
+// Flush-marker strategy: after each critical DbgPrint, emit a short marker
+// line. Xenia's log writer can lose 1-2 buffered lines on hard process
+// freeze. The marker is a "tracer" — if it makes it to disk, the line
+// before it did too. If we see [DIRECTCONNECT] ENTRY but no [FLUSH-N]
+// marker after it, the entry message was real but the freeze ate the next
+// line. If we see neither, the entry never executed.
+//
+// Interpretation table (after running and capturing log):
+//   Last marker     | Hang location
+//   ----------------+-------------------------------------------------------
+//   [FLUSH-B]       | First instruction of SV_AddTestClient
+//   [FLUSH-1] or 2  | Inside SV_DirectConnect (didn't return)
+//   [FLUSH-3]       | SV_DirectConnect returned OK; hang downstream
+//   [FLUSH-4]       | ClientDisconnect called — Gemini's host-drop theory!
+//   [FLUSH-C]       | engine returned; hang after that (probably GSC push)
+// ===========================================================================
+#if CODXE_DIAG_ENABLE_CONNECT_PROBES
+
+static Detour SV_DirectConnect_Probe_Detour;
+static Detour ClientDisconnect_Probe_Detour;
+
+static int SV_DirectConnect_Probe(unsigned long long netadr, unsigned long long qport)
+{
+    DbgPrint("sv_bots: [DIRECTCONNECT] ENTRY netadr_lo=0x%08X qport=0x%08X\n",
+             (unsigned)(netadr & 0xFFFFFFFFu),
+             (unsigned)(qport >> 32));
+    DbgPrint("sv_bots: [FLUSH-1]\n");
+
+    typedef int (*Orig_t)(unsigned long long, unsigned long long);
+    Orig_t orig = SV_DirectConnect_Probe_Detour.GetOriginal<Orig_t>();
+
+    DbgPrint("sv_bots: [DIRECTCONNECT] calling original...\n");
+    DbgPrint("sv_bots: [FLUSH-2]\n");
+
+    int result = orig(netadr, qport);
+
+    DbgPrint("sv_bots: [DIRECTCONNECT] EXIT result=0x%08X\n", (unsigned)result);
+    DbgPrint("sv_bots: [FLUSH-3]\n");
+    return result;
+}
+
+static void ClientDisconnect_Probe(int clientNum)
+{
+    DbgPrint("sv_bots: [CLIENTDISCONNECT] ENTRY clientNum=%d\n", clientNum);
+    DbgPrint("sv_bots: [FLUSH-4]\n");
+
+    typedef void (*Orig_t)(int);
+    Orig_t orig = ClientDisconnect_Probe_Detour.GetOriginal<Orig_t>();
+
+    DbgPrint("sv_bots: [CLIENTDISCONNECT] calling original...\n");
+    DbgPrint("sv_bots: [FLUSH-5]\n");
+
+    orig(clientNum);
+
+    DbgPrint("sv_bots: [CLIENTDISCONNECT] EXIT clientNum=%d\n", clientNum);
+    DbgPrint("sv_bots: [FLUSH-6]\n");
+}
+
+#endif
+
 // ---------------------------------------------------------------------------
 // GSC entity methods
 // ---------------------------------------------------------------------------
@@ -436,13 +511,31 @@ static void GScr_AddTestClient()
         s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
     }
 
+    DbgPrint("sv_bots: [ADDTESTCLIENT] ENTRY pendingName='%s'\n", s_pendingBotName);
+    DbgPrint("sv_bots: [FLUSH-A]\n");
+
+    DbgPrint("sv_bots: [ADDTESTCLIENT] calling engine SV_AddTestClient at 0x82281F08\n");
+    DbgPrint("sv_bots: [FLUSH-B]\n");
+
     gentity_s *ent = SV_AddTestClient();
+
+    DbgPrint("sv_bots: [ADDTESTCLIENT] engine returned ent=0x%08X\n", (unsigned)ent);
+    DbgPrint("sv_bots: [FLUSH-C]\n");
+
     s_pendingBotName[0] = '\0';
 
     if (ent)
+    {
+        DbgPrint("sv_bots: [ADDTESTCLIENT] pushing entnum=%d\n", ent->s.number);
+        DbgPrint("sv_bots: [FLUSH-D]\n");
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
+    }
     else
+    {
+        DbgPrint("sv_bots: [ADDTESTCLIENT] engine returned NULL - pushing 0\n");
+        DbgPrint("sv_bots: [FLUSH-E]\n");
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+    }
 }
 
 static void GScr_Kick()
@@ -560,34 +653,14 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // Module lifecycle
 // ---------------------------------------------------------------------------
 
-// ===========================================================================
-// DIAGNOSTIC TOGGLES (r283) — per Gemini suggestion
-// ---------------------------------------------------------------------------
-// Set all to 0 for the first diagnostic build. If WaW pregame works with
-// all three detours OFF, the freeze is conclusively in our detours.
-// Then re-enable ONE at a time across r284, r285, r286 to identify which.
-//
-// Order to test (per Gemini ranking):
-//   r283: all 0                            — baseline ("does WaW work at all?")
-//   r284: ENABLE_WEAPON_HOOK = 1           — Gemini's #1 suspect
-//   r285: ENABLE_USERINFO_HOOK = 1         — Gemini's #2 suspect
-//   r286: ENABLE_BOTUSERMOVE = 1           — lowest probability per Gemini
-//
-// NOTE: using #define preprocessor macros instead of `static const bool` to
-// avoid VS2010 warning C4127 (conditional expression is constant), which is
-// promoted to error by /WX.
-// ===========================================================================
-#define CODXE_DIAG_ENABLE_WEAPON_HOOK    0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK  0
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE    1
-
 sv_bots::sv_bots()
 {
     DbgPrint("sv_bots: installing T4 BW detours\n");
-    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d probes=%d (r291)\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
-             CODXE_DIAG_ENABLE_BOTUSERMOVE);
+             CODXE_DIAG_ENABLE_BOTUSERMOVE,
+             CODXE_DIAG_ENABLE_CONNECT_PROBES);
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
@@ -616,6 +689,19 @@ sv_bots::sv_bots()
     DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
 #endif
 
+#if CODXE_DIAG_ENABLE_CONNECT_PROBES
+    SV_DirectConnect_Probe_Detour = Detour(SV_DirectConnect_BW, SV_DirectConnect_Probe);
+    SV_DirectConnect_Probe_Detour.Install();
+    DbgPrint("sv_bots: SV_DirectConnect probe INSTALLED\n");
+
+    ClientDisconnect_Probe_Detour = Detour(ClientDisconnect_BW, ClientDisconnect_Probe);
+    ClientDisconnect_Probe_Detour.Install();
+    DbgPrint("sv_bots: ClientDisconnect probe INSTALLED\n");
+#else
+    DbgPrint("sv_bots: SV_DirectConnect probe SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: ClientDisconnect probe SKIPPED (diagnostic)\n");
+#endif
+
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
 
@@ -631,6 +717,10 @@ sv_bots::~sv_bots()
 #endif
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
+#endif
+#if CODXE_DIAG_ENABLE_CONNECT_PROBES
+    SV_DirectConnect_Probe_Detour.Remove();
+    ClientDisconnect_Probe_Detour.Remove();
 #endif
 
     CleanBotArray();
