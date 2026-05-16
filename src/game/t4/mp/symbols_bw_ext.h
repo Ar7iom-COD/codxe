@@ -115,14 +115,14 @@ static SV_DropClient_t SV_DropClient =
 //   r9  = qport + 1
 //   r10 = sv_maxclients
 
-typedef longlong (*SV_DirectConnect_BW_t)(unsigned long long netadr_lo,
-                                          unsigned long long netadr_hi_qport,
-                                          unsigned long long netadr_len,
-                                          unsigned long long xuid_ptr,
-                                          unsigned long long xnaddr_ptr,
-                                          unsigned long long qport,
-                                          unsigned long long qport_plus1,
-                                          unsigned long long maxclients);
+typedef longlong (*SV_DirectConnect_BW_t)(unsigned __int64 netadr_lo,
+                                          unsigned __int64 netadr_hi_qport,
+                                          unsigned __int64 netadr_len,
+                                          unsigned __int64 xuid_ptr,
+                                          unsigned __int64 xnaddr_ptr,
+                                          unsigned __int64 qport,
+                                          unsigned __int64 qport_plus1,
+                                          unsigned __int64 maxclients);
 static SV_DirectConnect_BW_t SV_DirectConnect_BW =
     reinterpret_cast<SV_DirectConnect_BW_t>(0x822815B0);
 
@@ -141,10 +141,10 @@ static Netmsg_Pop_t Netmsg_Pop =
 // are leftover register values in the vanilla call. Transitions the client
 // CS_CONNECTED → CS_CLIENTLOADING and sends the gamestate snapshot.
 typedef void (*SV_SendClientGameState_BW_t)(clientBW_t *cl,
-                                            unsigned long long a2,
-                                            unsigned long long a3,
-                                            unsigned long long a4,
-                                            unsigned long long a5);
+                                            unsigned __int64 a2,
+                                            unsigned __int64 a3,
+                                            unsigned __int64 a4,
+                                            unsigned __int64 a5);
 static SV_SendClientGameState_BW_t SV_SendClientGameState_BW =
     reinterpret_cast<SV_SendClientGameState_BW_t>(0x82280080);
 
@@ -153,12 +153,12 @@ static SV_SendClientGameState_BW_t SV_SendClientGameState_BW =
 // CS_CLIENTLOADING → CS_ACTIVE, links the gentity, calls GSC ClientBegin.
 typedef void (*SV_ClientEnterWorld_BW_t)(clientBW_t *cl,
                                          void *cmd44,
-                                         unsigned long long a3,
-                                         unsigned long long a4,
-                                         unsigned long long a5,
-                                         unsigned long long a6,
-                                         unsigned long long a7,
-                                         unsigned long long a8);
+                                         unsigned __int64 a3,
+                                         unsigned __int64 a4,
+                                         unsigned __int64 a5,
+                                         unsigned __int64 a6,
+                                         unsigned __int64 a7,
+                                         unsigned __int64 a8);
 static SV_ClientEnterWorld_BW_t SV_ClientEnterWorld_BW =
     reinterpret_cast<SV_ClientEnterWorld_BW_t>(0x82280598);
 
