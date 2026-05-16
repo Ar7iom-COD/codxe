@@ -20,15 +20,10 @@
 //     largely incorrect on TU7 default_mp.xex; see audit comments in
 //     symbols_bw_ext.h.
 //
-//   - SV_CalcPings is NOT detoured. On T4 X360 it's a stub thunk to an
-//     empty function and not called from any engine per-frame loop. The
-//     1-bar bot scoreboard is XLive QoS driven and unfixable here.
-//
 //   - GSC builtin registration: sv_bots exports BW_LookupFunction and
 //     BW_LookupMethod (`extern "C"`). The existing gsc_functions and
 //     gsc_client_methods modules call them BEFORE falling through to the
-//     engine. See patches/0001 and 0002. This avoids the double-detour-
-//     on-same-source problem that would corrupt the trampoline chain.
+//     engine.
 //
 //   - gentity is at client_t + 0x21324 on T4 (stock codxe T4 struct.h says
 //     +0x213F4 — wrong; that's lastPacketTime). We access via the parallel
@@ -37,6 +32,14 @@
 //   - On T4 the entity-from-script-arg path is Scr_GetEntityNum (returns
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
+//
+// r293 — vanilla bot spawn:
+//
+//   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
+//   it directly, the same way CoD Jumper's GSC does. The Path C bypass
+//   from r292 is removed — it was solving a problem that didn't exist
+//   in practice (the NET_CompareBaseAdr fall-through is real in the
+//   disassembly but doesn't manifest as host corruption on Xenia).
 //
 
 #include "pch.h"
@@ -51,11 +54,6 @@
 // pointers are passed to Detour() but they are never called directly from
 // C++. The optimizer can't see the address-take through the constructor
 // argument, so it complains. /WX promotes this to an error.
-//
-// Disabling at file scope keeps the rest of the project's warnings-as-
-// errors policy intact while letting this file build with the
-// CODXE_DIAG_* toggles turned off (which is exactly when the hooks
-// become statically unreferenced).
 #pragma warning(disable: 4505)
 
 namespace t4
@@ -165,7 +163,6 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
     {
-        // Pass non-game clients through to engine
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
@@ -173,55 +170,21 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
     {
-        // Index out of range — let engine handle it
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
 
-    // ========================================================================
-    // GEMINI FIX D — diagnostic logging + call-original guards
-    // ------------------------------------------------------------------------
-    // On Xenia, SV_BotFrame calls us for the HOST because host.xuid == 0.
-    // We must NOT inject bot input for the host, OR for any non-bot client.
-    //
-    // Defense in depth:
-    //   1. If remoteAddress.type != NA_BOT (host/network client), pass to original.
-    //   2. If isTestClient == 0 (not a test client), pass to original.
-    //
-    // KEY RISK: if our struct offsets are wrong, the host might falsely match
-    // NA_BOT (because uninitialized memory often reads as zero, and NA_BOT == 0).
-    // We log the FIRST 4 invocations to verify our offsets are correct.
-    // ========================================================================
-    static int s_diagCount = 0;
-    if (s_diagCount < 4)
-    {
-        DbgPrint("sv_bots: [BOTMOVE-DIAG #%d] cn=%d remoteAddr.type=%d isTestClient=%d gentity=%p\n",
-                 s_diagCount,
-                 clientNum,
-                 static_cast<int>(cl->header.netchan.remoteAddress.type),
-                 cl->isTestClient,
-                 cl->gentity);
-        s_diagCount++;
-    }
-
-    // Guard 1: real network/host clients should never hit our bot AI
+    // Defense in depth: only inject input for real bot clients.
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
-
-    // Guard 2: must be a real test client
     if (cl->isTestClient == 0)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
-
-    // ========================================================================
-    // PAST THIS POINT: this client is confirmed a real bot we spawned.
-    // Inject GSC-driven usercmd.
-    // ========================================================================
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -292,7 +255,6 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         }
     }
 
-    // "Ack" the previous snapshot so the server keeps generating new ones.
     cl->header.deltaMessage = cl->header.netchan.outgoingSequence - 1;
     SV_ClientThink_BW(cl, &cmd);
 }
@@ -315,6 +277,13 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
+
+// ===========================================================================
+// r293 DIAGNOSTIC TOGGLES
+// ===========================================================================
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -388,8 +357,6 @@ static void Scr_BotMirror(scr_entref_t entref)
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
         Scr_Error_BW("Usage: <bot> botMirror(<client>);", SCRIPTINSTANCE_SERVER);
 
-    // T4 Scr_GetEntityNum returns the entity number directly (vs IW3
-    // Scr_GetEntity which returned a gentity_s*).
     const int targetEntNum = Scr_GetEntityNum(0, SCRIPTINSTANCE_SERVER);
 
     if (targetEntNum < 0 || targetEntNum >= MAX_CLIENTS_BW)
@@ -409,15 +376,21 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
+//
+// CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We do the
+// same thing — call it directly, capture the returned entity, push it onto
+// the GSC stack. The optional name argument is stashed and stamped onto
+// the new client's userinfo by our SV_UserinfoChanged_Hook.
 
 static void GScr_AddTestClient()
 {
+    char name[32] = "Bot";
+
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) == 1)
     {
         const char *string = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
 
-        char name[32];
-        int  i = 0, j = 0;
+        int i = 0, j = 0;
         if (string)
         {
             for (; string[i] && j < static_cast<int>(sizeof(name)) - 1; ++i)
@@ -431,18 +404,30 @@ static void GScr_AddTestClient()
         if (j < 1)
             Scr_Error_BW("AddTestClient(): name must be at least 1 character long",
                          SCRIPTINSTANCE_SERVER);
-
-        std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
-        s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
     }
 
+    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
+
+    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
+    // the slot's userinfo during the engine's first userinfo-changed call
+    // for the new bot.
+    std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
+    s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
+
     gentity_s *ent = SV_AddTestClient();
+
     s_pendingBotName[0] = '\0';
 
     if (ent)
+    {
+        DbgPrint("sv_bots: [ADDTESTCLIENT] success, entnum=%d\n", ent->s.number);
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
+    }
     else
+    {
+        DbgPrint("sv_bots: [ADDTESTCLIENT] vanilla SV_AddTestClient returned NULL\n");
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+    }
 }
 
 static void GScr_Kick()
@@ -560,30 +545,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // Module lifecycle
 // ---------------------------------------------------------------------------
 
-// ===========================================================================
-// DIAGNOSTIC TOGGLES (r283) — per Gemini suggestion
-// ---------------------------------------------------------------------------
-// Set all to 0 for the first diagnostic build. If WaW pregame works with
-// all three detours OFF, the freeze is conclusively in our detours.
-// Then re-enable ONE at a time across r284, r285, r286 to identify which.
-//
-// Order to test (per Gemini ranking):
-//   r283: all 0                            — baseline ("does WaW work at all?")
-//   r284: ENABLE_WEAPON_HOOK = 1           — Gemini's #1 suspect
-//   r285: ENABLE_USERINFO_HOOK = 1         — Gemini's #2 suspect
-//   r286: ENABLE_BOTUSERMOVE = 1           — lowest probability per Gemini
-//
-// NOTE: using #define preprocessor macros instead of `static const bool` to
-// avoid VS2010 warning C4127 (conditional expression is constant), which is
-// promoted to error by /WX.
-// ===========================================================================
-#define CODXE_DIAG_ENABLE_WEAPON_HOOK    0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK  0
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE    0
-
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
