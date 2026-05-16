@@ -287,13 +287,13 @@ static G_SelectWeaponIndex_t G_SelectWeaponIndex =
 // int-steps = 0x2dd8b * 4 = 0xB762C; and EnterWorld `/ 0xb762c`).
 
 // svs.clients — pointer to the client_t array base.
-static clientBW_t *BW_svs_clients()
+static inline clientBW_t *BW_svs_clients()
 {
     return *reinterpret_cast<clientBW_t *const *>(0x830AFC90);
 }
 
 // sv_maxclients — sv struct ptr is at 0x82FF7C08, count is at +0xC.
-static int BW_sv_maxclients()
+static inline int BW_sv_maxclients()
 {
     const unsigned int svPtr = *reinterpret_cast<const unsigned int *>(0x82FF7C08);
     if (svPtr == 0)
@@ -302,7 +302,7 @@ static int BW_sv_maxclients()
 }
 
 // g_entities[entnum] — base at *(0x82FF7A08), stride at *(0x82FF7A0C).
-static gentity_s *BW_g_entity(int entnum)
+static inline gentity_s *BW_g_entity(int entnum)
 {
     const unsigned int base   = *reinterpret_cast<const unsigned int *>(0x82FF7A08);
     const unsigned int stride = *reinterpret_cast<const unsigned int *>(0x82FF7A0C);
