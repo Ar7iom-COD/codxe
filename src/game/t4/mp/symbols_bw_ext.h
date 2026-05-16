@@ -15,10 +15,7 @@
 // va, and SV_* function it touches. Names use a `_BW` suffix where they
 // would otherwise collide with stock declarations.
 //
-// All addresses below are Ghidra-verified against TU7 default_mp.xex:
-//   - Either labeled by name in the Ghidra symbol table, or
-//   - Manually confirmed by decompile pattern match (Scr_AddInt /
-//     Scr_AddUndefined, where Ghidra labels them only as FUN_xxx).
+// All addresses below are Ghidra-verified against TU7 default_mp.xex.
 //
 // Audited & corrected vs stock codxe T4 symbols.h:
 //   Scr_GetInt              stock 0x8234AFD0  →  real 0x82341C20
@@ -47,6 +44,38 @@
 //   Scr_Notify              0x82251460
 //   Scr_AllocString         0x823323F0
 //   G_SelectWeaponIndex     0x8225D6D8
+//
+// ============================================================================
+// r293 — REVERTED FROM PATH C
+// ============================================================================
+// Path C (r292) bypassed vanilla SV_AddTestClient by manually pushing a
+// connect packet into the engine netbuf parser. This was based on a Ghidra
+// finding that NET_CompareBaseAdr falls through to "equal" for two NA_BOT
+// addresses, which would supposedly cause SV_AddTestClient's post-scan to
+// corrupt the host slot.
+//
+// CoD Jumper's source (which runs on the same codxe T4 build as us) shows
+// that vanilla addtestclient() works fine on Xenia:
+//
+//     bot = addtestclient();
+//     bot.pers["isBot"] = true;
+//     bot.pers["name"] = "Harry";
+//     ...
+//
+// CoD Jumper's bot fully initializes, can be team-assigned, classed,
+// repositioned. The "bot is a static dummy" perception was only because
+// CoD Jumper calls FreezeControls(true) on it.
+//
+// So the NET_CompareBaseAdr disassembly finding is correct in isolation
+// but does NOT manifest as a bug in practice. The r282-r289 hangs were
+// caused by something else (likely struct-offset corruption or one of our
+// other detours behaving incorrectly).
+//
+// r293 removes Path C entirely:
+//   - SV_DirectConnect_BW, Netmsg_Push, Netmsg_Pop, ClientDisconnect_BW
+//     symbols are no longer needed and have been removed.
+//   - GScr_AddTestClient now calls vanilla SV_AddTestClient() directly,
+//     matching CoD Jumper's working pattern.
 // ============================================================================
 
 #include "structs_bw_ext.h"
