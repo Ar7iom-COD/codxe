@@ -5,77 +5,75 @@
 // ============================================================================
 // AUDIT WARNING: STOCK codxe T4 symbols.h IS LARGELY INCORRECT
 // ============================================================================
-// During this port, every Scr_* and Dvar_* address in the stock codxe-main
-// `src/game/t4/mp/symbols.h` was verified against TU7 default_mp.xex via
-// Ghidra and found to NOT land at function boundaries. The codxe-shipped T4
-// symbol table targets a different T4 build than the binary we have.
-//
-// This header (and the BW C++ port that includes it) avoids the stock
-// symbols by declaring its own corrected pointers for every Scr_*, Dvar_*,
-// va, and SV_* function it touches. Names use a `_BW` suffix where they
-// would otherwise collide with stock declarations.
-//
-// All addresses below are Ghidra-verified against TU7 default_mp.xex.
+// Every Scr_*/Dvar_* address in stock codxe-main src/game/t4/mp/symbols.h was
+// verified against TU7 default_mp.xex via Ghidra and found wrong. This header
+// declares corrected pointers with a `_BW` suffix where names would collide.
 //
 // Audited & corrected vs stock codxe T4 symbols.h:
-//   Scr_GetInt              stock 0x8234AFD0  →  real 0x82341C20
-//   Scr_GetFloat            stock 0x8234B250  →  real 0x82341EA0
-//   Scr_GetString           stock 0x8234B550  →  real 0x823421A0
-//   Scr_GetVector           stock 0x8234B790  →  real 0x823423E0
-//   Scr_GetEntity           stock 0x82254018  →  use Scr_GetEntityNum 0x82342770
-//   Scr_GetNumParam         stock 0x82345650  →  inlined (read DAT_85bb3fb4)
-//   Scr_Error               stock 0x8234BE08  →  real 0x8233CAC0
-//   Scr_ParamError          stock 0x82345E70  →  real 0x8233C9B8
-//   Scr_ObjectError         stock 0x82345EF0  →  real 0x8233CB40
-//   Scr_AddInt              stock 0x82345668  →  real 0x8233C4D0
-//   Scr_AddUndefined       (not in stock)     →  real 0x8233C458
-//   Scr_AddString          (not in stock)     →  real 0x8233C5F8
-//   Scr_AddEntityNum       (not in stock)     →  real 0x8233C2B8
-//   va                      stock 0x822C38D8  →  real 0x822BE508
-//   SV_ClientThink          stock 0x82284D50  →  real 0x82280F38
+//   Scr_GetInt       0x8234AFD0 → 0x82341C20
+//   Scr_GetFloat     0x8234B250 → 0x82341EA0
+//   Scr_GetString    0x8234B550 → 0x823421A0
+//   Scr_GetVector    0x8234B790 → 0x823423E0
+//   Scr_GetEntity    0x82254018 → use Scr_GetEntityNum 0x82342770
+//   Scr_GetNumParam  0x82345650 → inlined (read DAT_85bb3fb4)
+//   Scr_Error        0x8234BE08 → 0x8233CAC0
+//   Scr_ParamError   0x82345E70 → 0x8233C9B8
+//   Scr_ObjectError  0x82345EF0 → 0x8233CB40
+//   Scr_AddInt       0x82345668 → 0x8233C4D0
+//   Scr_AddUndefined (n/a)      → 0x8233C458
+//   Scr_AddString    (n/a)      → 0x8233C5F8
+//   Scr_AddEntityNum (n/a)      → 0x8233C2B8
+//   va               0x822C38D8 → 0x822BE508
+//   SV_ClientThink   0x82284D50 → 0x82280F38
 //
-// Hand-hunted (not in stock codxe T4 symbols.h):
-//   SV_AddTestClient        0x82281F08
+// ============================================================================
+// r295 — PATH C (verified)
+// ============================================================================
+// r294 proved vanilla SV_AddTestClient (0x82281F08) hangs on Xenia even with
+// all our detours disabled. Confirmed cause: its post-SV_DirectConnect scan
+// loop uses NET_CompareBaseAdr to locate the bot's slot; two NA_BOT (zeroed)
+// netadrs compare "equal", so the scan matches the host (slot 0) first and
+// writes isTestClient / SV_SendClientGameState / SV_ClientEnterWorld onto the
+// active human host → engine corruption → freeze.
+//
+// Path C bypasses vanilla SV_AddTestClient. We replicate its verified body
+// (steps 2-9 + 11 below) but REPLACE the broken post-scan (step 10) with our
+// own slot-find that explicitly skips slot 0 (host). Connect string carries
+// \invited\1 so SV_DirectConnect takes its safe "invited" CS_FREE scan path.
+//
+// SV_AddTestClient body, decompiler-verified (Ghidra, TU7 default_mp.xex):
+//   2. rand()/format → xuid string
+//   3. rand()/format → xnaddr string
+//   4. build connect string (fmt @ 0x82040A30, no \invited)
+//   5. FUN_8226ce38(connectbuf)                          ← netbuf push
+//   6. memset(netadr, 0, 12)
+//   7. qport = DAT_82f4b9d0++
+//   8. SV_DirectConnect(netadr[0:8], netadr[8:12]|qport<<32, 0xC,
+//                       xuidPtr, xnaddrPtr, qport, qport+1, maxclients)
+//   9. FUN_8226ce58()                                    ← netbuf pop
+//  10. post-scan via NET_CompareBaseAdr  ← BUG, we skip this
+//  11. cl->isTestClient = 1;
+//      SV_SendClientGameState(cl);
+//      memset(buf, 0, 0x2c);
+//      SV_ClientEnterWorld(cl, buf);
+//
+// All addresses below are Ghidra-verified against TU7 default_mp.xex:
+//   SV_AddTestClient        0x82281F08   (NOT called — kept for reference)
+//   SV_DirectConnect        0x822815B0   (8-arg, signature verified)
+//   FUN_8226CE38 (push)     0x8226CE38   (verified: netbuf write)
+//   FUN_8226CE58 (pop)      0x8226CE58   (verified: netbuf stack restore)
+//   SV_SendClientGameState  0x82280080   (verified: param_1 = client_t*)
+//   SV_ClientEnterWorld     0x82280598   (verified: param_1=client_t*,
+//                                         param_2=ptr to 0x2c-byte buffer)
 //   SV_BotUserMove          0x82286D68
 //   SV_UserinfoChanged      0x82280690
+//   SV_DropClient           0x8227FDE0
 //   SV_IsTestClient         0x8221D1E0
 //   Info_ValueForKey        0x822BE640
 //   Info_SetValueForKey     0x822BEC10
 //   Scr_Notify              0x82251460
 //   Scr_AllocString         0x823323F0
 //   G_SelectWeaponIndex     0x8225D6D8
-//
-// ============================================================================
-// r293 — REVERTED FROM PATH C
-// ============================================================================
-// Path C (r292) bypassed vanilla SV_AddTestClient by manually pushing a
-// connect packet into the engine netbuf parser. This was based on a Ghidra
-// finding that NET_CompareBaseAdr falls through to "equal" for two NA_BOT
-// addresses, which would supposedly cause SV_AddTestClient's post-scan to
-// corrupt the host slot.
-//
-// CoD Jumper's source (which runs on the same codxe T4 build as us) shows
-// that vanilla addtestclient() works fine on Xenia:
-//
-//     bot = addtestclient();
-//     bot.pers["isBot"] = true;
-//     bot.pers["name"] = "Harry";
-//     ...
-//
-// CoD Jumper's bot fully initializes, can be team-assigned, classed,
-// repositioned. The "bot is a static dummy" perception was only because
-// CoD Jumper calls FreezeControls(true) on it.
-//
-// So the NET_CompareBaseAdr disassembly finding is correct in isolation
-// but does NOT manifest as a bug in practice. The r282-r289 hangs were
-// caused by something else (likely struct-offset corruption or one of our
-// other detours behaving incorrectly).
-//
-// r293 removes Path C entirely:
-//   - SV_DirectConnect_BW, Netmsg_Push, Netmsg_Pop, ClientDisconnect_BW
-//     symbols are no longer needed and have been removed.
-//   - GScr_AddTestClient now calls vanilla SV_AddTestClient() directly,
-//     matching CoD Jumper's working pattern.
 // ============================================================================
 
 #include "structs_bw_ext.h"
@@ -101,8 +99,70 @@ typedef void (*SV_DropClient_t)(clientBW_t *cl, const char *reason, bool tellThe
 static SV_DropClient_t SV_DropClient =
     reinterpret_cast<SV_DropClient_t>(0x8227FDE0);
 
+// ---- Path C: SV_DirectConnect + netbuf push/pop -------------------------
+//
+// SV_DirectConnect — 8 args, ABI verified from SV_AddTestClient decompile.
+// The netadr_t (12 bytes) is passed split: bytes 0-7 in r3, bytes 8-11 in
+// the LOW half of r4 (qport occupies the HIGH half of r4). All-zero netadr
+// → type field (first 4 bytes) = 0 = NA_BOT.
+//
+//   r3  = netadr bytes 0..7         (all zero for a bot)
+//   r4  = (qport << 32) | netadr bytes 8..11  (bytes 8..11 zero)
+//   r5  = 0xC                       (sizeof netadr_t = 12)
+//   r6  = xuid string pointer
+//   r7  = xnaddr string pointer
+//   r8  = qport
+//   r9  = qport + 1
+//   r10 = sv_maxclients
+
+typedef longlong (*SV_DirectConnect_BW_t)(unsigned long long netadr_lo,
+                                          unsigned long long netadr_hi_qport,
+                                          unsigned long long netadr_len,
+                                          unsigned long long xuid_ptr,
+                                          unsigned long long xnaddr_ptr,
+                                          unsigned long long qport,
+                                          unsigned long long qport_plus1,
+                                          unsigned long long maxclients);
+static SV_DirectConnect_BW_t SV_DirectConnect_BW =
+    reinterpret_cast<SV_DirectConnect_BW_t>(0x822815B0);
+
+// Netbuf push: append a NUL-terminated OOB packet buffer into the global
+// netbuf parser state. SV_DirectConnect reads userinfo from this state.
+typedef void (*Netmsg_Push_t)(char *packet_buf);
+static Netmsg_Push_t Netmsg_Push =
+    reinterpret_cast<Netmsg_Push_t>(0x8226CE38);
+
+// Netbuf pop: restore the prior netbuf parser state. Must follow every push.
+typedef void (*Netmsg_Pop_t)();
+static Netmsg_Pop_t Netmsg_Pop =
+    reinterpret_cast<Netmsg_Pop_t>(0x8226CE58);
+
+// SV_SendClientGameState — only param_1 (client_t*) is meaningful; the rest
+// are leftover register values in the vanilla call. Transitions the client
+// CS_CONNECTED → CS_CLIENTLOADING and sends the gamestate snapshot.
+typedef void (*SV_SendClientGameState_BW_t)(clientBW_t *cl,
+                                            unsigned long long a2,
+                                            unsigned long long a3,
+                                            unsigned long long a4,
+                                            unsigned long long a5);
+static SV_SendClientGameState_BW_t SV_SendClientGameState_BW =
+    reinterpret_cast<SV_SendClientGameState_BW_t>(0x82280080);
+
+// SV_ClientEnterWorld — param_1 = client_t*, param_2 = pointer to a 0x2c
+// (44) byte buffer copied into client_t + 0x20ef4. Transitions
+// CS_CLIENTLOADING → CS_ACTIVE, links the gentity, calls GSC ClientBegin.
+typedef void (*SV_ClientEnterWorld_BW_t)(clientBW_t *cl,
+                                         void *cmd44,
+                                         unsigned long long a3,
+                                         unsigned long long a4,
+                                         unsigned long long a5,
+                                         unsigned long long a6,
+                                         unsigned long long a7,
+                                         unsigned long long a8);
+static SV_ClientEnterWorld_BW_t SV_ClientEnterWorld_BW =
+    reinterpret_cast<SV_ClientEnterWorld_BW_t>(0x82280598);
+
 // Real SV_ClientThink. Stock codxe T4 SV_ClientThink (0x82284D50) is wrong.
-// Suffixed `_BW` to avoid linker collision with the stock declaration.
 typedef void (*SV_ClientThink_BW_t)(clientBW_t *cl, usercmd_s *cmd);
 static SV_ClientThink_BW_t SV_ClientThink_BW =
     reinterpret_cast<SV_ClientThink_BW_t>(0x82280F38);
@@ -113,11 +173,7 @@ typedef void (*SV_BotUserMove_t)(clientBW_t *cl);
 static SV_BotUserMove_t SV_BotUserMove =
     reinterpret_cast<SV_BotUserMove_t>(0x82286D68);
 
-// NOTE: SV_CalcPings (0x822863D8) is a stub thunk to an empty function on
-// T4 X360 — not called from any per-frame loop. We removed the detour
-// from sv_bots.cpp because it would accomplish nothing. The 1-bar bot
-// scoreboard indicator is XLive QoS driven and cannot be changed from
-// server code. Symbol intentionally NOT exposed.
+// NOTE: SV_CalcPings (0x822863D8) is a stub thunk on T4 X360 — not detoured.
 
 // ---- Server: misc -------------------------------------------------------
 
@@ -136,21 +192,11 @@ static Info_SetValueForKey_t Info_SetValueForKey =
     reinterpret_cast<Info_SetValueForKey_t>(0x822BEC10);
 
 // ---- Misc utilities -----------------------------------------------------
-// va is heavily used by Scr_*Error paths. Stock codxe T4 va (0x822C38D8)
-// is wrong. Real T4 X360 TU7 address verified via Ghidra label.
 
 typedef char *(*va_BW_t)(const char *format, ...);
 static va_BW_t va_BW = reinterpret_cast<va_BW_t>(0x822BE508);
 
 // ---- Script (GSC) bridge — corrected addresses --------------------------
-//
-// Pattern conventions (verified by decompile):
-//   Scr_Get*:   (unsigned int index, scriptInstance_t inst)
-//   Scr_Add*:   (value, scriptInstance_t inst)  except Scr_AddUndefined(inst)
-//   Scr_*Error: (param-dependent, scriptInstance_t inst)
-//
-// PowerPC ABI: r3=arg1, r4=arg2, ...
-// SCRIPTINSTANCE_SERVER == 0 always for our paths.
 
 typedef void (*Scr_Notify_t)(gentity_s *ent, unsigned __int16 stringValue, unsigned int paramcount);
 static Scr_Notify_t Scr_Notify =
@@ -159,8 +205,6 @@ static Scr_Notify_t Scr_Notify =
 typedef int (*Scr_AllocString_t)(const char *s);
 static Scr_AllocString_t Scr_AllocString =
     reinterpret_cast<Scr_AllocString_t>(0x823323F0);
-
-// --- Scr_Add* (push onto active GSC stack) ---
 
 typedef void (*Scr_AddInt_BW_t)(int value, scriptInstance_t inst);
 static Scr_AddInt_BW_t Scr_AddInt_BW =
@@ -178,8 +222,6 @@ typedef void (*Scr_AddEntityNum_t)(int entnum, scriptInstance_t inst);
 static Scr_AddEntityNum_t Scr_AddEntityNum =
     reinterpret_cast<Scr_AddEntityNum_t>(0x8233C2B8);
 
-// --- Scr_Get* (read from GSC stack at index) ---
-
 typedef int (*Scr_GetInt_BW_t)(unsigned int index, scriptInstance_t inst);
 static Scr_GetInt_BW_t Scr_GetInt_BW =
     reinterpret_cast<Scr_GetInt_BW_t>(0x82341C20);
@@ -196,14 +238,9 @@ typedef void (*Scr_GetVector_BW_t)(unsigned int index, float *out, scriptInstanc
 static Scr_GetVector_BW_t Scr_GetVector_BW =
     reinterpret_cast<Scr_GetVector_BW_t>(0x823423E0);
 
-// Returns the entity number directly (signature differs from IW3 codxe's
-// Scr_GetEntity which returns a gentity_s*). On T4 use Scr_GetEntityNum
-// then resolve via &g_entities[entnum].
 typedef int (*Scr_GetEntityNum_t)(unsigned int index, scriptInstance_t inst);
 static Scr_GetEntityNum_t Scr_GetEntityNum =
     reinterpret_cast<Scr_GetEntityNum_t>(0x82342770);
-
-// --- Scr_*Error (longjmp out — these don't return) ---
 
 typedef void (*Scr_Error_BW_t)(const char *error, scriptInstance_t inst);
 static Scr_Error_BW_t Scr_Error_BW =
@@ -217,10 +254,7 @@ typedef void (*Scr_ParamError_BW_t)(unsigned int index, const char *error, scrip
 static Scr_ParamError_BW_t Scr_ParamError_BW =
     reinterpret_cast<Scr_ParamError_BW_t>(0x8233C9B8);
 
-// --- Scr_GetNumParam: INLINED ---
-// No real function — the engine reads this directly at every call site.
-// Param count for the active instance lives at &DAT_85bb3fb4 + inst*0x4320.
-
+// Scr_GetNumParam: INLINED — engine reads it directly at each call site.
 static inline unsigned int Scr_GetNumParam_BW(scriptInstance_t inst)
 {
     return *reinterpret_cast<volatile unsigned int *>(
@@ -232,6 +266,56 @@ static inline unsigned int Scr_GetNumParam_BW(scriptInstance_t inst)
 typedef void (*G_SelectWeaponIndex_t)(int clientNum, int iWeaponIndex);
 static G_SelectWeaponIndex_t G_SelectWeaponIndex =
     reinterpret_cast<G_SelectWeaponIndex_t>(0x8225D6D8);
+
+// ---- Engine globals (Path C slot-finding) -------------------------------
+//
+// Verified from SV_AddTestClient + SV_ClientEnterWorld + SV_SendClientGameState
+// decompiles (TU7 default_mp.xex). Path C uses these DIRECTLY rather than
+// trusting stock codxe T4's svsHeader, which has been wrong about many
+// offsets this session.
+//
+// Each is the ADDRESS OF a global, not the global's value. The engine code
+// does e.g. `piVar18 = DAT_830afc90;` — a load — so 0x830AFC90 holds a
+// pointer; the clients array base is *(void**)0x830AFC90.
+//
+//   DAT_830afc90  → svs.clients      base pointer   (client_t array)
+//   DAT_82ff7c08  → sv                struct ptr; sv_maxclients at +0xC
+//   DAT_82ff7a08  → g_entities        base pointer  (gentity_s array)
+//   DAT_82ff7a0c  → sizeof(gentity_s) stride        (int)
+//
+// client_t stride = 0xB762C (verified: SV_AddTestClient `piVar18 += 0x2dd8b`
+// int-steps = 0x2dd8b * 4 = 0xB762C; and EnterWorld `/ 0xb762c`).
+
+// svs.clients — pointer to the client_t array base.
+static clientBW_t *BW_svs_clients()
+{
+    return *reinterpret_cast<clientBW_t *const *>(0x830AFC90);
+}
+
+// sv_maxclients — sv struct ptr is at 0x82FF7C08, count is at +0xC.
+static int BW_sv_maxclients()
+{
+    const unsigned int svPtr = *reinterpret_cast<const unsigned int *>(0x82FF7C08);
+    if (svPtr == 0)
+        return 0;
+    return *reinterpret_cast<const int *>(svPtr + 0xC);
+}
+
+// g_entities[entnum] — base at *(0x82FF7A08), stride at *(0x82FF7A0C).
+static gentity_s *BW_g_entity(int entnum)
+{
+    const unsigned int base   = *reinterpret_cast<const unsigned int *>(0x82FF7A08);
+    const unsigned int stride = *reinterpret_cast<const unsigned int *>(0x82FF7A0C);
+    return reinterpret_cast<gentity_s *>(base + static_cast<unsigned int>(entnum) * stride);
+}
+
+// Verified client_t stride.
+static const unsigned int BW_CLIENT_STRIDE = 0xB762C;
+
+// qport counter the engine itself uses (DAT_82f4b9d0, a ushort). Path C
+// keeps its OWN counter instead, to avoid racing the engine, but the
+// address is recorded here for reference.
+//   DAT_82f4b9d0  → engine qport counter (ushort)
 
 } // namespace bw
 } // namespace mp
