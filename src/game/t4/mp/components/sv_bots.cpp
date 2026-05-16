@@ -332,38 +332,53 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 // ===========================================================================
 // G_SelectWeaponIndex detour — track per-client weapon
 // ===========================================================================
+//
+// r318 DIAGNOSTIC: body GUTTED to a pure pass-through. The detour is still
+// installed and still intercepts every call, but the hook does NOTHING except
+// forward to the original. This isolates "hook body bug" from "detour mechanism
+// bug" for the Awaiting-challenge pregame freeze:
+//   - pregame LOADS with this gutted   -> the freeze was in the hook BODY below.
+//   - pregame STILL FREEZES gutted     -> the freeze is the detour MECHANISM
+//                                         on this short function.
+// The real body (one line: g_botai[clientNum].weapon = iWeaponIndex) is kept
+// in the comment so r319 can restore it once the verdict is known.
+//
+//   ORIGINAL r317 BODY:
+//     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
+//         g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
 
 static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
-    if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
-        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
-
+    // r318: pure pass-through — no g_botai write.
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
 
 // ===========================================================================
 // SV_UserinfoChanged detour — custom bot names
 // ===========================================================================
-// When SV_AddTestClient -> SV_DirectConnect connects a bot, the engine calls
-// SV_UserinfoChanged with the client in NA_BOT / CS_CONNECTED state and the raw
-// connect userinfo loaded. We patch the "name" key before the original runs so
-// the chosen name propagates through SV_ClientEnterWorld and the configstring
-// broadcast.
+//
+// r318 DIAGNOSTIC: body GUTTED to a pure pass-through, same rationale as the
+// G_SelectWeaponIndex hook above. The name-patch is suspended for this build.
+// Note: SV_UserinfoChanged's userinfo buffer is at client+0x6DC (verified in
+// the decompile: `addi r23, r28, 0x6dc`). When r319 restores the body, confirm
+// clientBW_t.userinfo resolves to that offset.
+//
+//   ORIGINAL r317 BODY:
+//     if (s_pendingBotName[0] &&
+//         cl->header.netchan.remoteAddress.type == NA_BOT &&
+//         cl->header.state == CS_CONNECTED)
+//     {
+//         Info_SetValueForKey(cl->userinfo, "name", s_pendingBotName);
+//     }
 
 static char   s_pendingBotName[32] = {0};
 static Detour SV_UserinfoChanged_Detour;
 
 static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 {
-    if (s_pendingBotName[0] &&
-        cl->header.netchan.remoteAddress.type == NA_BOT &&
-        cl->header.state == CS_CONNECTED)
-    {
-        Info_SetValueForKey(cl->userinfo, "name", s_pendingBotName);
-    }
-
+    // r318: pure pass-through — no name patch.
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
 
@@ -643,7 +658,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r317 — NET_CompareBaseAdr post-scan fix)\n");
+    DbgPrint("sv_bots: T4 BW module init (r318 — DIAG: weapon/userinfo hooks gutted to pass-through)\n");
 
     CleanBotArray();
     s_pendingBotName[0]  = '\0';
