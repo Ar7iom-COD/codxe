@@ -286,31 +286,55 @@ static G_SelectWeaponIndex_t G_SelectWeaponIndex =
 // client_t stride = 0xB762C (verified: SV_AddTestClient `piVar18 += 0x2dd8b`
 // int-steps = 0x2dd8b * 4 = 0xB762C; and EnterWorld `/ 0xb762c`).
 
-// svs.clients — pointer to the client_t array base.
+// Raw addresses of the engine globals — kept as named constants so the
+// SYSTEM REPORT diagnostic can probe BOTH interpretations (base vs pointer)
+// without re-typing magic numbers.
+static const unsigned int BW_ADDR_SVS_CLIENTS = 0x830AFC90;  // svs.clients
+static const unsigned int BW_ADDR_SV_STRUCT   = 0x82FF7C08;  // sv struct
+static const unsigned int BW_ADDR_G_ENTITIES  = 0x82FF7A08;  // g_entities base
+static const unsigned int BW_ADDR_G_ENT_SIZE  = 0x82FF7A0C;  // sizeof(gentity_s)
+
+// Verified client_t stride (SV_AddTestClient `piVar18 += 0x2dd8b` → ×4).
+static const unsigned int BW_CLIENT_STRIDE = 0xB762C;
+
+// Verified client_t.name offset (SV_SendClientGameState/EnterWorld DPrintf
+// use `param_1 + 0x21328`).
+static const unsigned int BW_CLIENT_NAME_OFF = 0x21328;
+
+// svs.clients — the client_t array base.
+//
+// CURRENT INTERPRETATION: 0x830AFC90 HOLDS A POINTER to the array (one
+// dereference). This is unverified — the SYSTEM REPORT in sv_bots.cpp dumps
+// both this and the no-deref interpretation so a single run settles it.
 static inline clientBW_t *BW_svs_clients()
 {
-    return *reinterpret_cast<clientBW_t *const *>(0x830AFC90);
+    return *reinterpret_cast<clientBW_t *const *>(BW_ADDR_SVS_CLIENTS);
 }
 
-// sv_maxclients — sv struct ptr is at 0x82FF7C08, count is at +0xC.
+// sv_maxclients.
+//
+// T4 MP MAX_CLIENTS is a verified constant: 18 (confirmed in-game — the
+// Private Match lobby shows "1/18 Players"). The previous engine-memory
+// read (*(0x82FF7C08) treated as a pointer, then +0xC) returned 0 because
+// 0x82FF7C08 is almost certainly the sv struct BASE, not a pointer to it,
+// and sv's first field reads 0. Rather than guess the indirection, use the
+// constant: Path C's slot loops are bounded by MAX_CLIENTS_BW and check
+// per-slot state, so the constant is safe and correct.
 static inline int BW_sv_maxclients()
 {
-    const unsigned int svPtr = *reinterpret_cast<const unsigned int *>(0x82FF7C08);
-    if (svPtr == 0)
-        return 0;
-    return *reinterpret_cast<const int *>(svPtr + 0xC);
+    return MAX_CLIENTS_BW;  // = 18
 }
 
-// g_entities[entnum] — base at *(0x82FF7A08), stride at *(0x82FF7A0C).
+// g_entities[entnum] — base + entnum*stride.
+//
+// CURRENT INTERPRETATION: 0x82FF7A08 / 0x82FF7A0C HOLD the base and stride
+// values (one dereference each). Also dumped by the SYSTEM REPORT.
 static inline gentity_s *BW_g_entity(int entnum)
 {
-    const unsigned int base   = *reinterpret_cast<const unsigned int *>(0x82FF7A08);
-    const unsigned int stride = *reinterpret_cast<const unsigned int *>(0x82FF7A0C);
+    const unsigned int base   = *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENTITIES);
+    const unsigned int stride = *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENT_SIZE);
     return reinterpret_cast<gentity_s *>(base + static_cast<unsigned int>(entnum) * stride);
 }
-
-// Verified client_t stride.
-static const unsigned int BW_CLIENT_STRIDE = 0xB762C;
 
 // qport counter the engine itself uses (DAT_82f4b9d0, a ushort). Path C
 // keeps its OWN counter instead, to avoid racing the engine, but the
