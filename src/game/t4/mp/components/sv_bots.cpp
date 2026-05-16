@@ -367,15 +367,15 @@ static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
     DbgPrint("sv_bots: [PATH-C] FLUSH-3 before SV_DirectConnect (qport=0x%x)\n", qport);
     SV_DirectConnect_BW(
         0ULL,                                                       // r3
-        (static_cast<unsigned long long>(qport) << 32),             // r4
+        (static_cast<unsigned __int64>(qport) << 32),             // r4
         0xCULL,                                                     // r5
-        static_cast<unsigned long long>(
+        static_cast<unsigned __int64>(
             reinterpret_cast<unsigned int>(xuidStr)),               // r6
-        static_cast<unsigned long long>(
+        static_cast<unsigned __int64>(
             reinterpret_cast<unsigned int>(xnaddrStr)),             // r7
-        static_cast<unsigned long long>(qport),                     // r8
-        static_cast<unsigned long long>(qport) + 1,                 // r9
-        static_cast<unsigned long long>(maxclients));               // r10
+        static_cast<unsigned __int64>(qport),                     // r8
+        static_cast<unsigned __int64>(qport) + 1,                 // r9
+        static_cast<unsigned __int64>(maxclients));               // r10
     DbgPrint("sv_bots: [PATH-C] FLUSH-4 after SV_DirectConnect\n");
 
     // Step 9 — pop the netbuf (balances the push).
