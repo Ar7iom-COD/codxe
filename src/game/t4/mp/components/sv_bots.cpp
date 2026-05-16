@@ -15,32 +15,51 @@
 //     <bot> botStop()              — clear all bot input state
 //
 // ===========================================================================
-// r311 — netbuf bisect + re-entrancy guard
+// r312 — netbuf mandatory + SV_DirectConnect ABI fix
 // ===========================================================================
 //
-// r307..r310 crashed identically: pressing ADD BOTS produced 65,525 repeats of
-// "[PATH-C] connect string built" / "[PATH-C] FLUSH-1 before Netmsg_Push" and
-// then Xenia's "Overflowed stackpoints!". FLUSH-2 never printed even once.
+// r311 ran the netbuf bisect with BW_USE_NETMSG=0 (skip Netmsg_Push/Pop). The
+// log showed FLUSH-3 print, then the game HUNG (froze) inside
+// SV_DirectConnect_BW — FLUSH-4 never printed. r311 concluded "the netbuf was
+// not the bug" and that the fault was isolated inside SV_DirectConnect.
 //
-// Full decompile of the netbuf chain (FUN_8226ce38 / FUN_8226ce58 /
-// Function_8226CCB8) proved:
-//   - Netmsg_Push / Netmsg_Pop are a BALANCED push/pop stack over a 0x200-byte
-//     arena. Depth counter @0x82E1CE40, running offset @0x82DCCE38.
-//   - Function_8226CCB8 increments the depth counter with NO upper bound. It
-//     is safe ONLY because the engine always pairs every push with a pop.
-//   - Our Path C pushes but the loop never reaches the matching pop, so depth
-//     runs away, the 0x200 arena overruns, 0x200-offset underflows, and the
-//     resulting wild size corrupts memory -> bad return -> recursion -> crash.
+// The full SV_DirectConnect decompile (0x822815B0) corrects that conclusion.
+// SV_DirectConnect does NOT receive the connect string as a parameter. Its
+// FIRST action is to index the netbuf by the depth counter (DAT_82e1ce40) and
+// dereference the slot to find the connect string:
 //
-// r311 does two things:
-//   1. BW_USE_NETMSG bisect toggle (default 0) — gate BOTH Netmsg_Push and
-//      Netmsg_Pop together so the pair stays balanced. With 0, the netbuf is
-//      skipped entirely; if Path C now reaches FLUSH-3+, the netbuf pair was
-//      the crash. A new diagnostic prints the netbuf depth/offset BEFORE the
-//      first push so we can see if it was already dirty.
-//   2. A re-entrancy guard on BW_AddBotPathC: any future bad call target that
-//      recurses into the spawn path is logged once and rejected, instead of
-//      driving the guest stack into the ground.
+//     uVar24 = ((ulonglong)DAT_82e1ce40 & 0x3fffffff) << 2;   // depth*4
+//     if (1 < (int)*(uint*)(&DAT_82e1ce84 + depth*4)) {
+//         pcVar8 = *(char **)(*(uint*)(&DAT_82e1cea4 + depth*4) + 4);
+//     }
+//     Q_strncpyz(buf, pcVar8, 0x400);                         // copy connect str
+//     pcVar8 = Info_ValueForKey(buf, ...);                    // parse it
+//
+// Netmsg_Push (0x8226CE38) is the function that WRITES that slot. Netmsg_Push
+// and SV_DirectConnect are the producer/consumer halves of ONE handshake:
+// push -> SV_DirectConnect -> pop. This is exactly how SV_AddTestClient uses
+// them in its verified decompile.
+//
+// So r311's BW_USE_NETMSG=0 did not "bisect" a fault inside SV_DirectConnect —
+// it CREATED one. With no push, SV_DirectConnect read an unpopulated netbuf
+// slot, got a wild char*, and Q_strncpyz / Info_ValueForKey walked that
+// pointer forever looking for a NUL terminator that never came. That endless
+// string scan IS the r311 hang between FLUSH-3 and FLUSH-4. It was never a
+// client-array loop and never the 8-arg ABI.
+//
+// r312 does three things:
+//   1. BW_USE_NETMSG flipped to 1. The netbuf is MANDATORY, not optional.
+//      Netmsg_Push must run before SV_DirectConnect, Netmsg_Pop after.
+//   2. SV_DirectConnect r4 fixed. r311 hand-packed (qport<<32) into r4. The
+//      SV_DirectConnect decompile reads r4's LOW short as the port and shifts
+//      it itself (_sStack00000018 = param_2; uVar2 = (short)...; <<0x20).
+//      SV_AddTestClient passes r4 = uStack_518<<0x20 where uStack_518 is read
+//      from the memset'd 12-byte netadr = 0, i.e. the real test-client path
+//      passes r4 = 0. r312 passes r4 = 0 to match. qport already reaches the
+//      engine correctly through r8/r9 (and the connect string's \qport\).
+//   3. A pre-call dump of all 8 SV_DirectConnect args + the netbuf slot the
+//      engine is about to consume, printed BEFORE the call, so a frozen run
+//      still shows exactly what was passed.
 //
 // r294 proved, with all our detours disabled, that vanilla SV_AddTestClient
 // (0x82281F08) hangs on Xenia by itself. Root cause confirmed by full
@@ -56,6 +75,14 @@
 // post-scan (step 10) is replaced by BW_FindNewBotSlot(), which diffs slot
 // occupancy before/after SV_DirectConnect and explicitly never returns slot 0.
 //
+// KNOWN RISK (watch the r312 log): SV_DirectConnect itself runs THREE
+// NET_CompareBaseAdr / NET_CompareAdr scans internally, all against param_1
+// (r3), which we pass all-zero. On Xenia an all-zero netadr can false-match
+// the host the same way SV_AddTestClient's post-scan did. If the log shows
+// "reconnect rejected : too soon" or a hang right after "Client %i
+// connecting...", the fix is to give each bot a UNIQUE non-zero fake netadr
+// instead of all-zero. Do NOT pre-empt this — let the log decide.
+//
 // SV_AddTestClient body — decompiler-verified, TU7 default_mp.xex:
 //   1. pre-scan svs.clients for first CS_FREE slot; abort if none
 //   2. rand()/format → xuid string         (we use our own LCG + hex format)
@@ -64,7 +91,7 @@
 //   5. Netmsg_Push(connectbuf)             [0x8226CE38]
 //   6. memset(netadr, 0, 12)               (type field = 0 = NA_BOT)
 //   7. qport = counter++                   (our own counter, not engine's)
-//   8. SV_DirectConnect(netadr0_7, netadr8_11|qport<<32, 0xC,
+//   8. SV_DirectConnect(0, 0, 0xC,
 //                       xuidPtr, xnaddrPtr, qport, qport+1, maxclients)
 //                                          [0x822815B0]
 //   9. Netmsg_Pop()                        [0x8226CE58]
@@ -86,9 +113,9 @@
 // engine call so that, if anything still hangs, the last printed marker names
 // the exact culprit.
 //
-// All three AI-driver detours remain OFF in r295 (CODXE_DIAG_* = 0). They are
-// re-enabled, with proper client-state guards, only in r296 AFTER Path C is
-// confirmed to spawn cleanly.
+// All three AI-driver detours remain OFF in r312 (CODXE_DIAG_* = 0). They are
+// re-enabled, with proper client-state guards, only AFTER Path C is confirmed
+// to spawn cleanly.
 //
 
 #include "pch.h"
@@ -107,24 +134,41 @@ namespace mp
 using namespace t4::mp::bw;
 
 // ===========================================================================
-// r311 — netbuf bisect toggle
+// r312 — netbuf is MANDATORY, not a bisect knob
 // ===========================================================================
-// 0 = skip BOTH Netmsg_Push and Netmsg_Pop (prove the netbuf pair is the
-//     crash; if Path C reaches FLUSH-3+ with this off, it was).
-// 1 = use the engine netbuf (original behaviour).
+// The SV_DirectConnect decompile (0x822815B0) shows the function does NOT
+// receive the connect string as a parameter. Its first action is to index the
+// netbuf by the depth counter (DAT_82e1ce40) and dereference the slot to find
+// the connect string:
+//     pcVar8 = *(char **)(*(uint*)(&DAT_82e1cea4 + depth*4) + 4);
+//     Q_strncpyz(buf, pcVar8, 0x400);
+// Netmsg_Push is what writes that slot. Push and SV_DirectConnect are the
+// producer/consumer halves of ONE handshake (push -> call -> pop), exactly as
+// SV_AddTestClient uses them. r311's BW_USE_NETMSG=0 did not bisect a fault
+// inside SV_DirectConnect — it CREATED one: with no push, SV_DirectConnect
+// read an unpopulated slot, got a wild char*, and Q_strncpyz / Info_ValueForKey
+// walked it forever -> the r311 hang between FLUSH-3 and FLUSH-4.
+//
+//   1 = use the engine netbuf (REQUIRED — this is the only correct value).
+//   0 = skip push/pop. Kept ONLY to reproduce the r311 hang on demand.
+//       Do NOT ship with 0.
 //
 // NOTE: declared `volatile`, NOT `static const`. The project builds with /WX
-// (warnings-as-errors); a plain `static const int = 0` makes `if(BW_USE_NETMSG)`
+// (warnings-as-errors); a plain `static const int = 1` makes `if(BW_USE_NETMSG)`
 // a constant expression and triggers C4127 -> hard error. `volatile` tells the
 // compiler the value may change, so the `if` is not "constant", C4127 is
 // silenced, and behaviour is identical. VS2010-safe (no constexpr).
 // ===========================================================================
-static volatile int BW_USE_NETMSG = 0;
+static volatile int BW_USE_NETMSG = 1;
 
 // r311 — engine netbuf globals (verified from the FUN_8226ce38 decompile:
 // Netmsg_Push passes &DAT_82e1ce40 as the depth-counter pointer).
 static const unsigned int BW_NETBUF_DEPTH_ADDR  = 0x82E1CE40u;
 static const unsigned int BW_NETBUF_OFFSET_ADDR = 0x82DCCE38u;
+
+// r312 — netbuf consumer slot base. SV_DirectConnect reads the connect string
+// from (&DAT_82e1ce84 + (depth & 0x3fffffff)*4); we dump that slot pre-call.
+static const unsigned int BW_NETBUF_SLOT_BASE   = 0x82E1CE84u;
 
 // ---------------------------------------------------------------------------
 // Per-client AI input state
@@ -347,7 +391,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r311) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r312) =====\n");
 
     // --- svsHeader / client array ----------------------------------------
     // svsHeader (0x84F85100) -> serverStaticHeader_t { client_t* clients;
@@ -481,10 +525,11 @@ static gentity_s *BW_AddBotPathC_Impl(const char * /*requestedName*/)
 
     // Step 5 — push the connect string into the netbuf.
     //
-    // r311 BISECT: gated by BW_USE_NETMSG. Netmsg_Push / Netmsg_Pop are a
-    // balanced push/pop stack — they MUST be gated together by the SAME flag
-    // so the pair stays balanced (skipping only one corrupts the depth
-    // counter the other direction).
+    // r312: gated by BW_USE_NETMSG, which is now 1 (mandatory). Netmsg_Push is
+    // the PRODUCER half of the handshake; SV_DirectConnect is the consumer —
+    // it reads the connect string back out of the netbuf slot indexed by the
+    // depth counter. Netmsg_Push / Netmsg_Pop are a balanced push/pop stack —
+    // they MUST be gated together by the SAME flag so the pair stays balanced.
     DbgPrint("sv_bots: [PATH-C] netbuf depth=%d offset=%d\n",
              *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
              *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR));
@@ -498,32 +543,61 @@ static gentity_s *BW_AddBotPathC_Impl(const char * /*requestedName*/)
     // Step 6-7 — netadr is all-zero (NA_BOT). qport from our own counter.
     const unsigned short qport = g_botQport++;
 
-    // Step 8 — SV_DirectConnect. Exact 8-arg ABI from the verified decompile:
-    //   r3  = netadr bytes 0..7   = 0
-    //   r4  = netadr bytes 8..11 (0) | qport<<32
-    //   r5  = 0xC
+    // Step 8 — SV_DirectConnect. 8-arg ABI re-verified against the
+    // SV_DirectConnect AND SV_AddTestClient decompiles:
+    //   r3  = netadr bytes 0..7   = 0   (SV_AddTestClient passes uStack_51c,
+    //                                    a read from the memset'd netadr = 0)
+    //   r4  = netadr bytes 8..11  = 0   (SV_AddTestClient: uStack_518<<0x20;
+    //                                    uStack_518 is also memset'd = 0.
+    //                                    SV_DirectConnect reads r4's LOW short
+    //                                    as the port and shifts it ITSELF —
+    //                                    do NOT hand-pack qport<<32 here.)
+    //   r5  = 0xC                       (netadr size)
     //   r6  = xuid string ptr
     //   r7  = xnaddr string ptr
     //   r8  = qport
     //   r9  = qport+1
     //   r10 = maxclients
+    //
+    // r312: dump all 8 args + the netbuf slot SV_DirectConnect will read,
+    // BEFORE the call, so a frozen run still shows exactly what was passed.
+    {
+        const unsigned int depth = *reinterpret_cast<const unsigned int *>(BW_NETBUF_DEPTH_ADDR);
+        // The netbuf consumer reads the slot at (&DAT_82e1ce84 + depth*4);
+        // the engine masks depth with 0x3fffffff first.
+        const unsigned int slotAddr = BW_NETBUF_SLOT_BASE + ((depth & 0x3fffffffu) << 2);
+        const unsigned int slotVal  = *reinterpret_cast<const unsigned int *>(slotAddr);
+        DbgPrint("sv_bots: [PATH-C] netbuf consumer: depth=%u slot@0x%08X val=%u\n",
+                 depth, slotAddr, slotVal);
+    }
+    DbgPrint("sv_bots: [PATH-C] SV_DirectConnect args:\n");
+    DbgPrint("sv_bots:   r3 =0x%08X  r4 =0x%08X  r5 =0x%X\n",
+             0u, 0u, 0xCu);
+    DbgPrint("sv_bots:   r6 =0x%08X (xuid)  r7 =0x%08X (xnaddr)\n",
+             reinterpret_cast<unsigned int>(xuidStr),
+             reinterpret_cast<unsigned int>(xnaddrStr));
+    DbgPrint("sv_bots:   r8 =%u (qport)  r9 =%u  r10=%d (maxclients)\n",
+             static_cast<unsigned int>(qport),
+             static_cast<unsigned int>(qport) + 1u,
+             maxclients);
+
     DbgPrint("sv_bots: [PATH-C] FLUSH-3 before SV_DirectConnect (qport=0x%x)\n", qport);
     SV_DirectConnect_BW(
-        0ULL,                                                       // r3
-        (static_cast<unsigned __int64>(qport) << 32),             // r4
-        0xCULL,                                                     // r5
+        0ULL,                                                       // r3  netadr[0..7]  = 0
+        0ULL,                                                       // r4  netadr[8..11] = 0  (was qport<<32 — wrong)
+        0xCULL,                                                     // r5  netadr size
         static_cast<unsigned __int64>(
             reinterpret_cast<unsigned int>(xuidStr)),               // r6
         static_cast<unsigned __int64>(
             reinterpret_cast<unsigned int>(xnaddrStr)),             // r7
-        static_cast<unsigned __int64>(qport),                     // r8
-        static_cast<unsigned __int64>(qport) + 1,                 // r9
-        static_cast<unsigned __int64>(maxclients));               // r10
+        static_cast<unsigned __int64>(qport),                       // r8
+        static_cast<unsigned __int64>(qport) + 1,                   // r9
+        static_cast<unsigned __int64>(maxclients));                 // r10
     DbgPrint("sv_bots: [PATH-C] FLUSH-4 after SV_DirectConnect\n");
 
     // Step 9 — pop the netbuf (balances the push).
     //
-    // r311 BISECT: gated by the SAME BW_USE_NETMSG flag as the push above.
+    // r312: gated by the SAME BW_USE_NETMSG flag as the push above.
     DbgPrint("sv_bots: [PATH-C] FLUSH-5 before Netmsg_Pop\n");
     if (BW_USE_NETMSG)
         Netmsg_Pop();
@@ -582,7 +656,7 @@ static gentity_s *BW_AddBotPathC(const char *requestedName)
 }
 
 // ---------------------------------------------------------------------------
-// G_SelectWeaponIndex detour — track per-client weapon (driver, OFF in r295)
+// G_SelectWeaponIndex detour — track per-client weapon (driver, OFF in r312)
 // ---------------------------------------------------------------------------
 
 static Detour G_SelectWeaponIndex_Detour;
@@ -596,7 +670,7 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 }
 
 // ---------------------------------------------------------------------------
-// SV_BotUserMove detour — core bot driver (OFF in r295, re-enabled r296)
+// SV_BotUserMove detour — core bot driver (OFF in r312, re-enabled later)
 // ---------------------------------------------------------------------------
 
 static Detour SV_BotUserMove_Detour;
@@ -696,7 +770,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 }
 
 // ---------------------------------------------------------------------------
-// SV_UserinfoChanged detour — custom bot names (OFF in r295)
+// SV_UserinfoChanged detour — custom bot names (OFF in r312)
 // ---------------------------------------------------------------------------
 
 static char    s_pendingBotName[32] = {0};
@@ -715,11 +789,11 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r295 DIAGNOSTIC TOGGLES
+// r312 DIAGNOSTIC TOGGLES
 // ===========================================================================
 // All driver detours OFF. Path C is a plain GSC builtin — it needs no
 // detours. The detours are for AI input driving and are re-enabled, with
-// client-state guards, in r296 once Path C confirms a clean spawn.
+// client-state guards, once Path C confirms a clean spawn.
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0
@@ -976,7 +1050,7 @@ sv_bots::sv_bots()
 {
     const int useNetmsg = BW_USE_NETMSG;  // read volatile into a plain int
 
-    DbgPrint("sv_bots: T4 BW module init (r311 — netbuf bisect + reentry guard)\n");
+    DbgPrint("sv_bots: T4 BW module init (r312 — netbuf mandatory + ABI fix)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d netmsg=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
@@ -991,7 +1065,7 @@ sv_bots::sv_bots()
     G_SelectWeaponIndex_Detour.Install();
     DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (r295)\n");
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (r312)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
@@ -999,7 +1073,7 @@ sv_bots::sv_bots()
     SV_BotUserMove_Detour.Install();
     DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (r295)\n");
+    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (r312)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
@@ -1007,7 +1081,7 @@ sv_bots::sv_bots()
     SV_UserinfoChanged_Detour.Install();
     DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (r295)\n");
+    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (r312)\n");
 #endif
 }
 
