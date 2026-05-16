@@ -1,121 +1,55 @@
 //
 // Bot Warfare T4 port — engine module.
 //
-// Ports the codxe IW3 sv_bots.cpp to T4 X360 (TU7). Adds the BW C++ surface
-// that the GSC layer (scripts/mp/bots*.gsc + maps/mp/bots/_bot*.gsc) drives:
-//
-//   GSC functions
-//     addtestclient(<name>)        — spawn a bot (returns the bot entity)
-//     kick(<clientNum>[,<reason>]) — drop a client
-//
-//   GSC entity methods (on a bot entity)
-//     <bot> botMoveTo(<vec3>)      — drive forward/strafe toward a world point
-//     <bot> botAction("+fire")     — set/clear a button bit
-//     <bot> botMirror(<player>)    — copy another client's lastUsercmd 1:1
-//     <bot> botStop()              — clear all bot input state
-//
 // ===========================================================================
-// r312 — netbuf mandatory + SV_DirectConnect ABI fix
+// r314 — DELETE PATH C. Port the codxe IW3 reference 1:1.
 // ===========================================================================
 //
-// r311 ran the netbuf bisect with BW_USE_NETMSG=0 (skip Netmsg_Push/Pop). The
-// log showed FLUSH-3 print, then the game HUNG (froze) inside
-// SV_DirectConnect_BW — FLUSH-4 never printed. r311 concluded "the netbuf was
-// not the bug" and that the fault was isolated inside SV_DirectConnect.
+// codxe ships a working IW3 bot module: src/game/iw3/mp/components/sv_bots.cpp.
+// Its GScr_AddTestClient does exactly this:
 //
-// The full SV_DirectConnect decompile (0x822815B0) corrects that conclusion.
-// SV_DirectConnect does NOT receive the connect string as a parameter. Its
-// FIRST action is to index the netbuf by the depth counter (DAT_82e1ce40) and
-// dereference the slot to find the connect string:
+//     gentity_s *ent = SV_AddTestClient();    // the REAL engine function
 //
-//     uVar24 = ((ulonglong)DAT_82e1ce40 & 0x3fffffff) << 2;   // depth*4
-//     if (1 < (int)*(uint*)(&DAT_82e1ce84 + depth*4)) {
-//         pcVar8 = *(char **)(*(uint*)(&DAT_82e1cea4 + depth*4) + 4);
-//     }
-//     Q_strncpyz(buf, pcVar8, 0x400);                         // copy connect str
-//     pcVar8 = Info_ValueForKey(buf, ...);                    // parse it
+// One call, no arguments. No connect string, no netbuf, no SV_DirectConnect,
+// no 8-arg ABI, no hand-ported slot scan. The entire "Path C" apparatus
+// (r292..r313) was a workaround for a problem the working reference does not
+// have. r294 concluded vanilla SV_AddTestClient "hangs on Xenia because its
+// NET_CompareBaseAdr post-scan false-matches the host" — but the IW3 reference
+// calls SV_AddTestClient() raw and works. Either r294's diagnosis was wrong,
+// or r294 hung for a different reason (a missing detour, a bad symbol). Either
+// way, Path C was built on a misdiagnosis and is deleted here.
 //
-// Netmsg_Push (0x8226CE38) is the function that WRITES that slot. Netmsg_Push
-// and SV_DirectConnect are the producer/consumer halves of ONE handshake:
-// push -> SV_DirectConnect -> pop. This is exactly how SV_AddTestClient uses
-// them in its verified decompile.
+// r314 is a 1:1 port of the IW3 reference, adjusted for three T4 facts:
 //
-// So r311's BW_USE_NETMSG=0 did not "bisect" a fault inside SV_DirectConnect —
-// it CREATED one. With no push, SV_DirectConnect read an unpopulated netbuf
-// slot, got a wild char*, and Q_strncpyz / Info_ValueForKey walked that
-// pointer forever looking for a NUL terminator that never came. That endless
-// string scan IS the r311 hang between FLUSH-3 and FLUSH-4. It was never a
-// client-array loop and never the 8-arg ABI.
+//   1. SV_CalcPings is NOT detoured on T4. The IW3 reference reimplements
+//      SV_CalcPings and computes human ping from frames[j].messageAcked /
+//      messageSent. On T4 (per structs_bw_ext.h) those clientSnapshot_t
+//      fields are INERT — porting that loop would corrupt human ping. T4's
+//      SV_CalcPings is a stub thunk (per symbols_bw_ext.h) and handles bots
+//      fine on its own; bot ping is cosmetic. So: three detours, not four.
 //
-// r312 does three things:
-//   1. BW_USE_NETMSG flipped to 1. The netbuf is MANDATORY, not optional.
-//      Netmsg_Push must run before SV_DirectConnect, Netmsg_Pop after.
-//   2. SV_DirectConnect r4 fixed. r311 hand-packed (qport<<32) into r4. The
-//      SV_DirectConnect decompile reads r4's LOW short as the port and shifts
-//      it itself (_sStack00000018 = param_2; uVar2 = (short)...; <<0x20).
-//      SV_AddTestClient passes r4 = uStack_518<<0x20 where uStack_518 is read
-//      from the memset'd 12-byte netadr = 0, i.e. the real test-client path
-//      passes r4 = 0. r312 passes r4 = 0 to match. qport already reaches the
-//      engine correctly through r8/r9 (and the connect string's \qport\).
-//   3. A pre-call dump of all 8 SV_DirectConnect args + the netbuf slot the
-//      engine is about to consume, printed BEFORE the call, so a frozen run
-//      still shows exactly what was passed.
+//   2. The IW3 SV_BotUserMove_Stub gates bot input on
+//      g_clients[clientNum].sess.archiveTime == 0 (suppress input during
+//      killcam/replay). structs_bw_ext.h does not expose sess.archiveTime,
+//      so that gate is omitted. Consequence: T4 bots are not frozen during
+//      killcam. Cosmetic; revisit if it matters.
 //
-// r294 proved, with all our detours disabled, that vanilla SV_AddTestClient
-// (0x82281F08) hangs on Xenia by itself. Root cause confirmed by full
-// decompile: after SV_DirectConnect places the bot, SV_AddTestClient runs a
-// post-scan loop using NET_CompareBaseAdr to re-locate the bot's slot. Two
-// NA_BOT (all-zero) netadrs compare "equal", so on Xenia (XLive-offline, host
-// netadr also zero-ish) the scan matches the HOST (slot 0) first, then writes
-// isTestClient=1 + SV_SendClientGameState + SV_ClientEnterWorld onto the live
-// human host → engine corruption → freeze.
+//   3. codxe-T4 registers GSC builtins via the BW_LookupFunction /
+//      BW_LookupMethod tables dispatched by the codxe-T4 GSC layer, not via
+//      IW3's Scr_AddFunction / Scr_AddMethod. The lookup tables are kept.
 //
-// Path C bypasses SV_AddTestClient entirely. GScr_AddTestClient below is a
-// hand-port of SV_AddTestClient's verified body, with ONE change: the broken
-// post-scan (step 10) is replaced by BW_FindNewBotSlot(), which diffs slot
-// occupancy before/after SV_DirectConnect and explicitly never returns slot 0.
+// Diagnostics: BW_SystemReport + FLUSH markers bracket the SV_AddTestClient()
+// call. If SV_AddTestClient still hangs on T4 Xenia, the last printed marker
+// plus the verified SV_AddTestClient decompile localize the fault to one
+// internal scan — which is then a small targeted detour, NOT a return to
+// Path C.
 //
-// KNOWN RISK (watch the r312 log): SV_DirectConnect itself runs THREE
-// NET_CompareBaseAdr / NET_CompareAdr scans internally, all against param_1
-// (r3), which we pass all-zero. On Xenia an all-zero netadr can false-match
-// the host the same way SV_AddTestClient's post-scan did. If the log shows
-// "reconnect rejected : too soon" or a hang right after "Client %i
-// connecting...", the fix is to give each bot a UNIQUE non-zero fake netadr
-// instead of all-zero. Do NOT pre-empt this — let the log decide.
-//
-// SV_AddTestClient body — decompiler-verified, TU7 default_mp.xex:
-//   1. pre-scan svs.clients for first CS_FREE slot; abort if none
-//   2. rand()/format → xuid string         (we use our own LCG + hex format)
-//   3. rand()/format → xnaddr string
-//   4. build connect string                (we build our own, WITH \invited\1)
-//   5. Netmsg_Push(connectbuf)             [0x8226CE38]
-//   6. memset(netadr, 0, 12)               (type field = 0 = NA_BOT)
-//   7. qport = counter++                   (our own counter, not engine's)
-//   8. SV_DirectConnect(0, 0, 0xC,
-//                       xuidPtr, xnaddrPtr, qport, qport+1, maxclients)
-//                                          [0x822815B0]
-//   9. Netmsg_Pop()                        [0x8226CE58]
-//  10. >>> SKIP vanilla NET_CompareBaseAdr post-scan — REPLACED <<<
-//  11. cl->isTestClient = 1                (write +0xB561C)
-//      SV_SendClientGameState(cl)          [0x82280080]
-//      memset(buf44, 0, 0x2c)
-//      SV_ClientEnterWorld(cl, buf44)      [0x82280598]
-//      return &g_entities[slot]
-//
-// The r292 Path C attempt failed only because BW_BuildConnectPacket returned
-// _snprintf's value (a bogus stack pointer on this toolchain) instead of a
-// byte count, so the build was treated as failed and Path C never executed.
-// r295 eliminates _snprintf entirely — the connect string is assembled by a
-// tiny manual appender (BW_StrAppend) that tracks length itself.
-//
-// Every engine call below is traced directly to the Ghidra decompile. No
-// unverified assumptions remain. Heavy FLUSH-N DbgPrint markers bracket each
-// engine call so that, if anything still hangs, the last printed marker names
-// the exact culprit.
-//
-// All three AI-driver detours remain OFF in r312 (CODXE_DIAG_* = 0). They are
-// re-enabled, with proper client-state guards, only AFTER Path C is confirmed
-// to spawn cleanly.
+// Verified engine addresses (TU7 default_mp.xex, symbols_bw_ext.h):
+//   SV_AddTestClient    0x82281F08   (returns gentity_s*, no args)
+//   SV_UserinfoChanged  0x82280690
+//   SV_BotUserMove      0x82286D68
+//   SV_ClientThink      0x82280F38
+//   G_SelectWeaponIndex 0x8225D6D8
 //
 
 #include "pch.h"
@@ -124,7 +58,7 @@
 #include <cmath>
 #include <cstring>
 
-#pragma warning(disable: 4505)  // unreferenced local fn (hook bodies)
+#pragma warning(disable: 4505)  // unreferenced local fn
 
 namespace t4
 {
@@ -132,43 +66,6 @@ namespace mp
 {
 
 using namespace t4::mp::bw;
-
-// ===========================================================================
-// r312 — netbuf is MANDATORY, not a bisect knob
-// ===========================================================================
-// The SV_DirectConnect decompile (0x822815B0) shows the function does NOT
-// receive the connect string as a parameter. Its first action is to index the
-// netbuf by the depth counter (DAT_82e1ce40) and dereference the slot to find
-// the connect string:
-//     pcVar8 = *(char **)(*(uint*)(&DAT_82e1cea4 + depth*4) + 4);
-//     Q_strncpyz(buf, pcVar8, 0x400);
-// Netmsg_Push is what writes that slot. Push and SV_DirectConnect are the
-// producer/consumer halves of ONE handshake (push -> call -> pop), exactly as
-// SV_AddTestClient uses them. r311's BW_USE_NETMSG=0 did not bisect a fault
-// inside SV_DirectConnect — it CREATED one: with no push, SV_DirectConnect
-// read an unpopulated slot, got a wild char*, and Q_strncpyz / Info_ValueForKey
-// walked it forever -> the r311 hang between FLUSH-3 and FLUSH-4.
-//
-//   1 = use the engine netbuf (REQUIRED — this is the only correct value).
-//   0 = skip push/pop. Kept ONLY to reproduce the r311 hang on demand.
-//       Do NOT ship with 0.
-//
-// NOTE: declared `volatile`, NOT `static const`. The project builds with /WX
-// (warnings-as-errors); a plain `static const int = 1` makes `if(BW_USE_NETMSG)`
-// a constant expression and triggers C4127 -> hard error. `volatile` tells the
-// compiler the value may change, so the `if` is not "constant", C4127 is
-// silenced, and behaviour is identical. VS2010-safe (no constexpr).
-// ===========================================================================
-static volatile int BW_USE_NETMSG = 1;
-
-// r311 — engine netbuf globals (verified from the FUN_8226ce38 decompile:
-// Netmsg_Push passes &DAT_82e1ce40 as the depth-counter pointer).
-static const unsigned int BW_NETBUF_DEPTH_ADDR  = 0x82E1CE40u;
-static const unsigned int BW_NETBUF_OFFSET_ADDR = 0x82DCCE38u;
-
-// r312 — netbuf consumer slot base. SV_DirectConnect reads the connect string
-// from (&DAT_82e1ce84 + (depth & 0x3fffffff)*4); we dump that slot pre-call.
-static const unsigned int BW_NETBUF_SLOT_BASE   = 0x82E1CE84u;
 
 // ---------------------------------------------------------------------------
 // Per-client AI input state
@@ -222,7 +119,6 @@ static const BotAction_t BotActions[] = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Path C uses the verified engine global directly — see symbols_bw_ext.h.
 static inline clientBW_t *BW_GetClient(int clientNum)
 {
     return reinterpret_cast<clientBW_t *>(
@@ -246,135 +142,15 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
     return ent;
 }
 
-// ===========================================================================
-// PATH C — bot spawn
-// ===========================================================================
-
-// --- tiny LCG so we never touch the engine's rand state -------------------
-static unsigned int g_botRandState = 0x1A2B3C4Du;
-
-static unsigned int BW_BotRand()
-{
-    // Numerical Recipes LCG constants — good enough for fake xuid/xnaddr.
-    g_botRandState = g_botRandState * 1664525u + 1013904223u;
-    return g_botRandState;
-}
-
-// --- our own qport counter ------------------------------------------------
-static unsigned short g_botQport = 0x4000;
-
-// --- manual string appender (NO _snprintf — that was the r292 bug) --------
-//
-// Appends src to dst at *pos, NUL-terminates, advances *pos. Never overruns
-// cap. Returns false if it had to truncate.
-static bool BW_StrAppend(char *dst, int cap, int *pos, const char *src)
-{
-    int p = *pos;
-    while (*src && p < cap - 1)
-        dst[p++] = *src++;
-    dst[p] = '\0';
-    *pos = p;
-    return (*src == '\0');
-}
-
-// Append an 8-digit lowercase hex value.
-static bool BW_StrAppendHex8(char *dst, int cap, int *pos, unsigned int v)
-{
-    static const char hexdig[] = "0123456789abcdef";
-    char tmp[9];
-    for (int i = 7; i >= 0; --i)
-    {
-        tmp[i] = hexdig[v & 0xF];
-        v >>= 4;
-    }
-    tmp[8] = '\0';
-    return BW_StrAppend(dst, cap, pos, tmp);
-}
-
-// Append a decimal int.
-static bool BW_StrAppendInt(char *dst, int cap, int *pos, int v)
-{
-    char tmp[16];
-    int  n = 0;
-    if (v < 0) { tmp[n++] = '-'; v = -v; }
-    char digs[12];
-    int  d = 0;
-    do { digs[d++] = static_cast<char>('0' + (v % 10)); v /= 10; } while (v);
-    while (d > 0) tmp[n++] = digs[--d];
-    tmp[n] = '\0';
-    return BW_StrAppend(dst, cap, pos, tmp);
-}
-
-// --- slot-finding ---------------------------------------------------------
-//
-// Replaces SV_AddTestClient's broken NET_CompareBaseAdr post-scan. We snapshot
-// which slots are occupied (state != CS_FREE) BEFORE SV_DirectConnect, then
-// after, find the slot that newly became occupied. Slot 0 (host) is never
-// returned. CS_FREE == 0 (verified: SV_AddTestClient pre-scan tests `*piVar18
-// == 0`).
-
-static bool s_slotOccupiedBefore[MAX_CLIENTS_BW];
-
-static void BW_SnapshotSlots(int maxclients)
-{
-    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
-        s_slotOccupiedBefore[i] = false;
-
-    for (int i = 0; i < maxclients && i < MAX_CLIENTS_BW; ++i)
-    {
-        clientBW_t *cl = BW_GetClient(i);
-        // state is the first int of client_t.
-        const int state = *reinterpret_cast<const int *>(cl);
-        s_slotOccupiedBefore[i] = (state != 0);
-    }
-}
-
-// Returns the newly-occupied slot (1..maxclients-1), or -1 if none / only
-// slot 0 changed.
-static int BW_FindNewBotSlot(int maxclients)
-{
-    for (int i = 1; i < maxclients && i < MAX_CLIENTS_BW; ++i)  // i starts at 1: skip host
-    {
-        clientBW_t *cl = BW_GetClient(i);
-        const int state = *reinterpret_cast<const int *>(cl);
-        if (state != 0 && !s_slotOccupiedBefore[i])
-            return i;
-    }
-    return -1;
-}
-
-// Pre-scan for a free slot (mirrors SV_AddTestClient step 1). Returns true if
-// at least one slot in 1..maxclients-1 is CS_FREE.
-static bool BW_HasFreeSlot(int maxclients)
-{
-    for (int i = 1; i < maxclients && i < MAX_CLIENTS_BW; ++i)
-    {
-        clientBW_t *cl = BW_GetClient(i);
-        const int state = *reinterpret_cast<const int *>(cl);
-        if (state == 0)
-            return true;
-    }
-    return false;
-}
-
-// --- SYSTEM REPORT --------------------------------------------------------
-//
-// imagedump-style diagnostic. Dumps the engine-global state to the Xenia
-// log in one shot so each build is self-verifying.
-//
-// r309: the engine globals are now the codxe-verified T4 addresses
-// (svsHeader 0x84F85100, g_entities 0x82BAD1B0). This report confirms they
-// are live: with a match running it should show YOUR name at slot 0 and a
-// sane server time. If slot 0 still reads empty, the server was not up when
-// addtestclient() fired.
+// ---------------------------------------------------------------------------
+// SYSTEM REPORT — engine-global sanity dump (kept from r3xx diagnostics)
+// ---------------------------------------------------------------------------
 
 static void BW_DumpClientSlot(const char *cl, int slot)
 {
-    // state = first int of client_t (clientHeader_t.state); name at +0x21328.
     const int   state = *reinterpret_cast<const int *>(cl);
     const char *name  = cl + BW_CLIENT_NAME_OFF;
 
-    // Copy name defensively — it may be garbage / unterminated.
     char namebuf[36];
     int  n = 0;
     for (; n < 32; ++n)
@@ -391,14 +167,11 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r312) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r314) =====\n");
 
-    // --- svsHeader / client array ----------------------------------------
-    // svsHeader (0x84F85100) -> serverStaticHeader_t { client_t* clients;
-    // int time; }. .clients is the client_t array base.
-    const unsigned int hdrAddr   = BW_ADDR_SVSHEADER;
-    const unsigned int clientsP  = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
-    const int          svTime    = BW_svs_time();
+    const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
+    const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
+    const int          svTime   = BW_svs_time();
 
     DbgPrint("sv_bots: svsHeader @0x%08X  .clients=0x%08X  .time=%d\n",
              hdrAddr, clientsP, svTime);
@@ -414,294 +187,35 @@ static void BW_SystemReport()
         DbgPrint("sv_bots:   svsHeader.clients is 0 — server not up?\n");
     }
 
-    // --- g_entities ------------------------------------------------------
-    // Flat array at a fixed base; print slot 0's entity number as a sanity
-    // check (should be 0 for a live g_entities[0]).
-    const unsigned int gentBase = BW_ADDR_G_ENTITIES;
-    const int gent0Number = *reinterpret_cast<const int *>(gentBase + 0x0);
+    const unsigned int gentBase    = BW_ADDR_G_ENTITIES;
+    const int          gent0Number = *reinterpret_cast<const int *>(gentBase + 0x0);
     DbgPrint("sv_bots: g_entities @0x%08X stride=0x%X  ent[0].s.number=%d\n",
              gentBase, BW_GENTITY_STRIDE, gent0Number);
 
     DbgPrint("sv_bots: maxclients (constant) = %d\n", MAX_CLIENTS_BW);
-
-    // r311 — netbuf state, so we can see if the push/pop arena is already
-    // dirty (depth should be 0 before the first Netmsg_Push).
-    {
-        const int useNetmsg = BW_USE_NETMSG;  // read volatile into a plain int
-        DbgPrint("sv_bots: netbuf depth=%d offset=%d  (BW_USE_NETMSG=%d)\n",
-                 *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
-                 *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR),
-                 useNetmsg);
-    }
-
     DbgPrint("sv_bots: ===== END REPORT =====\n");
 }
 
-// --- the spawn itself -----------------------------------------------------
-//
-// Returns the bot's gentity on success, nullptr on failure. Mirrors the
-// verified SV_AddTestClient body; see the file header for the step map.
-//
-// r311: the actual body is BW_AddBotPathC_Impl. BW_AddBotPathC is a thin
-// re-entrancy guard wrapper — if anything recurses into the spawn path
-// (a bad call target returning into our frame, as r307..r310 did), it is
-// logged once and rejected instead of driving the guest stack to overflow.
-
-static gentity_s *BW_AddBotPathC_Impl(const char * /*requestedName*/)
-{
-    // Full system diagnostic FIRST — prints regardless of what follows.
-    BW_SystemReport();
-
-    const int maxclients = BW_sv_maxclients();
-    DbgPrint("sv_bots: [PATH-C] begin, maxclients=%d\n", maxclients);
-
-    if (maxclients <= 1)
-    {
-        DbgPrint("sv_bots: [PATH-C] FAIL: maxclients<=1 (server not up?)\n");
-        return nullptr;
-    }
-
-    // Step 1 — pre-scan for a free slot.
-    if (!BW_HasFreeSlot(maxclients))
-    {
-        DbgPrint("sv_bots: [PATH-C] FAIL: no free slot\n");
-        return nullptr;
-    }
-
-    // Snapshot occupancy for the post-DirectConnect diff.
-    BW_SnapshotSlots(maxclients);
-
-    // Steps 2-3 — fake xuid + xnaddr hex strings.
-    char xuidStr[24];
-    {
-        int p = 0;
-        xuidStr[0] = '\0';
-        BW_StrAppendHex8(xuidStr, sizeof(xuidStr), &p, BW_BotRand());
-        BW_StrAppendHex8(xuidStr, sizeof(xuidStr), &p, BW_BotRand());
-    }
-
-    char xnaddrStr[40];
-    {
-        int p = 0;
-        xnaddrStr[0] = '\0';
-        BW_StrAppendHex8(xnaddrStr, sizeof(xnaddrStr), &p, BW_BotRand());
-        BW_StrAppendHex8(xnaddrStr, sizeof(xnaddrStr), &p, BW_BotRand());
-        BW_StrAppendHex8(xnaddrStr, sizeof(xnaddrStr), &p, BW_BotRand());
-        BW_StrAppendHex8(xnaddrStr, sizeof(xnaddrStr), &p, BW_BotRand());
-    }
-
-    // Step 4 — build the connect string. WITH \invited\1 so SV_DirectConnect
-    // takes its safe "invited" CS_FREE-scan path. Fields mirror the engine's
-    // format string (verified at 0x82040A30) plus \invited.
-    //
-    // The leading "connect " keyword + the userinfo string. SV_DirectConnect
-    // parses this out of the netbuf.
-    char connectBuf[1024];
-    {
-        int p = 0;
-        connectBuf[0] = '\0';
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "connect \"");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\cg_predictItems\\1");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\cl_anonymous\\0");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\color\\4");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\head\\default");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\model\\multi");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\snaps\\20");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\rate\\5000");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\name\\BWBot");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\protocol\\");
-        BW_StrAppendInt(connectBuf, sizeof(connectBuf), &p, 92);   // 0x5c
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\qport\\");
-        BW_StrAppendInt(connectBuf, sizeof(connectBuf), &p, static_cast<int>(g_botQport));
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\xuid\\");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, xuidStr);
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\xnaddr\\");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, xnaddrStr);
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\natType\\2");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\\invited\\1");
-        BW_StrAppend(connectBuf, sizeof(connectBuf), &p, "\"");
-        DbgPrint("sv_bots: [PATH-C] connect string built, len=%d\n", p);
-    }
-
-    // Step 5 — push the connect string into the netbuf.
-    //
-    // r312: gated by BW_USE_NETMSG, which is now 1 (mandatory). Netmsg_Push is
-    // the PRODUCER half of the handshake; SV_DirectConnect is the consumer —
-    // it reads the connect string back out of the netbuf slot indexed by the
-    // depth counter. Netmsg_Push / Netmsg_Pop are a balanced push/pop stack —
-    // they MUST be gated together by the SAME flag so the pair stays balanced.
-    DbgPrint("sv_bots: [PATH-C] netbuf depth=%d offset=%d\n",
-             *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
-             *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR));
-    DbgPrint("sv_bots: [PATH-C] FLUSH-1 before Netmsg_Push\n");
-    if (BW_USE_NETMSG)
-        Netmsg_Push(connectBuf);
-    else
-        DbgPrint("sv_bots: [PATH-C] Netmsg_Push SKIPPED (bisect)\n");
-    DbgPrint("sv_bots: [PATH-C] FLUSH-2 after Netmsg_Push\n");
-
-    // Step 6-7 — netadr is all-zero (NA_BOT). qport from our own counter.
-    const unsigned short qport = g_botQport++;
-
-    // Step 8 — SV_DirectConnect. 8-arg ABI re-verified against the
-    // SV_DirectConnect AND SV_AddTestClient decompiles:
-    //   r3  = netadr bytes 0..7   = 0   (SV_AddTestClient passes uStack_51c,
-    //                                    a read from the memset'd netadr = 0)
-    //   r4  = netadr bytes 8..11  = 0   (SV_AddTestClient: uStack_518<<0x20;
-    //                                    uStack_518 is also memset'd = 0.
-    //                                    SV_DirectConnect reads r4's LOW short
-    //                                    as the port and shifts it ITSELF —
-    //                                    do NOT hand-pack qport<<32 here.)
-    //   r5  = 0xC                       (netadr size)
-    //   r6  = xuid string ptr
-    //   r7  = xnaddr string ptr
-    //   r8  = qport
-    //   r9  = qport+1
-    //   r10 = maxclients
-    //
-    // r312: dump all 8 args + the netbuf slot SV_DirectConnect will read,
-    // BEFORE the call, so a frozen run still shows exactly what was passed.
-    {
-        const unsigned int depth = *reinterpret_cast<const unsigned int *>(BW_NETBUF_DEPTH_ADDR);
-        // The netbuf consumer reads the slot at (&DAT_82e1ce84 + depth*4);
-        // the engine masks depth with 0x3fffffff first.
-        const unsigned int slotAddr = BW_NETBUF_SLOT_BASE + ((depth & 0x3fffffffu) << 2);
-        const unsigned int slotVal  = *reinterpret_cast<const unsigned int *>(slotAddr);
-        DbgPrint("sv_bots: [PATH-C] netbuf consumer: depth=%u slot@0x%08X val=%u\n",
-                 depth, slotAddr, slotVal);
-    }
-    DbgPrint("sv_bots: [PATH-C] SV_DirectConnect args:\n");
-    DbgPrint("sv_bots:   r3 =0x%08X  r4 =0x%08X  r5 =0x%X\n",
-             0u, 0u, 0xCu);
-    DbgPrint("sv_bots:   r6 =0x%08X (xuid)  r7 =0x%08X (xnaddr)\n",
-             reinterpret_cast<unsigned int>(xuidStr),
-             reinterpret_cast<unsigned int>(xnaddrStr));
-    DbgPrint("sv_bots:   r8 =%u (qport)  r9 =%u  r10=%d (maxclients)\n",
-             static_cast<unsigned int>(qport),
-             static_cast<unsigned int>(qport) + 1u,
-             maxclients);
-
-    DbgPrint("sv_bots: [PATH-C] FLUSH-3 before SV_DirectConnect (qport=0x%x)\n", qport);
-    SV_DirectConnect_BW(
-        0ULL,                                                       // r3  netadr[0..7]  = 0
-        0ULL,                                                       // r4  netadr[8..11] = 0  (was qport<<32 — wrong)
-        0xCULL,                                                     // r5  netadr size
-        static_cast<unsigned __int64>(
-            reinterpret_cast<unsigned int>(xuidStr)),               // r6
-        static_cast<unsigned __int64>(
-            reinterpret_cast<unsigned int>(xnaddrStr)),             // r7
-        static_cast<unsigned __int64>(qport),                       // r8
-        static_cast<unsigned __int64>(qport) + 1,                   // r9
-        static_cast<unsigned __int64>(maxclients));                 // r10
-    DbgPrint("sv_bots: [PATH-C] FLUSH-4 after SV_DirectConnect\n");
-
-    // Step 9 — pop the netbuf (balances the push).
-    //
-    // r312: gated by the SAME BW_USE_NETMSG flag as the push above.
-    DbgPrint("sv_bots: [PATH-C] FLUSH-5 before Netmsg_Pop\n");
-    if (BW_USE_NETMSG)
-        Netmsg_Pop();
-    else
-        DbgPrint("sv_bots: [PATH-C] Netmsg_Pop SKIPPED (bisect)\n");
-    DbgPrint("sv_bots: [PATH-C] FLUSH-6 after Netmsg_Pop\n");
-
-    // Step 10 — REPLACED. Find the bot's slot ourselves, skipping slot 0.
-    const int slot = BW_FindNewBotSlot(maxclients);
-    if (slot < 0)
-    {
-        DbgPrint("sv_bots: [PATH-C] FAIL: no new slot after SV_DirectConnect\n");
-        return nullptr;
-    }
-    DbgPrint("sv_bots: [PATH-C] bot landed in slot %d\n", slot);
-
-    clientBW_t *cl = BW_GetClient(slot);
-
-    // Step 11 — finalize: isTestClient, gamestate, enter world.
-    cl->isTestClient = 1;
-
-    DbgPrint("sv_bots: [PATH-C] FLUSH-7 before SV_SendClientGameState\n");
-    SV_SendClientGameState_BW(cl, 0, 0, 0, 0);
-    DbgPrint("sv_bots: [PATH-C] FLUSH-8 after SV_SendClientGameState\n");
-
-    unsigned char buf44[0x2c];
-    std::memset(buf44, 0, sizeof(buf44));
-
-    DbgPrint("sv_bots: [PATH-C] FLUSH-9 before SV_ClientEnterWorld\n");
-    SV_ClientEnterWorld_BW(cl, buf44, 0, 0, 0, 0, 0, 0);
-    DbgPrint("sv_bots: [PATH-C] FLUSH-10 after SV_ClientEnterWorld\n");
-
-    gentity_s *ent = BW_g_entity(slot);
-    DbgPrint("sv_bots: [PATH-C] SUCCESS: bot slot %d, entnum=%d\n", slot, ent->s.number);
-    return ent;
-}
-
-// r311 — re-entrancy guard wrapper. If a bad engine call target ever returns
-// into the spawn path again, this rejects the recursive call with a single
-// log line instead of letting the guest stack overflow.
-static gentity_s *BW_AddBotPathC(const char *requestedName)
-{
-    static volatile int s_inPathC = 0;
-
-    if (s_inPathC)
-    {
-        DbgPrint("sv_bots: [PATH-C] RE-ENTRY BLOCKED — spawn path recursed "
-                 "(bad call target?)\n");
-        return nullptr;
-    }
-
-    s_inPathC = 1;
-    gentity_s *result = BW_AddBotPathC_Impl(requestedName);
-    s_inPathC = 0;
-    return result;
-}
-
-// ---------------------------------------------------------------------------
-// G_SelectWeaponIndex detour — track per-client weapon (driver, OFF in r312)
-// ---------------------------------------------------------------------------
-
-static Detour G_SelectWeaponIndex_Detour;
-
-static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
-{
-    if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
-        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
-
-    G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
-}
-
-// ---------------------------------------------------------------------------
-// SV_BotUserMove detour — core bot driver (OFF in r312, re-enabled later)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// SV_BotUserMove detour — the AI input driver
+// ===========================================================================
+// 1:1 port of the IW3 reference SV_BotUserMove_Stub. T4 difference: the IW3
+// reference gates the input block on g_clients[clientNum].sess.archiveTime==0
+// (killcam suppression). structs_bw_ext.h does not expose sess.archiveTime,
+// so the gate is omitted — T4 bots are not input-frozen during killcam.
 
 static Detour SV_BotUserMove_Detour;
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
-    }
 
     const int clientNum = static_cast<int>(
         (reinterpret_cast<char *>(cl) - reinterpret_cast<char *>(BW_svs_clients()))
         / static_cast<int>(BW_CLIENT_STRIDE));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
-    }
-
-    if (cl->header.netchan.remoteAddress.type != NA_BOT)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
-        return;
-    }
-    if (cl->isTestClient == 0)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
-        return;
-    }
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -769,12 +283,31 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     SV_ClientThink_BW(cl, &cmd);
 }
 
-// ---------------------------------------------------------------------------
-// SV_UserinfoChanged detour — custom bot names (OFF in r312)
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// G_SelectWeaponIndex detour — track per-client weapon
+// ===========================================================================
 
-static char    s_pendingBotName[32] = {0};
-static Detour  SV_UserinfoChanged_Detour;
+static Detour G_SelectWeaponIndex_Detour;
+
+static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
+{
+    if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
+        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
+
+    G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
+}
+
+// ===========================================================================
+// SV_UserinfoChanged detour — custom bot names
+// ===========================================================================
+// 1:1 port of the IW3 reference. When SV_AddTestClient -> SV_DirectConnect
+// connects a bot, the engine calls SV_UserinfoChanged with the client in
+// NA_BOT / CS_CONNECTED state and the raw connect userinfo loaded. We patch
+// the "name" key before the original runs, so the chosen name propagates
+// through SV_ClientEnterWorld and the configstring broadcast.
+
+static char   s_pendingBotName[32] = {0};
+static Detour SV_UserinfoChanged_Detour;
 
 static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 {
@@ -787,17 +320,6 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
-
-// ===========================================================================
-// r312 DIAGNOSTIC TOGGLES
-// ===========================================================================
-// All driver detours OFF. Path C is a plain GSC builtin — it needs no
-// detours. The detours are for AI input driving and are re-enabled, with
-// client-state guards, once Path C confirms a clean spawn.
-// ===========================================================================
-#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -888,18 +410,24 @@ static void Scr_BotMirror(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// GSC global function — addtestclient(<name>)  → Path C
+// GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
+// 1:1 port of the IW3 reference GScr_AddTestClient: optionally stash a custom
+// name, call the REAL engine SV_AddTestClient(), clear the name. The
+// SV_UserinfoChanged detour applies the name mid-connect.
+//
+// FLUSH markers bracket SV_AddTestClient(). If it hangs on T4 Xenia, FLUSH-A
+// prints and FLUSH-B does not — and the fault is then inside the real engine
+// function, to be fixed with a targeted detour, NOT by reviving Path C.
 
 static void GScr_AddTestClient()
 {
-    char name[32] = "Bot";
-
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) == 1)
     {
         const char *string = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
 
-        int i = 0, j = 0;
+        char name[32];
+        int  i = 0, j = 0;
         if (string)
         {
             for (; string[i] && j < static_cast<int>(sizeof(name)) - 1; ++i)
@@ -913,11 +441,22 @@ static void GScr_AddTestClient()
         if (j < 1)
             Scr_Error_BW("AddTestClient(): name must be at least 1 character long",
                          SCRIPTINSTANCE_SERVER);
+
+        std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
+        s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
     }
 
-    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s' — using Path C\n", name);
+    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n",
+             s_pendingBotName[0] ? s_pendingBotName : "(default)");
 
-    gentity_s *ent = BW_AddBotPathC(name);
+    BW_SystemReport();
+
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A before SV_AddTestClient\n");
+    gentity_s *ent = SV_AddTestClient();
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-B after SV_AddTestClient (ent=0x%08X)\n",
+             reinterpret_cast<unsigned int>(ent));
+
+    s_pendingBotName[0] = '\0';
 
     if (ent)
     {
@@ -926,7 +465,7 @@ static void GScr_AddTestClient()
     }
     else
     {
-        DbgPrint("sv_bots: [ADDTESTCLIENT] Path C returned NULL\n");
+        DbgPrint("sv_bots: [ADDTESTCLIENT] SV_AddTestClient returned NULL\n");
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
@@ -1045,59 +584,40 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
+// THREE detours, matching the IW3 reference minus SV_CalcPings (see file
+// header point 1). All three are installed unconditionally — the IW3
+// reference installs them unconditionally and they are required for a bot to
+// connect (SV_UserinfoChanged) and act (SV_BotUserMove, G_SelectWeaponIndex).
 
 sv_bots::sv_bots()
 {
-    const int useNetmsg = BW_USE_NETMSG;  // read volatile into a plain int
-
-    DbgPrint("sv_bots: T4 BW module init (r312 — netbuf mandatory + ABI fix)\n");
-    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d netmsg=%d\n",
-             CODXE_DIAG_ENABLE_WEAPON_HOOK,
-             CODXE_DIAG_ENABLE_USERINFO_HOOK,
-             CODXE_DIAG_ENABLE_BOTUSERMOVE,
-             useNetmsg);
+    DbgPrint("sv_bots: T4 BW module init (r314 — IW3 reference port, Path C deleted)\n");
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
 
-#if CODXE_DIAG_ENABLE_WEAPON_HOOK
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
     G_SelectWeaponIndex_Detour.Install();
     DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
-#else
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (r312)\n");
-#endif
 
-#if CODXE_DIAG_ENABLE_BOTUSERMOVE
     SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
     SV_BotUserMove_Detour.Install();
     DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
-#else
-    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (r312)\n");
-#endif
 
-#if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
     SV_UserinfoChanged_Detour.Install();
     DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
-#else
-    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (r312)\n");
-#endif
+
+    DbgPrint("sv_bots: SV_CalcPings NOT detoured (T4 frame fields inert — see header)\n");
 }
 
 sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: T4 BW module shutdown\n");
 
-#if CODXE_DIAG_ENABLE_WEAPON_HOOK
     G_SelectWeaponIndex_Detour.Remove();
-#endif
-#if CODXE_DIAG_ENABLE_BOTUSERMOVE
     SV_BotUserMove_Detour.Remove();
-#endif
-#if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
-#endif
 
     CleanBotArray();
 }
