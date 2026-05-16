@@ -15,8 +15,32 @@
 //     <bot> botStop()              — clear all bot input state
 //
 // ===========================================================================
-// r307 — PATH C bot spawn + BW SYSTEM REPORT diagnostic
+// r311 — netbuf bisect + re-entrancy guard
 // ===========================================================================
+//
+// r307..r310 crashed identically: pressing ADD BOTS produced 65,525 repeats of
+// "[PATH-C] connect string built" / "[PATH-C] FLUSH-1 before Netmsg_Push" and
+// then Xenia's "Overflowed stackpoints!". FLUSH-2 never printed even once.
+//
+// Full decompile of the netbuf chain (FUN_8226ce38 / FUN_8226ce58 /
+// Function_8226CCB8) proved:
+//   - Netmsg_Push / Netmsg_Pop are a BALANCED push/pop stack over a 0x200-byte
+//     arena. Depth counter @0x82E1CE40, running offset @0x82DCCE38.
+//   - Function_8226CCB8 increments the depth counter with NO upper bound. It
+//     is safe ONLY because the engine always pairs every push with a pop.
+//   - Our Path C pushes but the loop never reaches the matching pop, so depth
+//     runs away, the 0x200 arena overruns, 0x200-offset underflows, and the
+//     resulting wild size corrupts memory -> bad return -> recursion -> crash.
+//
+// r311 does two things:
+//   1. BW_USE_NETMSG bisect toggle (default 0) — gate BOTH Netmsg_Push and
+//      Netmsg_Pop together so the pair stays balanced. With 0, the netbuf is
+//      skipped entirely; if Path C now reaches FLUSH-3+, the netbuf pair was
+//      the crash. A new diagnostic prints the netbuf depth/offset BEFORE the
+//      first push so we can see if it was already dirty.
+//   2. A re-entrancy guard on BW_AddBotPathC: any future bad call target that
+//      recurses into the spawn path is logged once and rejected, instead of
+//      driving the guest stack into the ground.
 //
 // r294 proved, with all our detours disabled, that vanilla SV_AddTestClient
 // (0x82281F08) hangs on Xenia by itself. Root cause confirmed by full
@@ -81,6 +105,21 @@ namespace mp
 {
 
 using namespace t4::mp::bw;
+
+// ===========================================================================
+// r311 — netbuf bisect toggle
+// ===========================================================================
+// 0 = skip BOTH Netmsg_Push and Netmsg_Pop (prove the netbuf pair is the
+//     crash; if Path C reaches FLUSH-3+ with this off, it was).
+// 1 = use the engine netbuf (original behaviour).
+// VS2010: static const, NOT constexpr.
+// ===========================================================================
+static const int BW_USE_NETMSG = 0;
+
+// r311 — engine netbuf globals (verified from the FUN_8226ce38 decompile:
+// Netmsg_Push passes &DAT_82e1ce40 as the depth-counter pointer).
+static const unsigned int BW_NETBUF_DEPTH_ADDR  = 0x82E1CE40u;
+static const unsigned int BW_NETBUF_OFFSET_ADDR = 0x82DCCE38u;
 
 // ---------------------------------------------------------------------------
 // Per-client AI input state
@@ -303,7 +342,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r309) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r311) =====\n");
 
     // --- svsHeader / client array ----------------------------------------
     // svsHeader (0x84F85100) -> serverStaticHeader_t { client_t* clients;
@@ -335,6 +374,14 @@ static void BW_SystemReport()
              gentBase, BW_GENTITY_STRIDE, gent0Number);
 
     DbgPrint("sv_bots: maxclients (constant) = %d\n", MAX_CLIENTS_BW);
+
+    // r311 — netbuf state, so we can see if the push/pop arena is already
+    // dirty (depth should be 0 before the first Netmsg_Push).
+    DbgPrint("sv_bots: netbuf depth=%d offset=%d  (BW_USE_NETMSG=%d)\n",
+             *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
+             *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR),
+             BW_USE_NETMSG);
+
     DbgPrint("sv_bots: ===== END REPORT =====\n");
 }
 
@@ -342,8 +389,13 @@ static void BW_SystemReport()
 //
 // Returns the bot's gentity on success, nullptr on failure. Mirrors the
 // verified SV_AddTestClient body; see the file header for the step map.
+//
+// r311: the actual body is BW_AddBotPathC_Impl. BW_AddBotPathC is a thin
+// re-entrancy guard wrapper — if anything recurses into the spawn path
+// (a bad call target returning into our frame, as r307..r310 did), it is
+// logged once and rejected instead of driving the guest stack to overflow.
 
-static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
+static gentity_s *BW_AddBotPathC_Impl(const char * /*requestedName*/)
 {
     // Full system diagnostic FIRST — prints regardless of what follows.
     BW_SystemReport();
@@ -420,8 +472,19 @@ static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
     }
 
     // Step 5 — push the connect string into the netbuf.
+    //
+    // r311 BISECT: gated by BW_USE_NETMSG. Netmsg_Push / Netmsg_Pop are a
+    // balanced push/pop stack — they MUST be gated together by the SAME flag
+    // so the pair stays balanced (skipping only one corrupts the depth
+    // counter the other direction).
+    DbgPrint("sv_bots: [PATH-C] netbuf depth=%d offset=%d\n",
+             *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
+             *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR));
     DbgPrint("sv_bots: [PATH-C] FLUSH-1 before Netmsg_Push\n");
-    Netmsg_Push(connectBuf);
+    if (BW_USE_NETMSG)
+        Netmsg_Push(connectBuf);
+    else
+        DbgPrint("sv_bots: [PATH-C] Netmsg_Push SKIPPED (bisect)\n");
     DbgPrint("sv_bots: [PATH-C] FLUSH-2 after Netmsg_Push\n");
 
     // Step 6-7 — netadr is all-zero (NA_BOT). qport from our own counter.
@@ -451,8 +514,13 @@ static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
     DbgPrint("sv_bots: [PATH-C] FLUSH-4 after SV_DirectConnect\n");
 
     // Step 9 — pop the netbuf (balances the push).
+    //
+    // r311 BISECT: gated by the SAME BW_USE_NETMSG flag as the push above.
     DbgPrint("sv_bots: [PATH-C] FLUSH-5 before Netmsg_Pop\n");
-    Netmsg_Pop();
+    if (BW_USE_NETMSG)
+        Netmsg_Pop();
+    else
+        DbgPrint("sv_bots: [PATH-C] Netmsg_Pop SKIPPED (bisect)\n");
     DbgPrint("sv_bots: [PATH-C] FLUSH-6 after Netmsg_Pop\n");
 
     // Step 10 — REPLACED. Find the bot's slot ourselves, skipping slot 0.
@@ -483,6 +551,26 @@ static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
     gentity_s *ent = BW_g_entity(slot);
     DbgPrint("sv_bots: [PATH-C] SUCCESS: bot slot %d, entnum=%d\n", slot, ent->s.number);
     return ent;
+}
+
+// r311 — re-entrancy guard wrapper. If a bad engine call target ever returns
+// into the spawn path again, this rejects the recursive call with a single
+// log line instead of letting the guest stack overflow.
+static gentity_s *BW_AddBotPathC(const char *requestedName)
+{
+    static volatile int s_inPathC = 0;
+
+    if (s_inPathC)
+    {
+        DbgPrint("sv_bots: [PATH-C] RE-ENTRY BLOCKED — spawn path recursed "
+                 "(bad call target?)\n");
+        return nullptr;
+    }
+
+    s_inPathC = 1;
+    gentity_s *result = BW_AddBotPathC_Impl(requestedName);
+    s_inPathC = 0;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -878,11 +966,12 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r307 — PATH C + SYSTEM REPORT)\n");
-    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: T4 BW module init (r311 — netbuf bisect + reentry guard)\n");
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d netmsg=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
-             CODXE_DIAG_ENABLE_BOTUSERMOVE);
+             CODXE_DIAG_ENABLE_BOTUSERMOVE,
+             BW_USE_NETMSG);
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
