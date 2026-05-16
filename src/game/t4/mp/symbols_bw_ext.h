@@ -39,8 +39,8 @@
 //
 // Hand-hunted (not in stock codxe T4 symbols.h):
 //   SV_AddTestClient        0x82281F08
-//   SV_DirectConnect        0x822815B0   (r291: probe point)
-//   ClientDisconnect        0x82208C90   (r291: probe point)
+//   SV_DirectConnect        0x822815B0
+//   ClientDisconnect        0x82208C90
 //   SV_BotUserMove          0x82286D68
 //   SV_UserinfoChanged      0x82280690
 //   SV_IsTestClient         0x8221D1E0
@@ -49,6 +49,19 @@
 //   Scr_Notify              0x82251460
 //   Scr_AllocString         0x823323F0
 //   G_SelectWeaponIndex     0x8225D6D8
+//
+// r292 Path C additions — netmsg push/pop pair used to inject a synthetic
+// connect packet into the engine's netbuf parser state. SV_DirectConnect
+// reads userinfo from a global parser context populated by push (8226ce38);
+// pop (8226ce58) restores the prior state. SV_AddTestClient itself uses
+// this same pair to inject its synthetic connect string. By calling it
+// ourselves with a userinfo string containing \invited\1, we route through
+// SV_DirectConnect's "invited"-success scan (state==CS_FREE checks only)
+// instead of the broken xuid-mismatch fall-through that triggers the
+// post-scan NET_CompareBaseAdr corruption when vanilla SV_AddTestClient
+// runs its slot-locator loop.
+//   FUN_8226CE38            0x8226CE38   (netmsg buffer push)
+//   FUN_8226CE58            0x8226CE58   (netmsg buffer pop)
 // ============================================================================
 
 #include "structs_bw_ext.h"
@@ -74,24 +87,45 @@ typedef void (*SV_DropClient_t)(clientBW_t *cl, const char *reason, bool tellThe
 static SV_DropClient_t SV_DropClient =
     reinterpret_cast<SV_DropClient_t>(0x8227FDE0);
 
-// ---- Server: connection-path probes (r291 diagnostic) ------------------
+// ---- Server: SV_DirectConnect + netmsg push/pop (r292 Path C) ----------
 //
-// SV_DirectConnect is called from SV_AddTestClient at 0x82282014.
-// It reads the queued connect packet, parses userinfo, allocates or
-// matches a client slot, calls ClientConnect (GSC layer), and returns.
-// Suspected hang point on Xenia bot spawn.
+// SV_DirectConnect reads the parsed userinfo from a GLOBAL netbuf parser
+// state, not from its arguments. Vanilla SV_AddTestClient populates this
+// state via FUN_8226CE38 (push), calls SV_DirectConnect, then calls
+// FUN_8226CE58 (pop) to restore. We reuse the same protocol.
 //
-// PPC ABI passes 64-bit args in single registers. Disassembly shows:
-//   r3 = netadr_t (8 bytes loaded from r1+0x50; for bots, type=NA_BOT=0)
-//   r4 = qport shifted left 32 (high half of arg2)
-typedef int (*SV_DirectConnect_BW_t)(unsigned long long netadr, unsigned long long qport);
+// PPC ABI: 64-bit args in single registers. SV_DirectConnect's
+// disassembly shows:
+//   r3 = netadr_t (8 bytes; for bots, type=NA_BOT=0)
+//   r4 = qport (high half of arg2)
+//   r5, r6, r7 = unused for our path (vanilla passes uninitialized locals)
+//   r8 = xnaddr-related
+//
+// We pass zeros for r5..r8 since the "invited" path doesn't read them.
+
+typedef int (*SV_DirectConnect_BW_t)(unsigned long long netadr,
+                                      unsigned long long qport,
+                                      unsigned long long arg3,
+                                      unsigned long long arg4,
+                                      unsigned long long arg5,
+                                      unsigned long long arg6);
 static SV_DirectConnect_BW_t SV_DirectConnect_BW =
     reinterpret_cast<SV_DirectConnect_BW_t>(0x822815B0);
 
-// ClientDisconnect is called from inside SV_DirectConnect at 0x82281AD8
-// when an existing client with matching XUID is found. On Xenia where
-// host xuid is 0, this MIGHT trigger a self-disconnect-during-tick
-// deadlock. r291 probes whether this path executes.
+// Netmsg buffer push: takes a pointer to a NUL-terminated OOB packet
+// buffer (e.g., "connect \"...\""). Populates the global netbuf parser
+// state so the next SV_DirectConnect call reads from this buffer.
+typedef void (*Netmsg_Push_t)(char *packet_buf);
+static Netmsg_Push_t Netmsg_Push =
+    reinterpret_cast<Netmsg_Push_t>(0x8226CE38);
+
+// Netmsg buffer pop: restores the prior netbuf parser state. Must be
+// called after every Netmsg_Push, even if SV_DirectConnect failed.
+typedef void (*Netmsg_Pop_t)();
+static Netmsg_Pop_t Netmsg_Pop =
+    reinterpret_cast<Netmsg_Pop_t>(0x8226CE58);
+
+// ClientDisconnect (kept for diagnostic probes if needed)
 typedef void (*ClientDisconnect_BW_t)(int clientNum);
 static ClientDisconnect_BW_t ClientDisconnect_BW =
     reinterpret_cast<ClientDisconnect_BW_t>(0x82208C90);
