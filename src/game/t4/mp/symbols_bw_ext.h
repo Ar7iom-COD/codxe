@@ -115,7 +115,7 @@ static SV_DropClient_t SV_DropClient =
 //   r9  = qport + 1
 //   r10 = sv_maxclients
 
-typedef longlong (*SV_DirectConnect_BW_t)(unsigned __int64 netadr_lo,
+typedef __int64 (*SV_DirectConnect_BW_t)(unsigned __int64 netadr_lo,
                                           unsigned __int64 netadr_hi_qport,
                                           unsigned __int64 netadr_len,
                                           unsigned __int64 xuid_ptr,
