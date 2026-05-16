@@ -15,7 +15,7 @@
 //     <bot> botStop()              — clear all bot input state
 //
 // ===========================================================================
-// r295 — PATH C bot spawn (FULLY GHIDRA-VERIFIED)
+// r307 — PATH C bot spawn + BW SYSTEM REPORT diagnostic
 // ===========================================================================
 //
 // r294 proved, with all our detours disabled, that vanilla SV_AddTestClient
@@ -269,6 +269,105 @@ static bool BW_HasFreeSlot(int maxclients)
     return false;
 }
 
+// --- SYSTEM REPORT --------------------------------------------------------
+//
+// imagedump-style diagnostic. Dumps every unverified engine-global
+// interpretation to the Xenia log in ONE shot, so a single run settles the
+// "Part C" indirection question for good.
+//
+// HOW TO READ IT: set your in-game name to something unique in the lobby,
+// load the map, press "add bot". In the log, whichever svs.clients
+// interpretation shows YOUR name at slot 0 (and a small sane state value)
+// is the correct one. That tells us, definitively, whether 0x830AFC90 is
+// the array base or a pointer to it.
+
+static void BW_DumpClientSlot(const char *tag, const char *cl, int slot)
+{
+    // state = first int of client_t; name at +0x21328.
+    const int   state = *reinterpret_cast<const int *>(cl);
+    const char *name  = cl + BW_CLIENT_NAME_OFF;
+
+    // Copy name defensively — it may be garbage / unterminated.
+    char namebuf[36];
+    int  n = 0;
+    for (; n < 32; ++n)
+    {
+        const char ch = name[n];
+        if (ch == '\0') break;
+        namebuf[n] = (static_cast<unsigned char>(ch) >= 0x20 &&
+                      static_cast<unsigned char>(ch) < 0x7F) ? ch : '?';
+    }
+    namebuf[n] = '\0';
+
+    DbgPrint("sv_bots:   %s slot %d: state=%d name=\"%s\"\n", tag, slot, state, namebuf);
+}
+
+static void BW_SystemReport()
+{
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT =====\n");
+
+    // --- svs.clients : two interpretations -------------------------------
+    // (A) 0x830AFC90 IS the client_t array base (no dereference).
+    // (B) 0x830AFC90 HOLDS a pointer to the array (one dereference).
+    const unsigned int rawSvsClients = BW_ADDR_SVS_CLIENTS;
+    const unsigned int derefSvsClients =
+        *reinterpret_cast<const unsigned int *>(BW_ADDR_SVS_CLIENTS);
+
+    DbgPrint("sv_bots: svs.clients addr=0x%08X  *(addr)=0x%08X\n",
+             rawSvsClients, derefSvsClients);
+
+    DbgPrint("sv_bots: [interp A] 0x830AFC90 AS base:\n");
+    {
+        const char *baseA = reinterpret_cast<const char *>(rawSvsClients);
+        BW_DumpClientSlot("A", baseA + 0 * BW_CLIENT_STRIDE, 0);
+        BW_DumpClientSlot("A", baseA + 1 * BW_CLIENT_STRIDE, 1);
+    }
+
+    DbgPrint("sv_bots: [interp B] *(0x830AFC90) AS base:\n");
+    if (derefSvsClients != 0)
+    {
+        const char *baseB = reinterpret_cast<const char *>(derefSvsClients);
+        BW_DumpClientSlot("B", baseB + 0 * BW_CLIENT_STRIDE, 0);
+        BW_DumpClientSlot("B", baseB + 1 * BW_CLIENT_STRIDE, 1);
+    }
+    else
+    {
+        DbgPrint("sv_bots:   B: *(0x830AFC90) is 0 — interp B not viable\n");
+    }
+
+    // --- sv struct : raw bytes + maxclients candidates -------------------
+    const unsigned int rawSv  = BW_ADDR_SV_STRUCT;
+    const unsigned int *svW   = reinterpret_cast<const unsigned int *>(rawSv);
+    DbgPrint("sv_bots: sv @0x%08X  words: %08X %08X %08X %08X %08X\n",
+             rawSv, svW[0], svW[1], svW[2], svW[3], svW[4]);
+
+    // maxclients candidate 1: 0x82FF7C08 IS sv base → field at +0xC.
+    const int mcDirect = *reinterpret_cast<const int *>(rawSv + 0xC);
+    DbgPrint("sv_bots: maxclients candidate (0x82FF7C08+0xC) = %d\n", mcDirect);
+
+    // maxclients candidate 2: 0x82FF7C08 holds a pointer → *ptr +0xC.
+    if (svW[0] != 0)
+    {
+        const int mcIndirect = *reinterpret_cast<const int *>(svW[0] + 0xC);
+        DbgPrint("sv_bots: maxclients candidate (*(0x82FF7C08)+0xC) = %d\n", mcIndirect);
+    }
+    else
+    {
+        DbgPrint("sv_bots: maxclients candidate (*(0x82FF7C08)+0xC) = N/A (*ptr is 0)\n");
+    }
+
+    // --- g_entities ------------------------------------------------------
+    const unsigned int gentBase   =
+        *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENTITIES);
+    const unsigned int gentStride =
+        *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENT_SIZE);
+    DbgPrint("sv_bots: g_entities base=0x%08X stride=0x%X (%d)\n",
+             gentBase, gentStride, static_cast<int>(gentStride));
+
+    DbgPrint("sv_bots: using constant maxclients = %d\n", MAX_CLIENTS_BW);
+    DbgPrint("sv_bots: ===== END REPORT =====\n");
+}
+
 // --- the spawn itself -----------------------------------------------------
 //
 // Returns the bot's gentity on success, nullptr on failure. Mirrors the
@@ -276,6 +375,9 @@ static bool BW_HasFreeSlot(int maxclients)
 
 static gentity_s *BW_AddBotPathC(const char * /*requestedName*/)
 {
+    // Full system diagnostic FIRST — prints regardless of what follows.
+    BW_SystemReport();
+
     const int maxclients = BW_sv_maxclients();
     DbgPrint("sv_bots: [PATH-C] begin, maxclients=%d\n", maxclients);
 
@@ -806,7 +908,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r295 — PATH C bot spawn)\n");
+    DbgPrint("sv_bots: T4 BW module init (r307 — PATH C + SYSTEM REPORT)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
