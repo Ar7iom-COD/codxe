@@ -650,15 +650,26 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// FOUR detours now. Three are the IW3-reference drivers (SV_BotUserMove,
-// G_SelectWeaponIndex, SV_UserinfoChanged). The fourth, NET_CompareBaseAdr_impl,
-// is the r317 fix — installed unconditionally but INERT unless s_botAddInProgress
-// is set, so it only affects the SV_AddTestClient() window. SV_CalcPings is
-// still not detoured (T4 frame fields inert).
+// r319 DIAGNOSTIC: ALL FOUR Install() calls are commented out.
+//
+// r318 proved the freeze is NOT in the hook bodies (both gutted, still froze).
+// Two hypotheses remain:
+//   (b1) the detour MECHANISM corrupts a function when it splices in, OR
+//   (b2) the freeze is NOT our code at all (codxe-core / netplay session).
+//
+// r319 installs ZERO detours. The Detour objects are still constructed (cheap,
+// inert — construction alone patches nothing; only Install() writes memory).
+// If r319 loads past "Awaiting challenge" -> the detour MECHANISM is the cause.
+// If r319 still freezes -> sv_bots is innocent; the freeze is codxe-core or the
+// netplay/XLive session handshake, and the investigation moves entirely off
+// this file.
+//
+// To restore: uncomment the four .Install() lines. The Detour() constructions
+// are left in place so restoring is a pure uncomment, no retyping.
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r318 — DIAG: weapon/userinfo hooks gutted to pass-through)\n");
+    DbgPrint("sv_bots: T4 BW module init (r319 — DIAG: ALL detours NOT installed)\n");
 
     CleanBotArray();
     s_pendingBotName[0]  = '\0';
@@ -666,28 +677,30 @@ sv_bots::sv_bots()
 
     NET_CompareBaseAdr_impl_Detour =
         Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
-    NET_CompareBaseAdr_impl_Detour.Install();
-    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour INSTALLED (inert until bot-add)\n");
+    // NET_CompareBaseAdr_impl_Detour.Install();   // r319: NOT installed
+    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour NOT installed (r319 diag)\n");
 
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-    G_SelectWeaponIndex_Detour.Install();
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
+    // G_SelectWeaponIndex_Detour.Install();       // r319: NOT installed
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour NOT installed (r319 diag)\n");
 
     SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    SV_BotUserMove_Detour.Install();
-    DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
+    // SV_BotUserMove_Detour.Install();            // r319: NOT installed
+    DbgPrint("sv_bots: SV_BotUserMove detour NOT installed (r319 diag)\n");
 
     SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
-    SV_UserinfoChanged_Detour.Install();
-    DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
+    // SV_UserinfoChanged_Detour.Install();        // r319: NOT installed
+    DbgPrint("sv_bots: SV_UserinfoChanged detour NOT installed (r319 diag)\n");
 
-    DbgPrint("sv_bots: SV_CalcPings NOT detoured (T4 frame fields inert — see header)\n");
+    DbgPrint("sv_bots: r319 — module loaded, ZERO detours active\n");
 }
 
 sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: T4 BW module shutdown\n");
 
+    // r319: nothing was installed, so Remove() is a no-op — but harmless to
+    // leave; Detour::Remove() on an un-installed detour does nothing.
     NET_CompareBaseAdr_impl_Detour.Remove();
     G_SelectWeaponIndex_Detour.Remove();
     SV_BotUserMove_Detour.Remove();
