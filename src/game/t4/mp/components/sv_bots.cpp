@@ -38,11 +38,42 @@
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
 //
+// r292 PATH C — bot-spawn fix:
+//
+//   Vanilla SV_AddTestClient (0x82281F08) has two latent bugs that
+//   intersect catastrophically on Xenia offline play:
+//
+//     1. Its hardcoded connect-string format at .rdata 0x82040A30 omits
+//        `\invited\1`. When SV_DirectConnect reads userinfo without an
+//        "invited" key, the EXE_SERVERISFULL branch is taken if any
+//        private slots exist.
+//
+//     2. AFTER SV_DirectConnect returns, vanilla SV_AddTestClient scans
+//        for the bot's assigned slot via NET_CompareBaseAdr. On Xenia
+//        the host's netadr is zero-initialized (looks like NA_BOT=0),
+//        and NET_CompareBaseAdr's implementation falls through to
+//        "equal" when both addresses are NA_BOT — so the host (slot 0)
+//        matches first. Vanilla then stamps `isTestClient=1` on the host
+//        and runs SendClientGameState/ClientEnterWorld against it mid-
+//        tick → engine corruption → freeze.
+//
+//   Path C bypasses vanilla entirely. We build our own connect string
+//   with `\invited\1` baked in, push it via the engine's netbuf parser
+//   (Netmsg_Push / Netmsg_Pop at 0x8226CE38 / 0x8226CE58 — the same pair
+//   vanilla uses), and call SV_DirectConnect directly. This routes
+//   through the "invited"-success path inside SV_DirectConnect, which
+//   uses `state == CS_FREE` checks (no NET_CompareBaseAdr involvement),
+//   properly fills the first free slot, and runs the full ClientConnect
+//   sequence on its own. We never call vanilla SV_AddTestClient, so the
+//   broken post-scan never executes.
+//
 
 #include "pch.h"
 #include "sv_bots.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // MSVC C4505: "unreferenced local function has been removed". Our static
@@ -51,11 +82,6 @@
 // pointers are passed to Detour() but they are never called directly from
 // C++. The optimizer can't see the address-take through the constructor
 // argument, so it complains. /WX promotes this to an error.
-//
-// Disabling at file scope keeps the rest of the project's warnings-as-
-// errors policy intact while letting this file build with the
-// CODXE_DIAG_* toggles turned off (which is exactly when the hooks
-// become statically unreferenced).
 #pragma warning(disable: 4505)
 
 namespace t4
@@ -165,7 +191,6 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
     {
-        // Pass non-game clients through to engine
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
@@ -173,55 +198,21 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
     {
-        // Index out of range — let engine handle it
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
 
-    // ========================================================================
-    // GEMINI FIX D — diagnostic logging + call-original guards
-    // ------------------------------------------------------------------------
-    // On Xenia, SV_BotFrame calls us for the HOST because host.xuid == 0.
-    // We must NOT inject bot input for the host, OR for any non-bot client.
-    //
-    // Defense in depth:
-    //   1. If remoteAddress.type != NA_BOT (host/network client), pass to original.
-    //   2. If isTestClient == 0 (not a test client), pass to original.
-    //
-    // KEY RISK: if our struct offsets are wrong, the host might falsely match
-    // NA_BOT (because uninitialized memory often reads as zero, and NA_BOT == 0).
-    // We log the FIRST 4 invocations to verify our offsets are correct.
-    // ========================================================================
-    static int s_diagCount = 0;
-    if (s_diagCount < 4)
-    {
-        DbgPrint("sv_bots: [BOTMOVE-DIAG #%d] cn=%d remoteAddr.type=%d isTestClient=%d gentity=%p\n",
-                 s_diagCount,
-                 clientNum,
-                 static_cast<int>(cl->header.netchan.remoteAddress.type),
-                 cl->isTestClient,
-                 cl->gentity);
-        s_diagCount++;
-    }
-
-    // Guard 1: real network/host clients should never hit our bot AI
+    // Defense in depth: only inject input for real bot clients.
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
-
-    // Guard 2: must be a real test client
     if (cl->isTestClient == 0)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
-
-    // ========================================================================
-    // PAST THIS POINT: this client is confirmed a real bot we spawned.
-    // Inject GSC-driven usercmd.
-    // ========================================================================
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -292,7 +283,6 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         }
     }
 
-    // "Ack" the previous snapshot so the server keeps generating new ones.
     cl->header.deltaMessage = cl->header.netchan.outgoingSequence - 1;
     SV_ClientThink_BW(cl, &cmd);
 }
@@ -317,79 +307,217 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r291 DIAGNOSTIC TOGGLES
-// ===========================================================================
-// Set CONNECT_PROBES=1 to probe SV_DirectConnect and ClientDisconnect entry/exit.
-// Keep BOTUSERMOVE=1 — that detour is proven safe and gives us baseline coverage.
+// r292 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1   // r292: need this for bot names
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
-#define CODXE_DIAG_ENABLE_CONNECT_PROBES      0  // r291: probe engine bot-spawn path
+#define CODXE_DIAG_ENABLE_CONNECT_PROBES      0   // r292: superseded by Path C
 
-// ===========================================================================
-// r291 connection-path probes — entry/exit tracing for engine bot-spawn path
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// r292 Path C — bot spawn via direct SV_DirectConnect injection
+// ---------------------------------------------------------------------------
 //
-// Flush-marker strategy: after each critical DbgPrint, emit a short marker
-// line. Xenia's log writer can lose 1-2 buffered lines on hard process
-// freeze. The marker is a "tracer" — if it makes it to disk, the line
-// before it did too. If we see [DIRECTCONNECT] ENTRY but no [FLUSH-N]
-// marker after it, the entry message was real but the freeze ate the next
-// line. If we see neither, the entry never executed.
+// We bypass vanilla SV_AddTestClient (0x82281F08) entirely. Vanilla has:
+//   - format string at .rdata 0x82040A30 omits `\invited\1` (causes
+//     SV_DirectConnect to take EXE_SERVERISFULL branch on private slots)
+//   - post-DirectConnect scan via NET_CompareBaseAdr that wrongly matches
+//     the host's zero-initialized netadr against a bot's NA_BOT netadr
+//     on Xenia offline → stamps isTestClient=1 on host → engine freeze
 //
-// Interpretation table (after running and capturing log):
-//   Last marker     | Hang location
-//   ----------------+-------------------------------------------------------
-//   [FLUSH-B]       | First instruction of SV_AddTestClient
-//   [FLUSH-1] or 2  | Inside SV_DirectConnect (didn't return)
-//   [FLUSH-3]       | SV_DirectConnect returned OK; hang downstream
-//   [FLUSH-4]       | ClientDisconnect called — Gemini's host-drop theory!
-//   [FLUSH-C]       | engine returned; hang after that (probably GSC push)
-// ===========================================================================
-#if CODXE_DIAG_ENABLE_CONNECT_PROBES
+// Our implementation builds a connect string WITH `\invited\1`, pushes it
+// to the netbuf parser, calls SV_DirectConnect, then pops. The "invited"-
+// success path inside SV_DirectConnect uses state==CS_FREE checks (no
+// NET_CompareBaseAdr involvement), so the bug doesn't trigger.
+// ---------------------------------------------------------------------------
 
-static Detour SV_DirectConnect_Probe_Detour;
-static Detour ClientDisconnect_Probe_Detour;
+// PRNG state for synthesizing xuid/xnaddr per bot. We don't need
+// cryptographic randomness — just enough variation to keep xuids distinct
+// across bots so SV_DirectConnect's xuid-matching path (which we don't
+// take, but which scans regardless) doesn't see duplicates.
+static unsigned int g_botSpawnSeed = 0x12345678u;
 
-static int SV_DirectConnect_Probe(unsigned long long netadr, unsigned long long qport)
+static unsigned int BW_BotRand()
 {
-    DbgPrint("sv_bots: [DIRECTCONNECT] ENTRY netadr_lo=0x%08X qport=0x%08X\n",
-             (unsigned)(netadr & 0xFFFFFFFFu),
-             (unsigned)(qport >> 32));
-    DbgPrint("sv_bots: [FLUSH-1]\n");
-
-    typedef int (*Orig_t)(unsigned long long, unsigned long long);
-    Orig_t orig = SV_DirectConnect_Probe_Detour.GetOriginal<Orig_t>();
-
-    DbgPrint("sv_bots: [DIRECTCONNECT] calling original...\n");
-    DbgPrint("sv_bots: [FLUSH-2]\n");
-
-    int result = orig(netadr, qport);
-
-    DbgPrint("sv_bots: [DIRECTCONNECT] EXIT result=0x%08X\n", (unsigned)result);
-    DbgPrint("sv_bots: [FLUSH-3]\n");
-    return result;
+    // LCG (Numerical Recipes constants). Sufficient for unique xuids.
+    g_botSpawnSeed = g_botSpawnSeed * 1664525u + 1013904223u;
+    return g_botSpawnSeed;
 }
 
-static void ClientDisconnect_Probe(int clientNum)
+// Count current connected clients (any state != CS_FREE) to detect
+// whether a bot was actually added after SV_DirectConnect returns. We
+// can't trust SV_DirectConnect's return value alone because it returns
+// void/int (depending on path) and the "invited" path goes through
+// LAB_82281C58 → falls through to setup — no explicit success signal.
+static int BW_CountConnectedClients()
 {
-    DbgPrint("sv_bots: [CLIENTDISCONNECT] ENTRY clientNum=%d\n", clientNum);
-    DbgPrint("sv_bots: [FLUSH-4]\n");
-
-    typedef void (*Orig_t)(int);
-    Orig_t orig = ClientDisconnect_Probe_Detour.GetOriginal<Orig_t>();
-
-    DbgPrint("sv_bots: [CLIENTDISCONNECT] calling original...\n");
-    DbgPrint("sv_bots: [FLUSH-5]\n");
-
-    orig(clientNum);
-
-    DbgPrint("sv_bots: [CLIENTDISCONNECT] EXIT clientNum=%d\n", clientNum);
-    DbgPrint("sv_bots: [FLUSH-6]\n");
+    int count = 0;
+    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+    {
+        clientBW_t *cl = BW_GetClient(i);
+        if (cl->header.state != CS_FREE)
+            ++count;
+    }
+    return count;
 }
 
-#endif
+// Find the first newly-occupied client slot after our SV_DirectConnect
+// call. Returns -1 if no new slot was filled (i.e. SV_DirectConnect
+// failed). We compare against a snapshot taken before the call.
+static int BW_FindNewBotSlot(const bool *was_occupied_before)
+{
+    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+    {
+        clientBW_t *cl = BW_GetClient(i);
+        const bool now_occupied = (cl->header.state != CS_FREE);
+        if (now_occupied && !was_occupied_before[i])
+        {
+            // Sanity: must be a bot we just added.
+            if (cl->header.netchan.remoteAddress.type == NA_BOT)
+                return i;
+        }
+    }
+    return -1;
+}
+
+// Build the connect-packet OOB buffer. Format matches what Quake-engine
+// servers expect: `connect "<userinfo>"` (with embedded backslash-prefixed
+// k/v pairs inside the quoted userinfo).
+//
+// Returns total bytes written (including NUL).
+static int BW_BuildConnectPacket(char *out, int outsize, const char *botName)
+{
+    const unsigned int xuid_lo = BW_BotRand();
+    const unsigned int xuid_hi = BW_BotRand();
+    const unsigned int xna0    = BW_BotRand();
+    const unsigned int xna1    = BW_BotRand();
+    const unsigned int xna2    = BW_BotRand();
+    const unsigned int xna3    = BW_BotRand();
+    const unsigned int xna4    = BW_BotRand();
+
+    // OOB connect format. Critical fields:
+    //   \invited\1     → triggers the safe "invited" path in SV_DirectConnect
+    //   \protocol\92   → T4 TU7 protocol version
+    //   \xuid\<hex>    → 16 hex chars; SV_DirectConnect parses as 64-bit
+    //   \xnaddr\<hex>  → 36 hex chars (xnaddr is larger); not strictly
+    //                    required for invited path but vanilla emits it
+    //   \name\<n>      → display name; will be re-stamped by our
+    //                    SV_UserinfoChanged_Hook if s_pendingBotName is set
+    //   \natType\2     → "open" NAT (matches vanilla)
+    //   \qport\<n>     → quake-port; arbitrary unique value per bot
+    //
+    // Other client-cvar fields (cg_predictItems, rate, snaps, etc.) are
+    // re-set by the engine during ClientUserinfoChanged after spawn, so
+    // we don't bother including them. SV_DirectConnect only cares about
+    // invited / xuid / protocol / qport on the invited path.
+    return _snprintf(out, outsize,
+        "connect \"\\invited\\1"
+        "\\protocol\\92"
+        "\\xuid\\%08x%08x"
+        "\\xnaddr\\%08x%08x%08x%08x%08x"
+        "\\name\\%s"
+        "\\natType\\2"
+        "\\qport\\%d"
+        "\"",
+        xuid_hi, xuid_lo,
+        xna0, xna1, xna2, xna3, xna4,
+        botName,
+        static_cast<int>(BW_BotRand() & 0xFFFF));
+}
+
+// Spawn a bot via direct SV_DirectConnect injection. Returns the
+// gentity_s* for the newly-occupied slot, or NULL on failure.
+static gentity_s *BW_AddBotPathC(const char *botName)
+{
+    // Snapshot current slot occupancy so we can identify the new slot.
+    bool was_occupied[MAX_CLIENTS_BW];
+    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+    {
+        clientBW_t *cl = BW_GetClient(i);
+        was_occupied[i] = (cl->header.state != CS_FREE);
+    }
+
+    const int before = BW_CountConnectedClients();
+    DbgPrint("sv_bots: [PATH-C] spawn start: %d/%d slots in use\n",
+             before, MAX_CLIENTS_BW);
+
+    // Build connect packet.
+    char packet[1024];
+    const int written = BW_BuildConnectPacket(packet, sizeof(packet), botName);
+    if (written <= 0 || written >= static_cast<int>(sizeof(packet)))
+    {
+        DbgPrint("sv_bots: [PATH-C] FAIL: connect-packet build failed (%d)\n", written);
+        return nullptr;
+    }
+    DbgPrint("sv_bots: [PATH-C] packet built (%d bytes)\n", written);
+
+    // Push to engine netbuf parser. SV_DirectConnect will read its
+    // userinfo from the parser state, not from arguments.
+    Netmsg_Push(packet);
+
+    // Call SV_DirectConnect. Args:
+    //   r3 = netadr (8 bytes; type=NA_BOT in low 32, rest zero)
+    //   r4 = qport packed in high half (we pass 0; SV_DirectConnect reads
+    //        qport from userinfo \qport key when type==NA_BOT)
+    //   r5..r8 = unused for invited path
+    //
+    // NA_BOT = 0, so netadr_lo = 0x00000000.
+    SV_DirectConnect_BW(/* netadr */ 0,
+                        /* qport  */ 0,
+                        /* arg3   */ 0,
+                        /* arg4   */ 0,
+                        /* arg5   */ 0,
+                        /* arg6   */ 0);
+
+    // Pop netbuf. MUST be called even on failure.
+    Netmsg_Pop();
+
+    const int after = BW_CountConnectedClients();
+    DbgPrint("sv_bots: [PATH-C] spawn done:  %d/%d slots in use (delta=%+d)\n",
+             after, MAX_CLIENTS_BW, after - before);
+
+    if (after <= before)
+    {
+        DbgPrint("sv_bots: [PATH-C] FAIL: no new slot occupied\n");
+        return nullptr;
+    }
+
+    const int slot = BW_FindNewBotSlot(was_occupied);
+    if (slot < 0)
+    {
+        DbgPrint("sv_bots: [PATH-C] FAIL: occupancy increased but no NA_BOT slot found\n");
+        return nullptr;
+    }
+
+    // Safety: refuse to return slot 0 (host). If we somehow ended up
+    // there, abort — the bug we're fixing manifested as slot-0 corruption,
+    // so refuse to play that game even by accident.
+    if (slot == 0)
+    {
+        DbgPrint("sv_bots: [PATH-C] CRITICAL: bot landed in slot 0 (HOST) - aborting\n");
+        return nullptr;
+    }
+
+    clientBW_t *cl = BW_GetClient(slot);
+    DbgPrint("sv_bots: [PATH-C] SUCCESS: bot in slot %d, gentity=%p, isTestClient=%d, addr.type=%d\n",
+             slot, cl->gentity, cl->isTestClient,
+             static_cast<int>(cl->header.netchan.remoteAddress.type));
+
+    // SV_DirectConnect's invited path does NOT set isTestClient — that's
+    // vanilla SV_AddTestClient's job. We have to stamp it ourselves, or
+    // SV_BotFrame won't drive our bot.
+    cl->isTestClient = 1;
+
+    // Sanity: gentity must be linked. If SV_DirectConnect succeeded but
+    // gentity is null, ClientConnect didn't run or didn't populate it.
+    if (!cl->gentity)
+    {
+        DbgPrint("sv_bots: [PATH-C] WARNING: slot %d has null gentity\n", slot);
+        return nullptr;
+    }
+
+    return cl->gentity;
+}
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -463,8 +591,6 @@ static void Scr_BotMirror(scr_entref_t entref)
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
         Scr_Error_BW("Usage: <bot> botMirror(<client>);", SCRIPTINSTANCE_SERVER);
 
-    // T4 Scr_GetEntityNum returns the entity number directly (vs IW3
-    // Scr_GetEntity which returned a gentity_s*).
     const int targetEntNum = Scr_GetEntityNum(0, SCRIPTINSTANCE_SERVER);
 
     if (targetEntNum < 0 || targetEntNum >= MAX_CLIENTS_BW)
@@ -487,12 +613,13 @@ static void Scr_BotMirror(scr_entref_t entref)
 
 static void GScr_AddTestClient()
 {
+    char name[32] = "Bot";
+
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) == 1)
     {
         const char *string = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
 
-        char name[32];
-        int  i = 0, j = 0;
+        int i = 0, j = 0;
         if (string)
         {
             for (; string[i] && j < static_cast<int>(sizeof(name)) - 1; ++i)
@@ -506,34 +633,30 @@ static void GScr_AddTestClient()
         if (j < 1)
             Scr_Error_BW("AddTestClient(): name must be at least 1 character long",
                          SCRIPTINSTANCE_SERVER);
-
-        std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
-        s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
     }
 
-    DbgPrint("sv_bots: [ADDTESTCLIENT] ENTRY pendingName='%s'\n", s_pendingBotName);
-    DbgPrint("sv_bots: [FLUSH-A]\n");
+    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
 
-    DbgPrint("sv_bots: [ADDTESTCLIENT] calling engine SV_AddTestClient at 0x82281F08\n");
-    DbgPrint("sv_bots: [FLUSH-B]\n");
+    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
+    // the slot's userinfo during the engine's first userinfo-changed call
+    // for the new bot. We do this BEFORE the spawn call so the hook fires
+    // synchronously while SV_DirectConnect runs ClientUserinfoChanged.
+    std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
+    s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
 
-    gentity_s *ent = SV_AddTestClient();
-
-    DbgPrint("sv_bots: [ADDTESTCLIENT] engine returned ent=0x%08X\n", (unsigned)ent);
-    DbgPrint("sv_bots: [FLUSH-C]\n");
+    // r292 PATH C — do NOT call vanilla SV_AddTestClient.
+    gentity_s *ent = BW_AddBotPathC(name);
 
     s_pendingBotName[0] = '\0';
 
     if (ent)
     {
-        DbgPrint("sv_bots: [ADDTESTCLIENT] pushing entnum=%d\n", ent->s.number);
-        DbgPrint("sv_bots: [FLUSH-D]\n");
+        DbgPrint("sv_bots: [ADDTESTCLIENT] success, entnum=%d\n", ent->s.number);
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
     }
     else
     {
-        DbgPrint("sv_bots: [ADDTESTCLIENT] engine returned NULL - pushing 0\n");
-        DbgPrint("sv_bots: [FLUSH-E]\n");
+        DbgPrint("sv_bots: [ADDTESTCLIENT] failure - pushing 0\n");
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
@@ -655,8 +778,8 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours\n");
-    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d probes=%d (r291)\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r292 Path C)\n");
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d probes=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE,
@@ -664,6 +787,13 @@ sv_bots::sv_bots()
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
+
+    // Seed the bot PRNG from a couple of available entropy sources.
+    // svsHeader->time may be 0 at module-construction; that's OK — the
+    // LCG advances enough on first use.
+    g_botSpawnSeed ^= reinterpret_cast<unsigned int>(&g_botSpawnSeed);
+    g_botSpawnSeed ^= static_cast<unsigned int>(svsHeader ? svsHeader->time : 0);
+    DbgPrint("sv_bots: bot PRNG seeded with 0x%08X\n", g_botSpawnSeed);
 
 #if CODXE_DIAG_ENABLE_WEAPON_HOOK
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
@@ -689,20 +819,8 @@ sv_bots::sv_bots()
     DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
 #endif
 
-#if CODXE_DIAG_ENABLE_CONNECT_PROBES
-    SV_DirectConnect_Probe_Detour = Detour(SV_DirectConnect_BW, SV_DirectConnect_Probe);
-    SV_DirectConnect_Probe_Detour.Install();
-    DbgPrint("sv_bots: SV_DirectConnect probe INSTALLED\n");
-
-    ClientDisconnect_Probe_Detour = Detour(ClientDisconnect_BW, ClientDisconnect_Probe);
-    ClientDisconnect_Probe_Detour.Install();
-    DbgPrint("sv_bots: ClientDisconnect probe INSTALLED\n");
-#else
-    DbgPrint("sv_bots: SV_DirectConnect probe SKIPPED (diagnostic)\n");
-    DbgPrint("sv_bots: ClientDisconnect probe SKIPPED (diagnostic)\n");
-#endif
-
     // SV_CalcPings deliberately NOT detoured — see file header.
+    // SV_DirectConnect / ClientDisconnect probes from r291 superseded by Path C.
 }
 
 sv_bots::~sv_bots()
@@ -717,10 +835,6 @@ sv_bots::~sv_bots()
 #endif
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
-#endif
-#if CODXE_DIAG_ENABLE_CONNECT_PROBES
-    SV_DirectConnect_Probe_Detour.Remove();
-    ClientDisconnect_Probe_Detour.Remove();
 #endif
 
     CleanBotArray();
