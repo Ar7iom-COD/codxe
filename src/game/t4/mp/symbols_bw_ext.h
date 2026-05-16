@@ -15,10 +15,7 @@
 // va, and SV_* function it touches. Names use a `_BW` suffix where they
 // would otherwise collide with stock declarations.
 //
-// All addresses below are Ghidra-verified against TU7 default_mp.xex:
-//   - Either labeled by name in the Ghidra symbol table, or
-//   - Manually confirmed by decompile pattern match (Scr_AddInt /
-//     Scr_AddUndefined, where Ghidra labels them only as FUN_xxx).
+// All addresses below are Ghidra-verified against TU7 default_mp.xex.
 //
 // Audited & corrected vs stock codxe T4 symbols.h:
 //   Scr_GetInt              stock 0x8234AFD0  →  real 0x82341C20
@@ -39,8 +36,6 @@
 //
 // Hand-hunted (not in stock codxe T4 symbols.h):
 //   SV_AddTestClient        0x82281F08
-//   SV_DirectConnect        0x822815B0
-//   ClientDisconnect        0x82208C90
 //   SV_BotUserMove          0x82286D68
 //   SV_UserinfoChanged      0x82280690
 //   SV_IsTestClient         0x8221D1E0
@@ -50,18 +45,37 @@
 //   Scr_AllocString         0x823323F0
 //   G_SelectWeaponIndex     0x8225D6D8
 //
-// r292 Path C additions — netmsg push/pop pair used to inject a synthetic
-// connect packet into the engine's netbuf parser state. SV_DirectConnect
-// reads userinfo from a global parser context populated by push (8226ce38);
-// pop (8226ce58) restores the prior state. SV_AddTestClient itself uses
-// this same pair to inject its synthetic connect string. By calling it
-// ourselves with a userinfo string containing \invited\1, we route through
-// SV_DirectConnect's "invited"-success scan (state==CS_FREE checks only)
-// instead of the broken xuid-mismatch fall-through that triggers the
-// post-scan NET_CompareBaseAdr corruption when vanilla SV_AddTestClient
-// runs its slot-locator loop.
-//   FUN_8226CE38            0x8226CE38   (netmsg buffer push)
-//   FUN_8226CE58            0x8226CE58   (netmsg buffer pop)
+// ============================================================================
+// r293 — REVERTED FROM PATH C
+// ============================================================================
+// Path C (r292) bypassed vanilla SV_AddTestClient by manually pushing a
+// connect packet into the engine netbuf parser. This was based on a Ghidra
+// finding that NET_CompareBaseAdr falls through to "equal" for two NA_BOT
+// addresses, which would supposedly cause SV_AddTestClient's post-scan to
+// corrupt the host slot.
+//
+// CoD Jumper's source (which runs on the same codxe T4 build as us) shows
+// that vanilla addtestclient() works fine on Xenia:
+//
+//     bot = addtestclient();
+//     bot.pers["isBot"] = true;
+//     bot.pers["name"] = "Harry";
+//     ...
+//
+// CoD Jumper's bot fully initializes, can be team-assigned, classed,
+// repositioned. The "bot is a static dummy" perception was only because
+// CoD Jumper calls FreezeControls(true) on it.
+//
+// So the NET_CompareBaseAdr disassembly finding is correct in isolation
+// but does NOT manifest as a bug in practice. The r282-r289 hangs were
+// caused by something else (likely struct-offset corruption or one of our
+// other detours behaving incorrectly).
+//
+// r293 removes Path C entirely:
+//   - SV_DirectConnect_BW, Netmsg_Push, Netmsg_Pop, ClientDisconnect_BW
+//     symbols are no longer needed and have been removed.
+//   - GScr_AddTestClient now calls vanilla SV_AddTestClient() directly,
+//     matching CoD Jumper's working pattern.
 // ============================================================================
 
 #include "structs_bw_ext.h"
@@ -86,49 +100,6 @@ static SV_UserinfoChanged_t SV_UserinfoChanged =
 typedef void (*SV_DropClient_t)(clientBW_t *cl, const char *reason, bool tellThem);
 static SV_DropClient_t SV_DropClient =
     reinterpret_cast<SV_DropClient_t>(0x8227FDE0);
-
-// ---- Server: SV_DirectConnect + netmsg push/pop (r292 Path C) ----------
-//
-// SV_DirectConnect reads the parsed userinfo from a GLOBAL netbuf parser
-// state, not from its arguments. Vanilla SV_AddTestClient populates this
-// state via FUN_8226CE38 (push), calls SV_DirectConnect, then calls
-// FUN_8226CE58 (pop) to restore. We reuse the same protocol.
-//
-// PPC ABI: 64-bit args in single registers. SV_DirectConnect's
-// disassembly shows:
-//   r3 = netadr_t (8 bytes; for bots, type=NA_BOT=0)
-//   r4 = qport (high half of arg2)
-//   r5, r6, r7 = unused for our path (vanilla passes uninitialized locals)
-//   r8 = xnaddr-related
-//
-// We pass zeros for r5..r8 since the "invited" path doesn't read them.
-
-typedef int (*SV_DirectConnect_BW_t)(unsigned long long netadr,
-                                      unsigned long long qport,
-                                      unsigned long long arg3,
-                                      unsigned long long arg4,
-                                      unsigned long long arg5,
-                                      unsigned long long arg6);
-static SV_DirectConnect_BW_t SV_DirectConnect_BW =
-    reinterpret_cast<SV_DirectConnect_BW_t>(0x822815B0);
-
-// Netmsg buffer push: takes a pointer to a NUL-terminated OOB packet
-// buffer (e.g., "connect \"...\""). Populates the global netbuf parser
-// state so the next SV_DirectConnect call reads from this buffer.
-typedef void (*Netmsg_Push_t)(char *packet_buf);
-static Netmsg_Push_t Netmsg_Push =
-    reinterpret_cast<Netmsg_Push_t>(0x8226CE38);
-
-// Netmsg buffer pop: restores the prior netbuf parser state. Must be
-// called after every Netmsg_Push, even if SV_DirectConnect failed.
-typedef void (*Netmsg_Pop_t)();
-static Netmsg_Pop_t Netmsg_Pop =
-    reinterpret_cast<Netmsg_Pop_t>(0x8226CE58);
-
-// ClientDisconnect (kept for diagnostic probes if needed)
-typedef void (*ClientDisconnect_BW_t)(int clientNum);
-static ClientDisconnect_BW_t ClientDisconnect_BW =
-    reinterpret_cast<ClientDisconnect_BW_t>(0x82208C90);
 
 // Real SV_ClientThink. Stock codxe T4 SV_ClientThink (0x82284D50) is wrong.
 // Suffixed `_BW` to avoid linker collision with the stock declaration.
