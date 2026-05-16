@@ -112,9 +112,14 @@ using namespace t4::mp::bw;
 // 0 = skip BOTH Netmsg_Push and Netmsg_Pop (prove the netbuf pair is the
 //     crash; if Path C reaches FLUSH-3+ with this off, it was).
 // 1 = use the engine netbuf (original behaviour).
-// VS2010: static const, NOT constexpr.
+//
+// NOTE: declared `volatile`, NOT `static const`. The project builds with /WX
+// (warnings-as-errors); a plain `static const int = 0` makes `if(BW_USE_NETMSG)`
+// a constant expression and triggers C4127 -> hard error. `volatile` tells the
+// compiler the value may change, so the `if` is not "constant", C4127 is
+// silenced, and behaviour is identical. VS2010-safe (no constexpr).
 // ===========================================================================
-static const int BW_USE_NETMSG = 0;
+static volatile int BW_USE_NETMSG = 0;
 
 // r311 — engine netbuf globals (verified from the FUN_8226ce38 decompile:
 // Netmsg_Push passes &DAT_82e1ce40 as the depth-counter pointer).
@@ -377,10 +382,13 @@ static void BW_SystemReport()
 
     // r311 — netbuf state, so we can see if the push/pop arena is already
     // dirty (depth should be 0 before the first Netmsg_Push).
-    DbgPrint("sv_bots: netbuf depth=%d offset=%d  (BW_USE_NETMSG=%d)\n",
-             *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
-             *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR),
-             BW_USE_NETMSG);
+    {
+        const int useNetmsg = BW_USE_NETMSG;  // read volatile into a plain int
+        DbgPrint("sv_bots: netbuf depth=%d offset=%d  (BW_USE_NETMSG=%d)\n",
+                 *reinterpret_cast<const int *>(BW_NETBUF_DEPTH_ADDR),
+                 *reinterpret_cast<const int *>(BW_NETBUF_OFFSET_ADDR),
+                 useNetmsg);
+    }
 
     DbgPrint("sv_bots: ===== END REPORT =====\n");
 }
@@ -966,12 +974,14 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
+    const int useNetmsg = BW_USE_NETMSG;  // read volatile into a plain int
+
     DbgPrint("sv_bots: T4 BW module init (r311 — netbuf bisect + reentry guard)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d netmsg=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE,
-             BW_USE_NETMSG);
+             useNetmsg);
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
