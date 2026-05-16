@@ -271,19 +271,18 @@ static bool BW_HasFreeSlot(int maxclients)
 
 // --- SYSTEM REPORT --------------------------------------------------------
 //
-// imagedump-style diagnostic. Dumps every unverified engine-global
-// interpretation to the Xenia log in ONE shot, so a single run settles the
-// "Part C" indirection question for good.
+// imagedump-style diagnostic. Dumps the engine-global state to the Xenia
+// log in one shot so each build is self-verifying.
 //
-// HOW TO READ IT: set your in-game name to something unique in the lobby,
-// load the map, press "add bot". In the log, whichever svs.clients
-// interpretation shows YOUR name at slot 0 (and a small sane state value)
-// is the correct one. That tells us, definitively, whether 0x830AFC90 is
-// the array base or a pointer to it.
+// r309: the engine globals are now the codxe-verified T4 addresses
+// (svsHeader 0x84F85100, g_entities 0x82BAD1B0). This report confirms they
+// are live: with a match running it should show YOUR name at slot 0 and a
+// sane server time. If slot 0 still reads empty, the server was not up when
+// addtestclient() fired.
 
-static void BW_DumpClientSlot(const char *tag, const char *cl, int slot)
+static void BW_DumpClientSlot(const char *cl, int slot)
 {
-    // state = first int of client_t; name at +0x21328.
+    // state = first int of client_t (clientHeader_t.state); name at +0x21328.
     const int   state = *reinterpret_cast<const int *>(cl);
     const char *name  = cl + BW_CLIENT_NAME_OFF;
 
@@ -299,72 +298,43 @@ static void BW_DumpClientSlot(const char *tag, const char *cl, int slot)
     }
     namebuf[n] = '\0';
 
-    DbgPrint("sv_bots:   %s slot %d: state=%d name=\"%s\"\n", tag, slot, state, namebuf);
+    DbgPrint("sv_bots:   slot %d: state=%d name=\"%s\"\n", slot, state, namebuf);
 }
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r309) =====\n");
 
-    // --- svs.clients : two interpretations -------------------------------
-    // (A) 0x830AFC90 IS the client_t array base (no dereference).
-    // (B) 0x830AFC90 HOLDS a pointer to the array (one dereference).
-    const unsigned int rawSvsClients = BW_ADDR_SVS_CLIENTS;
-    const unsigned int derefSvsClients =
-        *reinterpret_cast<const unsigned int *>(BW_ADDR_SVS_CLIENTS);
+    // --- svsHeader / client array ----------------------------------------
+    // svsHeader (0x84F85100) -> serverStaticHeader_t { client_t* clients;
+    // int time; }. .clients is the client_t array base.
+    const unsigned int hdrAddr   = BW_ADDR_SVSHEADER;
+    const unsigned int clientsP  = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
+    const int          svTime    = BW_svs_time();
 
-    DbgPrint("sv_bots: svs.clients addr=0x%08X  *(addr)=0x%08X\n",
-             rawSvsClients, derefSvsClients);
+    DbgPrint("sv_bots: svsHeader @0x%08X  .clients=0x%08X  .time=%d\n",
+             hdrAddr, clientsP, svTime);
 
-    DbgPrint("sv_bots: [interp A] 0x830AFC90 AS base:\n");
+    if (clientsP != 0)
     {
-        const char *baseA = reinterpret_cast<const char *>(rawSvsClients);
-        BW_DumpClientSlot("A", baseA + 0 * BW_CLIENT_STRIDE, 0);
-        BW_DumpClientSlot("A", baseA + 1 * BW_CLIENT_STRIDE, 1);
-    }
-
-    DbgPrint("sv_bots: [interp B] *(0x830AFC90) AS base:\n");
-    if (derefSvsClients != 0)
-    {
-        const char *baseB = reinterpret_cast<const char *>(derefSvsClients);
-        BW_DumpClientSlot("B", baseB + 0 * BW_CLIENT_STRIDE, 0);
-        BW_DumpClientSlot("B", baseB + 1 * BW_CLIENT_STRIDE, 1);
+        const char *base = reinterpret_cast<const char *>(clientsP);
+        BW_DumpClientSlot(base + 0 * BW_CLIENT_STRIDE, 0);
+        BW_DumpClientSlot(base + 1 * BW_CLIENT_STRIDE, 1);
     }
     else
     {
-        DbgPrint("sv_bots:   B: *(0x830AFC90) is 0 — interp B not viable\n");
-    }
-
-    // --- sv struct : raw bytes + maxclients candidates -------------------
-    const unsigned int rawSv  = BW_ADDR_SV_STRUCT;
-    const unsigned int *svW   = reinterpret_cast<const unsigned int *>(rawSv);
-    DbgPrint("sv_bots: sv @0x%08X  words: %08X %08X %08X %08X %08X\n",
-             rawSv, svW[0], svW[1], svW[2], svW[3], svW[4]);
-
-    // maxclients candidate 1: 0x82FF7C08 IS sv base → field at +0xC.
-    const int mcDirect = *reinterpret_cast<const int *>(rawSv + 0xC);
-    DbgPrint("sv_bots: maxclients candidate (0x82FF7C08+0xC) = %d\n", mcDirect);
-
-    // maxclients candidate 2: 0x82FF7C08 holds a pointer → *ptr +0xC.
-    if (svW[0] != 0)
-    {
-        const int mcIndirect = *reinterpret_cast<const int *>(svW[0] + 0xC);
-        DbgPrint("sv_bots: maxclients candidate (*(0x82FF7C08)+0xC) = %d\n", mcIndirect);
-    }
-    else
-    {
-        DbgPrint("sv_bots: maxclients candidate (*(0x82FF7C08)+0xC) = N/A (*ptr is 0)\n");
+        DbgPrint("sv_bots:   svsHeader.clients is 0 — server not up?\n");
     }
 
     // --- g_entities ------------------------------------------------------
-    const unsigned int gentBase   =
-        *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENTITIES);
-    const unsigned int gentStride =
-        *reinterpret_cast<const unsigned int *>(BW_ADDR_G_ENT_SIZE);
-    DbgPrint("sv_bots: g_entities base=0x%08X stride=0x%X (%d)\n",
-             gentBase, gentStride, static_cast<int>(gentStride));
+    // Flat array at a fixed base; print slot 0's entity number as a sanity
+    // check (should be 0 for a live g_entities[0]).
+    const unsigned int gentBase = BW_ADDR_G_ENTITIES;
+    const int gent0Number = *reinterpret_cast<const int *>(gentBase + 0x0);
+    DbgPrint("sv_bots: g_entities @0x%08X stride=0x%X  ent[0].s.number=%d\n",
+             gentBase, BW_GENTITY_STRIDE, gent0Number);
 
-    DbgPrint("sv_bots: using constant maxclients = %d\n", MAX_CLIENTS_BW);
+    DbgPrint("sv_bots: maxclients (constant) = %d\n", MAX_CLIENTS_BW);
     DbgPrint("sv_bots: ===== END REPORT =====\n");
 }
 
@@ -566,7 +536,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
 
-    cmd.serverTime = svsHeader->time;
+    cmd.serverTime = BW_svs_time();
     cmd.weapon     = g_botai[clientNum].weapon;
     cmd.buttons    = static_cast<button_mask>(g_botai[clientNum].buttons);
 
