@@ -2,60 +2,47 @@
 // Bot Warfare T4 port — engine module.
 //
 // ===========================================================================
-// r317 — surgical fix for the SV_AddTestClient post-scan hang
+// r320-A — first real test of the r317 surgical guard at the bot-spawn step
 // ===========================================================================
 //
-// r314 deleted Path C and called the real engine SV_AddTestClient() directly,
-// the codxe-IW3-reference architecture. The r316 log proved that call HANGS on
-// T4 Xenia: [ADDTESTCLIENT] FLUSH-A prints, FLUSH-B never does — control enters
-// SV_AddTestClient (0x82281F08) and never returns.
+// HISTORY
+//   r314  deleted Path C; called the real engine SV_AddTestClient() directly.
+//   r316  proved that call hangs on T4 Xenia: FLUSH-A prints, FLUSH-B never.
+//   r317  added the NET_CompareBaseAdr_impl detour ("surgical guard") — but
+//         froze in PREGAME (Awaiting challenge), before bot-spawn was reached,
+//         so the guard itself was NEVER actually exercised at the spawn step.
+//   r318  gutted hook bodies — still froze in pregame. Hook bodies cleared.
+//   r319  commented out ALL FOUR Install() calls. Result: pregame LOADED fine
+//         (so the pregame freeze was the detour MECHANISM, not our hook code),
+//         BUT pressing D-pad Up still froze — because r319 left
+//         GScr_AddTestClient calling the REAL SV_AddTestClient() with the
+//         guard DISARMED. That r319 spawn-hang reproduced r316 by construction
+//         and proved nothing new.
 //
-// The cause is now decompiler-confirmed, and it is NOT what r294 assumed.
-// r294 said "two all-zero NA_BOT netadrs compare equal". The NET_CompareBaseAdr
-// decompile shows that is over-stated:
+// r320-A — THE TEST THAT WAS NEVER RUN
+//   Re-enable ONLY NET_CompareBaseAdr_impl_Detour.Install(). The other three
+//   detours stay off (they are irrelevant to bot spawn, and r318 already
+//   cleared their bodies). This is the first genuine test of whether r317's
+//   surgical fix actually makes the real SV_AddTestClient() complete.
 //
-//   NET_CompareBaseAdr_impl (0x82278B20):
-//     if (typeA == typeB) {
-//         if (typeA != 2 && typeA != 0) { ...compare IP bytes (type 4)... }
-//         // type 0 (NA_BOT) and type 2 (loopback) FALL THROUGH to:
-//         portA = *(ushort*)(a + 2);   // netadr_t.port at offset 8
-//         portB = *(ushort*)(b + 2);
-//     }
-//     return portA - portB;            // 0 == "equal"
+//   PLUS a bug fix in the hook. The original r317 hook tested only
+//   (*a == 0 && *b == 0) — NA_BOT vs NA_BOT. But the slot that corrupts is the
+//   HOST at slot 0, and on Xenia (XLive-offline) the host netadr is degenerate
+//   too: type 0 (NA_BOT) OR type 2 (NA_LOOPBACK). NET_CompareBaseAdr_impl falls
+//   through to the port-compare for BOTH type 0 and type 2 (see file header of
+//   symbols_bw_ext.h). The original test missed the bot-vs-host case entirely
+//   whenever the host was loopback. r320-A widens the guard to fire for any
+//   degenerate-vs-degenerate pair (type 0 or 2 on both sides). This is most
+//   likely why r317 could never have worked even in principle.
 //
-// So two NA_BOT addrs compare equal ONLY IF their .port fields match. The real
-// bug: SV_AddTestClient does memset(netadr, 0, 12) for the bot — port 0 — and
-// the Xenia host (XLive-offline) netadr is also all-zero — port 0. Equal port
-// => "equal" => SV_AddTestClient's post-SV_DirectConnect scan matches the HOST
-// at slot 0, writes isTestClient / SV_SendClientGameState / SV_ClientEnterWorld
-// onto the live host => corruption => freeze. (Verified: SV_AddTestClient at
-// 0x8228205C calls NET_CompareBaseAdr; the wrapper 0x82278BD0 calls _impl.)
-//
-// NET_CompareBaseAdr itself is CORRECT — it is being fed a zero port. The fix
-// is therefore surgical and leaves every engine function behaving as designed:
-// detour NET_CompareBaseAdr_impl, and while a bot-add is in progress, report
-// "not equal" for any NA_BOT-vs-NA_BOT comparison. The post-scan then skips the
-// host, finds the genuine new bot slot, and returns.
-//
-// Scope of the detour:
-//   - The hook is INERT unless s_botAddInProgress is set. It is set ONLY around
-//     the SV_AddTestClient() call, so no unrelated caller is ever affected.
-//   - During SV_AddTestClient(), SV_DirectConnect also runs an internal
-//     NET_CompareBaseAdr reconnect scan (SV_DirectConnect at 0x82281718 calls
-//     the wrapper). Our hook fires there too — forcing "not equal" means "this
-//     bot is not a reconnecting client", which is correct for a fresh bot.
-//   - Detouring _impl (not the wrapper) catches BOTH call paths, since the
-//     wrapper 0x82278BD0 calls _impl 0x82278B20.
-//
-// Return convention (verified from the wrapper disassembly):
-//   NET_CompareBaseAdr wrapper does cntlzw/rlwinm on _impl's return:
-//     _impl returns 0       -> wrapper returns 1  ("equal")
-//     _impl returns nonzero -> wrapper returns 0  ("not equal")
-//   So the hook returns 1 to force "not equal".
-//
-// Everything else is r314 unchanged: Path C stays deleted, three detours
-// (SV_BotUserMove, G_SelectWeaponIndex, SV_UserinfoChanged), SV_CalcPings not
-// detoured (T4 frame fields inert).
+// THE DECISION TREE FOR THIS BUILD
+//   A1 + A2 + B all print, ent non-null  -> guard works; r317 design correct;
+//                                           the bug was the missing type==2.
+//                                           Next: re-enable the other 3 detours.
+//   A1 prints, A2 never                  -> still hanging INSIDE SV_AddTestClient
+//                                           even with the guard -> go to r320-B
+//                                           (hand-port / Path C resurrected).
+//   A2 prints, B weird / ent bad         -> hang moved downstream -> new info.
 //
 // Verified engine addresses (TU7 default_mp.xex):
 //   SV_AddTestClient        0x82281F08   (returns gentity_s*, no args)
@@ -182,7 +169,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r317) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r320-A) =====\n");
 
     const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
     const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
@@ -212,11 +199,25 @@ static void BW_SystemReport()
 }
 
 // ===========================================================================
-// r317 — NET_CompareBaseAdr_impl detour
+// r320-A — NET_CompareBaseAdr_impl detour (the surgical guard)
 // ===========================================================================
-// While a bot-add is in progress, force NA_BOT-vs-NA_BOT comparisons to report
-// "not equal" so SV_AddTestClient's post-scan does not match the host at slot 0.
-// See the file header for the full rationale and the return convention.
+// While a bot-add is in progress, force any comparison between two DEGENERATE
+// netadrs (type 0 NA_BOT or type 2 NA_LOOPBACK) to report "not equal", so the
+// SV_AddTestClient post-SV_DirectConnect scan does NOT false-match the host at
+// slot 0 (which on Xenia-offline also has a degenerate, port-0 netadr).
+//
+// r317 bug fixed here: the original test was (*a == 0 && *b == 0) only — it
+// matched NA_BOT vs NA_BOT but MISSED bot-vs-host when the host is loopback
+// (type 2). NET_CompareBaseAdr_impl falls through to the port-compare for both
+// type 0 and type 2, so both must be treated as degenerate.
+//
+// Return convention (verified from the wrapper disassembly at 0x82278BD0):
+//   _impl returns 0       -> wrapper returns 1  ("equal")
+//   _impl returns nonzero -> wrapper returns 0  ("not equal")
+// So the hook returns 1 (nonzero) to force "not equal".
+//
+// The hook is INERT unless s_botAddInProgress is set; it is set ONLY around
+// the SV_AddTestClient() call, so no unrelated caller is ever affected.
 
 static Detour       NET_CompareBaseAdr_impl_Detour;
 static volatile int s_botAddInProgress = 0;
@@ -229,13 +230,19 @@ static long long NET_CompareBaseAdr_impl_Hook(unsigned int *a,
                                               unsigned __int64 p6,
                                               unsigned __int64 p7)
 {
-    // a[0] / b[0] are the netadr_t.type ints. NA_BOT == 0.
-    if (s_botAddInProgress && a != nullptr && b != nullptr &&
-        *a == 0 && *b == 0)
+    // a[0] / b[0] are the netadr_t.type ints. NA_BOT == 0, NA_LOOPBACK == 2.
+    if (s_botAddInProgress && a != nullptr && b != nullptr)
     {
-        // Both NA_BOT. Return nonzero -> wrapper reports "not equal" -> the
-        // SV_AddTestClient post-scan skips this slot instead of matching it.
-        return 1;
+        const unsigned int ta = *a;
+        const unsigned int tb = *b;
+        const bool aDegenerate = (ta == 0u || ta == 2u);
+        const bool bDegenerate = (tb == 0u || tb == 2u);
+        if (aDegenerate && bDegenerate)
+        {
+            // Force "not equal" so the post-scan skips this slot instead of
+            // false-matching the host.
+            return 1;
+        }
     }
 
     return NET_CompareBaseAdr_impl_Detour
@@ -249,6 +256,8 @@ static long long NET_CompareBaseAdr_impl_Hook(unsigned int *a,
 // reference gates the input block on g_clients[clientNum].sess.archiveTime==0
 // (killcam suppression). structs_bw_ext.h does not expose sess.archiveTime,
 // so the gate is omitted — T4 bots are not input-frozen during killcam.
+//
+// r320-A: detour constructed but NOT installed (irrelevant to bot spawn).
 
 static Detour SV_BotUserMove_Detour;
 
@@ -332,16 +341,8 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 // ===========================================================================
 // G_SelectWeaponIndex detour — track per-client weapon
 // ===========================================================================
-//
-// r318 DIAGNOSTIC: body GUTTED to a pure pass-through. The detour is still
-// installed and still intercepts every call, but the hook does NOTHING except
-// forward to the original. This isolates "hook body bug" from "detour mechanism
-// bug" for the Awaiting-challenge pregame freeze:
-//   - pregame LOADS with this gutted   -> the freeze was in the hook BODY below.
-//   - pregame STILL FREEZES gutted     -> the freeze is the detour MECHANISM
-//                                         on this short function.
-// The real body (one line: g_botai[clientNum].weapon = iWeaponIndex) is kept
-// in the comment so r319 can restore it once the verdict is known.
+// r320-A: detour constructed but NOT installed. Body still gutted to a pure
+// pass-through (r318 diagnostic state). Real body kept in comment for restore.
 //
 //   ORIGINAL r317 BODY:
 //     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
@@ -351,19 +352,16 @@ static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
-    // r318: pure pass-through — no g_botai write.
+    // r318/r320-A: pure pass-through — no g_botai write.
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
 
 // ===========================================================================
 // SV_UserinfoChanged detour — custom bot names
 // ===========================================================================
-//
-// r318 DIAGNOSTIC: body GUTTED to a pure pass-through, same rationale as the
-// G_SelectWeaponIndex hook above. The name-patch is suspended for this build.
-// Note: SV_UserinfoChanged's userinfo buffer is at client+0x6DC (verified in
-// the decompile: `addi r23, r28, 0x6dc`). When r319 restores the body, confirm
-// clientBW_t.userinfo resolves to that offset.
+// r320-A: detour constructed but NOT installed. Body still gutted to a pure
+// pass-through (r318 diagnostic state). Real body kept in comment for restore.
+// Note: SV_UserinfoChanged's userinfo buffer is at client+0x6DC (verified).
 //
 //   ORIGINAL r317 BODY:
 //     if (s_pendingBotName[0] &&
@@ -378,7 +376,7 @@ static Detour SV_UserinfoChanged_Detour;
 
 static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 {
-    // r318: pure pass-through — no name patch.
+    // r318/r320-A: pure pass-through — no name patch.
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
 
@@ -473,13 +471,15 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
-// Stash an optional custom name, arm the NET_CompareBaseAdr_impl detour, call
-// the REAL engine SV_AddTestClient(), disarm, clear the name. The
-// SV_UserinfoChanged detour applies the name mid-connect.
+// Stash an optional custom name, ARM the NET_CompareBaseAdr_impl guard, call
+// the REAL engine SV_AddTestClient(), disarm, clear the name.
 //
-// FLUSH markers bracket SV_AddTestClient(). r316 showed FLUSH-A printing and
-// FLUSH-B not — if r317's detour works, FLUSH-B should now print and ent be
-// non-NULL.
+// r320-A FLUSH markers:
+//   FLUSH-A1 : guard armed, about to enter SV_AddTestClient
+//   FLUSH-A2 : SV_AddTestClient RETURNED (this is the line r316/r319 never hit)
+//   FLUSH-B  : guard disarmed
+// If A1 prints and A2 does not -> still hanging inside SV_AddTestClient even
+// with the guard installed -> r320-B (hand-port) is required.
 
 static void GScr_AddTestClient()
 {
@@ -515,12 +515,16 @@ static void GScr_AddTestClient()
     // Arm the NET_CompareBaseAdr_impl detour ONLY for the duration of the
     // SV_AddTestClient() call. Outside this window the hook is fully inert.
     s_botAddInProgress = 1;
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A before SV_AddTestClient "
-             "(NET_CompareBaseAdr guard ARMED)\n");
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A1 guard armed=%d, entering SV_AddTestClient "
+             "(r320-A guard INSTALLED)\n", s_botAddInProgress);
+
     gentity_s *ent = SV_AddTestClient();
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-B after SV_AddTestClient (ent=0x%08X)\n",
+
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A2 SV_AddTestClient RETURNED (ent=0x%08X)\n",
              reinterpret_cast<unsigned int>(ent));
+
     s_botAddInProgress = 0;
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-B guard disarmed\n");
 
     s_pendingBotName[0] = '\0';
 
@@ -650,57 +654,46 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// r319 DIAGNOSTIC: ALL FOUR Install() calls are commented out.
+// r320-A: ONLY NET_CompareBaseAdr_impl_Detour.Install() is enabled. The other
+// three detours are constructed but NOT installed — they are irrelevant to the
+// bot-spawn path and r318 already cleared their bodies. This isolates one
+// question: with the surgical guard ACTIVE, does the real SV_AddTestClient()
+// complete?
 //
-// r318 proved the freeze is NOT in the hook bodies (both gutted, still froze).
-// Two hypotheses remain:
-//   (b1) the detour MECHANISM corrupts a function when it splices in, OR
-//   (b2) the freeze is NOT our code at all (codxe-core / netplay session).
-//
-// r319 installs ZERO detours. The Detour objects are still constructed (cheap,
-// inert — construction alone patches nothing; only Install() writes memory).
-// If r319 loads past "Awaiting challenge" -> the detour MECHANISM is the cause.
-// If r319 still freezes -> sv_bots is innocent; the freeze is codxe-core or the
-// netplay/XLive session handshake, and the investigation moves entirely off
-// this file.
-//
-// To restore: uncomment the four .Install() lines. The Detour() constructions
-// are left in place so restoring is a pure uncomment, no retyping.
+// To restore the other three later: uncomment their .Install() lines.
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r319 — DIAG: ALL detours NOT installed)\n");
+    DbgPrint("sv_bots: T4 BW module init (r320-A — guard INSTALLED, 3 detours off)\n");
 
     CleanBotArray();
-    s_pendingBotName[0]  = '\0';
-    s_botAddInProgress   = 0;
+    s_pendingBotName[0] = '\0';
+    s_botAddInProgress  = 0;
 
     NET_CompareBaseAdr_impl_Detour =
         Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
-    // NET_CompareBaseAdr_impl_Detour.Install();   // r319: NOT installed
-    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour NOT installed (r319 diag)\n");
+    NET_CompareBaseAdr_impl_Detour.Install();   // r320-A: ENABLED — the surgical guard
+    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour INSTALLED (r320-A)\n");
 
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-    // G_SelectWeaponIndex_Detour.Install();       // r319: NOT installed
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour NOT installed (r319 diag)\n");
+    // G_SelectWeaponIndex_Detour.Install();    // r320-A: NOT installed
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour NOT installed (r320-A)\n");
 
     SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    // SV_BotUserMove_Detour.Install();            // r319: NOT installed
-    DbgPrint("sv_bots: SV_BotUserMove detour NOT installed (r319 diag)\n");
+    // SV_BotUserMove_Detour.Install();         // r320-A: NOT installed
+    DbgPrint("sv_bots: SV_BotUserMove detour NOT installed (r320-A)\n");
 
     SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
-    // SV_UserinfoChanged_Detour.Install();        // r319: NOT installed
-    DbgPrint("sv_bots: SV_UserinfoChanged detour NOT installed (r319 diag)\n");
+    // SV_UserinfoChanged_Detour.Install();     // r320-A: NOT installed
+    DbgPrint("sv_bots: SV_UserinfoChanged detour NOT installed (r320-A)\n");
 
-    DbgPrint("sv_bots: r319 — module loaded, ZERO detours active\n");
+    DbgPrint("sv_bots: r320-A — module loaded, guard active\n");
 }
 
 sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: T4 BW module shutdown\n");
 
-    // r319: nothing was installed, so Remove() is a no-op — but harmless to
-    // leave; Detour::Remove() on an un-installed detour does nothing.
     NET_CompareBaseAdr_impl_Detour.Remove();
     G_SelectWeaponIndex_Detour.Remove();
     SV_BotUserMove_Detour.Remove();
