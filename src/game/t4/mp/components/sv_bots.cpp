@@ -2,54 +2,69 @@
 // Bot Warfare T4 port — engine module.
 //
 // ===========================================================================
-// r314 — DELETE PATH C. Port the codxe IW3 reference 1:1.
+// r317 — surgical fix for the SV_AddTestClient post-scan hang
 // ===========================================================================
 //
-// codxe ships a working IW3 bot module: src/game/iw3/mp/components/sv_bots.cpp.
-// Its GScr_AddTestClient does exactly this:
+// r314 deleted Path C and called the real engine SV_AddTestClient() directly,
+// the codxe-IW3-reference architecture. The r316 log proved that call HANGS on
+// T4 Xenia: [ADDTESTCLIENT] FLUSH-A prints, FLUSH-B never does — control enters
+// SV_AddTestClient (0x82281F08) and never returns.
 //
-//     gentity_s *ent = SV_AddTestClient();    // the REAL engine function
+// The cause is now decompiler-confirmed, and it is NOT what r294 assumed.
+// r294 said "two all-zero NA_BOT netadrs compare equal". The NET_CompareBaseAdr
+// decompile shows that is over-stated:
 //
-// One call, no arguments. No connect string, no netbuf, no SV_DirectConnect,
-// no 8-arg ABI, no hand-ported slot scan. The entire "Path C" apparatus
-// (r292..r313) was a workaround for a problem the working reference does not
-// have. r294 concluded vanilla SV_AddTestClient "hangs on Xenia because its
-// NET_CompareBaseAdr post-scan false-matches the host" — but the IW3 reference
-// calls SV_AddTestClient() raw and works. Either r294's diagnosis was wrong,
-// or r294 hung for a different reason (a missing detour, a bad symbol). Either
-// way, Path C was built on a misdiagnosis and is deleted here.
+//   NET_CompareBaseAdr_impl (0x82278B20):
+//     if (typeA == typeB) {
+//         if (typeA != 2 && typeA != 0) { ...compare IP bytes (type 4)... }
+//         // type 0 (NA_BOT) and type 2 (loopback) FALL THROUGH to:
+//         portA = *(ushort*)(a + 2);   // netadr_t.port at offset 8
+//         portB = *(ushort*)(b + 2);
+//     }
+//     return portA - portB;            // 0 == "equal"
 //
-// r314 is a 1:1 port of the IW3 reference, adjusted for three T4 facts:
+// So two NA_BOT addrs compare equal ONLY IF their .port fields match. The real
+// bug: SV_AddTestClient does memset(netadr, 0, 12) for the bot — port 0 — and
+// the Xenia host (XLive-offline) netadr is also all-zero — port 0. Equal port
+// => "equal" => SV_AddTestClient's post-SV_DirectConnect scan matches the HOST
+// at slot 0, writes isTestClient / SV_SendClientGameState / SV_ClientEnterWorld
+// onto the live host => corruption => freeze. (Verified: SV_AddTestClient at
+// 0x8228205C calls NET_CompareBaseAdr; the wrapper 0x82278BD0 calls _impl.)
 //
-//   1. SV_CalcPings is NOT detoured on T4. The IW3 reference reimplements
-//      SV_CalcPings and computes human ping from frames[j].messageAcked /
-//      messageSent. On T4 (per structs_bw_ext.h) those clientSnapshot_t
-//      fields are INERT — porting that loop would corrupt human ping. T4's
-//      SV_CalcPings is a stub thunk (per symbols_bw_ext.h) and handles bots
-//      fine on its own; bot ping is cosmetic. So: three detours, not four.
+// NET_CompareBaseAdr itself is CORRECT — it is being fed a zero port. The fix
+// is therefore surgical and leaves every engine function behaving as designed:
+// detour NET_CompareBaseAdr_impl, and while a bot-add is in progress, report
+// "not equal" for any NA_BOT-vs-NA_BOT comparison. The post-scan then skips the
+// host, finds the genuine new bot slot, and returns.
 //
-//   2. The IW3 SV_BotUserMove_Stub gates bot input on
-//      g_clients[clientNum].sess.archiveTime == 0 (suppress input during
-//      killcam/replay). structs_bw_ext.h does not expose sess.archiveTime,
-//      so that gate is omitted. Consequence: T4 bots are not frozen during
-//      killcam. Cosmetic; revisit if it matters.
+// Scope of the detour:
+//   - The hook is INERT unless s_botAddInProgress is set. It is set ONLY around
+//     the SV_AddTestClient() call, so no unrelated caller is ever affected.
+//   - During SV_AddTestClient(), SV_DirectConnect also runs an internal
+//     NET_CompareBaseAdr reconnect scan (SV_DirectConnect at 0x82281718 calls
+//     the wrapper). Our hook fires there too — forcing "not equal" means "this
+//     bot is not a reconnecting client", which is correct for a fresh bot.
+//   - Detouring _impl (not the wrapper) catches BOTH call paths, since the
+//     wrapper 0x82278BD0 calls _impl 0x82278B20.
 //
-//   3. codxe-T4 registers GSC builtins via the BW_LookupFunction /
-//      BW_LookupMethod tables dispatched by the codxe-T4 GSC layer, not via
-//      IW3's Scr_AddFunction / Scr_AddMethod. The lookup tables are kept.
+// Return convention (verified from the wrapper disassembly):
+//   NET_CompareBaseAdr wrapper does cntlzw/rlwinm on _impl's return:
+//     _impl returns 0       -> wrapper returns 1  ("equal")
+//     _impl returns nonzero -> wrapper returns 0  ("not equal")
+//   So the hook returns 1 to force "not equal".
 //
-// Diagnostics: BW_SystemReport + FLUSH markers bracket the SV_AddTestClient()
-// call. If SV_AddTestClient still hangs on T4 Xenia, the last printed marker
-// plus the verified SV_AddTestClient decompile localize the fault to one
-// internal scan — which is then a small targeted detour, NOT a return to
-// Path C.
+// Everything else is r314 unchanged: Path C stays deleted, three detours
+// (SV_BotUserMove, G_SelectWeaponIndex, SV_UserinfoChanged), SV_CalcPings not
+// detoured (T4 frame fields inert).
 //
-// Verified engine addresses (TU7 default_mp.xex, symbols_bw_ext.h):
-//   SV_AddTestClient    0x82281F08   (returns gentity_s*, no args)
-//   SV_UserinfoChanged  0x82280690
-//   SV_BotUserMove      0x82286D68
-//   SV_ClientThink      0x82280F38
-//   G_SelectWeaponIndex 0x8225D6D8
+// Verified engine addresses (TU7 default_mp.xex):
+//   SV_AddTestClient        0x82281F08   (returns gentity_s*, no args)
+//   NET_CompareBaseAdr      0x82278BD0   (wrapper)
+//   NET_CompareBaseAdr_impl 0x82278B20   (inner — detour target)
+//   SV_UserinfoChanged      0x82280690
+//   SV_BotUserMove          0x82286D68
+//   SV_ClientThink          0x82280F38
+//   G_SelectWeaponIndex     0x8225D6D8
 //
 
 #include "pch.h"
@@ -143,7 +158,7 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// SYSTEM REPORT — engine-global sanity dump (kept from r3xx diagnostics)
+// SYSTEM REPORT — engine-global sanity dump
 // ---------------------------------------------------------------------------
 
 static void BW_DumpClientSlot(const char *cl, int slot)
@@ -167,7 +182,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r314) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r317) =====\n");
 
     const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
     const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
@@ -194,6 +209,37 @@ static void BW_SystemReport()
 
     DbgPrint("sv_bots: maxclients (constant) = %d\n", MAX_CLIENTS_BW);
     DbgPrint("sv_bots: ===== END REPORT =====\n");
+}
+
+// ===========================================================================
+// r317 — NET_CompareBaseAdr_impl detour
+// ===========================================================================
+// While a bot-add is in progress, force NA_BOT-vs-NA_BOT comparisons to report
+// "not equal" so SV_AddTestClient's post-scan does not match the host at slot 0.
+// See the file header for the full rationale and the return convention.
+
+static Detour       NET_CompareBaseAdr_impl_Detour;
+static volatile int s_botAddInProgress = 0;
+
+static long long NET_CompareBaseAdr_impl_Hook(unsigned int *a,
+                                              unsigned int *b,
+                                              unsigned __int64 p3,
+                                              unsigned __int64 p4,
+                                              unsigned __int64 p5,
+                                              unsigned __int64 p6,
+                                              unsigned __int64 p7)
+{
+    // a[0] / b[0] are the netadr_t.type ints. NA_BOT == 0.
+    if (s_botAddInProgress && a != nullptr && b != nullptr &&
+        *a == 0 && *b == 0)
+    {
+        // Both NA_BOT. Return nonzero -> wrapper reports "not equal" -> the
+        // SV_AddTestClient post-scan skips this slot instead of matching it.
+        return 1;
+    }
+
+    return NET_CompareBaseAdr_impl_Detour
+        .GetOriginal<NET_CompareBaseAdr_impl_t>()(a, b, p3, p4, p5, p6, p7);
 }
 
 // ===========================================================================
@@ -300,11 +346,11 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // ===========================================================================
 // SV_UserinfoChanged detour — custom bot names
 // ===========================================================================
-// 1:1 port of the IW3 reference. When SV_AddTestClient -> SV_DirectConnect
-// connects a bot, the engine calls SV_UserinfoChanged with the client in
-// NA_BOT / CS_CONNECTED state and the raw connect userinfo loaded. We patch
-// the "name" key before the original runs, so the chosen name propagates
-// through SV_ClientEnterWorld and the configstring broadcast.
+// When SV_AddTestClient -> SV_DirectConnect connects a bot, the engine calls
+// SV_UserinfoChanged with the client in NA_BOT / CS_CONNECTED state and the raw
+// connect userinfo loaded. We patch the "name" key before the original runs so
+// the chosen name propagates through SV_ClientEnterWorld and the configstring
+// broadcast.
 
 static char   s_pendingBotName[32] = {0};
 static Detour SV_UserinfoChanged_Detour;
@@ -412,13 +458,13 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
-// 1:1 port of the IW3 reference GScr_AddTestClient: optionally stash a custom
-// name, call the REAL engine SV_AddTestClient(), clear the name. The
+// Stash an optional custom name, arm the NET_CompareBaseAdr_impl detour, call
+// the REAL engine SV_AddTestClient(), disarm, clear the name. The
 // SV_UserinfoChanged detour applies the name mid-connect.
 //
-// FLUSH markers bracket SV_AddTestClient(). If it hangs on T4 Xenia, FLUSH-A
-// prints and FLUSH-B does not — and the fault is then inside the real engine
-// function, to be fixed with a targeted detour, NOT by reviving Path C.
+// FLUSH markers bracket SV_AddTestClient(). r316 showed FLUSH-A printing and
+// FLUSH-B not — if r317's detour works, FLUSH-B should now print and ent be
+// non-NULL.
 
 static void GScr_AddTestClient()
 {
@@ -451,10 +497,15 @@ static void GScr_AddTestClient()
 
     BW_SystemReport();
 
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A before SV_AddTestClient\n");
+    // Arm the NET_CompareBaseAdr_impl detour ONLY for the duration of the
+    // SV_AddTestClient() call. Outside this window the hook is fully inert.
+    s_botAddInProgress = 1;
+    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A before SV_AddTestClient "
+             "(NET_CompareBaseAdr guard ARMED)\n");
     gentity_s *ent = SV_AddTestClient();
     DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-B after SV_AddTestClient (ent=0x%08X)\n",
              reinterpret_cast<unsigned int>(ent));
+    s_botAddInProgress = 0;
 
     s_pendingBotName[0] = '\0';
 
@@ -584,17 +635,24 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// THREE detours, matching the IW3 reference minus SV_CalcPings (see file
-// header point 1). All three are installed unconditionally — the IW3
-// reference installs them unconditionally and they are required for a bot to
-// connect (SV_UserinfoChanged) and act (SV_BotUserMove, G_SelectWeaponIndex).
+// FOUR detours now. Three are the IW3-reference drivers (SV_BotUserMove,
+// G_SelectWeaponIndex, SV_UserinfoChanged). The fourth, NET_CompareBaseAdr_impl,
+// is the r317 fix — installed unconditionally but INERT unless s_botAddInProgress
+// is set, so it only affects the SV_AddTestClient() window. SV_CalcPings is
+// still not detoured (T4 frame fields inert).
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r314 — IW3 reference port, Path C deleted)\n");
+    DbgPrint("sv_bots: T4 BW module init (r317 — NET_CompareBaseAdr post-scan fix)\n");
 
     CleanBotArray();
-    s_pendingBotName[0] = '\0';
+    s_pendingBotName[0]  = '\0';
+    s_botAddInProgress   = 0;
+
+    NET_CompareBaseAdr_impl_Detour =
+        Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
+    NET_CompareBaseAdr_impl_Detour.Install();
+    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour INSTALLED (inert until bot-add)\n");
 
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
     G_SelectWeaponIndex_Detour.Install();
@@ -615,6 +673,7 @@ sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: T4 BW module shutdown\n");
 
+    NET_CompareBaseAdr_impl_Detour.Remove();
     G_SelectWeaponIndex_Detour.Remove();
     SV_BotUserMove_Detour.Remove();
     SV_UserinfoChanged_Detour.Remove();
