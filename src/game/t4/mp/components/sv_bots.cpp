@@ -285,7 +285,7 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
 
-// r333 — TU7 address dump. Reads raw .text words to xenia.log so the last
+// r334 — TU7 address dump. Reads raw .text words to xenia.log so the last
 // 4 BW symbols can be signature-matched offline. Pure reads, no detour,
 // no patch — runs once at module init, before any bot is spawned. Set to
 // 0 once symbols_bw_ext.h is finalised with TU7 addresses.
@@ -548,10 +548,10 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 }
 
 // ---------------------------------------------------------------------------
-// r333 — TU7 address dump (DUMP4)
+// r334 — TU7 address dump (DUMP4)
 //
 // Resolves the last 4 unresolved TU7 symbols by dumping raw .text memory:
-//   SV_IsTestClient          window  0x8221A000 .. 0x82221000
+//   SV_IsTestClient          window  0x8221A000 .. 0x82223000
 //   Scr_Add* / Scr_Get* run  window  0x82345000 .. 0x8234C000
 //
 // These run inside the live TU7 process — Xenia has already decrypted the
@@ -560,27 +560,37 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // region is pure executable .text (vaddr base 0x820D0000+), so reads cannot
 // fault. No detour and no patch is installed; this is read-only.
 //
-// Output line format (8 words per line, address-prefixed):
-//   sv_bots: DUMP4 <addr>: w0 w1 w2 w3 w4 w5 w6 w7
+// Output line format (6 words per line, address-prefixed, stride 0x18):
+//   sv_bots: DUMP4 <addr>: w0 w1 w2 w3 w4 w5
 //
-// To match: take each base-image function prologue, mask off branch
-// displacements AND D-form immediates (lis/addi/ori — TU7 rewrites
-// data-address immediates), and search this dump. base->TU7 delta is
-// piecewise-linear, so each family must be matched independently.
+// r333 used 8 words/line and stride 0x20. T4's DbgPrint is fixed-arity and
+// only reads the PowerPC register window (r3..r10 = 8 args); words 6 and 7
+// were arg 9/10, spilled to stack, and printed as stale garbage. r334 uses
+// 6 words (7 args incl. addr) so every word is a real in-register read, and
+// stride 0x18 makes the dump fully contiguous with no 8-byte gap per row.
+//
+// NOTE: base->TU7 function ordering is NOT preserved (proven from the r333
+// Scr_Add* family — TU7 reverses AddInt/AddUndefined vs base). Match each
+// function by full-body signature, never by relative position.
 // ---------------------------------------------------------------------------
 
 static void BW_DumpRegion(unsigned int start, unsigned int end, const char *tag)
 {
     DbgPrint("sv_bots: DUMP4 BEGIN %s [%08X .. %08X]\n", tag, start, end);
 
-    for (unsigned int addr = start; addr < end; addr += 0x20)
+    // r334: 6 words per line, stride 0x18 — fully contiguous, no gaps.
+    // The DbgPrint call passes 7 args (addr + 6 words); PowerPC passes the
+    // first 8 integer args in r3..r10, so every argument stays in-register.
+    // r333 used 8 words / 9 args — args 9 and 10 spilled to stack and
+    // T4's fixed-arity DbgPrint printed stale garbage for words 6 and 7.
+    for (unsigned int addr = start; addr < end; addr += 0x18)
     {
         const volatile unsigned int *p =
             reinterpret_cast<const volatile unsigned int *>(addr);
 
-        DbgPrint("sv_bots: DUMP4 %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+        DbgPrint("sv_bots: DUMP4 %08X: %08X %08X %08X %08X %08X %08X\n",
                  addr,
-                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                 p[0], p[1], p[2], p[3], p[4], p[5]);
     }
 
     DbgPrint("sv_bots: DUMP4 END %s\n", tag);
@@ -588,10 +598,13 @@ static void BW_DumpRegion(unsigned int start, unsigned int end, const char *tag)
 
 static void BW_DumpRegions()
 {
-    DbgPrint("sv_bots: DUMP4 ==== r333 TU7 address dump start ====\n");
-    BW_DumpRegion(0x8221A000, 0x82221000, "SV_ISTESTCLIENT");
+    DbgPrint("sv_bots: DUMP4 ==== r334 TU7 address dump start ====\n");
+    // SV_IsTestClient: r333 window topped out at 0x82221000 and the
+    // function (base 0x8221D1E0 + ~+0x3E20 SV-region delta) sat at/past
+    // that edge. Widened the top to 0x82223000.
+    BW_DumpRegion(0x8221A000, 0x82223000, "SV_ISTESTCLIENT");
     BW_DumpRegion(0x82345000, 0x8234C000, "SCR_FAMILY");
-    DbgPrint("sv_bots: DUMP4 ==== r333 TU7 address dump end ====\n");
+    DbgPrint("sv_bots: DUMP4 ==== r334 TU7 address dump end ====\n");
 }
 
 // ---------------------------------------------------------------------------
