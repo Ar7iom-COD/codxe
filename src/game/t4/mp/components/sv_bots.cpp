@@ -2,7 +2,7 @@
 // Bot Warfare T4 port — engine module.
 //
 // ===========================================================================
-// r330 — TU7 re-derivation build: dump SV_AddTestClient bytes to the log
+// r331 — TU7 re-derivation build: dump SV_AddTestClient bytes to the log
 // ===========================================================================
 //
 // WHY THIS BUILD EXISTS
@@ -29,7 +29,7 @@
 //   r327  installed ONLY NET_CompareBaseAdr_impl -> still froze pregame ->
 //         detour mechanism itself breaks pregame. Detour route abandoned.
 //   r328  one-instruction raw scan-patch @0x8228203C -> SKIPPED (wrong binary).
-//   r330  THIS BUILD — no patch, no detours; dumps SV_AddTestClient bytes.
+//   r331  THIS BUILD — no patch, no detours; dumps SV_AddTestClient bytes.
 //
 // Engine addresses below are from the OLD (base 0.0.0.8) Ghidra project and
 // are NOT trusted. SV_AddTestClient's ENTRY (0x82281F08) is trusted only
@@ -60,32 +60,146 @@ namespace mp
 using namespace t4::mp::bw;
 
 // ---------------------------------------------------------------------------
-// r330 diagnostic: dump the SV_AddTestClient region from the live TU7 process
+// r331 diagnostic (A+B): TU7 address re-derivation
 // ---------------------------------------------------------------------------
-// SV_AddTestClient entry is 0x82281F08. We dump from a little before the entry
-// through entry + 0x380 (896 bytes / 224 instructions) so the scan loop is
-// captured with margin on both sides. Pure reads of executable memory — no
-// detour, no patch, cannot perturb anything.
+// Base-image analysis (decrypted 0.0.0.8) established, FOR THE BASE IMAGE:
+//   GSC builtin table   ~0x82476450 (12-byte entries {char* name, void* fn, int})
+//   "addtestclient" str   0x8202E79C
+//   GScr_AddTestClient    0x822395C8  (calls SV_AddTestClient via bl 0x82281F08)
+//   SV_AddTestClient      0x82281F08  (base) -- RELOCATED in TU7
+// TU7 relocates code, so base addresses are wrong for the running binary.
+//
+// PART A — raw region dumps (offline disassembly):
+//   builtintable  0x82476400 + 0x1000  (.data)
+//   stringarea    0x8202E000 + 0x1000  (.rdata)
+//   gscaddtc      0x82239400 + 0x0300  (.text)
+//
+// PART B — self-locating builtin-table scan: walk .data looking for the
+//   {rdata-ptr, text-ptr, small-int} x N pattern, then print every
+//   {name, func} pair. Self-locating => robust if the table relocated.
+//
+// Pure reads. No detour, no patch. Runs at init before any spawn.
 
-#define BW_DUMP_BASE   0x82281F08u   // SV_AddTestClient entry
-#define BW_DUMP_LEN    0x380u        // bytes to dump (224 instructions)
+struct BW_DumpRegion { unsigned int base; unsigned int len; const char *tag; };
 
-static void BW_DumpAddTestClientRegion()
+static void BW_DumpRegions()
 {
-    DbgPrint("sv_bots: DUMP begin SV_AddTestClient region "
-             "(base=0x%08X len=0x%X)\n", BW_DUMP_BASE, BW_DUMP_LEN);
+    static const BW_DumpRegion regions[] = {
+        { 0x82476400u, 0x1000u, "builtintable" },
+        { 0x8202E000u, 0x1000u, "stringarea"   },
+        { 0x82239400u, 0x0300u, "gscaddtc"     },
+    };
 
-    const volatile unsigned int *p =
-        reinterpret_cast<const volatile unsigned int *>(BW_DUMP_BASE);
-
-    for (unsigned int off = 0; off < BW_DUMP_LEN; off += 4)
+    const unsigned int regionCount =
+        static_cast<unsigned int>(sizeof(regions) / sizeof(regions[0]));
+    for (unsigned int r = 0; r < regionCount; ++r)
     {
-        const unsigned int addr = BW_DUMP_BASE + off;
-        const unsigned int word = p[off / 4u];
-        DbgPrint("sv_bots: DUMP %08X: %08X\n", addr, word);
+        const unsigned int base = regions[r].base;
+        const unsigned int len  = regions[r].len;
+        DbgPrint("sv_bots: DUMP2 begin tag=%s base=0x%08X len=0x%X\n",
+                 regions[r].tag, base, len);
+
+        const volatile unsigned int *p =
+            reinterpret_cast<const volatile unsigned int *>(base);
+        for (unsigned int off = 0; off < len; off += 4)
+        {
+            DbgPrint("sv_bots: DUMP2 %s %08X: %08X\n",
+                     regions[r].tag, base + off, p[off / 4u]);
+        }
+        DbgPrint("sv_bots: DUMP2 end tag=%s\n", regions[r].tag);
+    }
+}
+
+// --- PART B: self-locating builtin-table scan -----------------------------
+// Image layout (from base PE sections; TU7 keeps the same section VAs):
+//   .rdata 0x82000600 .. 0x820B0924   (builtin NAME strings live here)
+//   .text  0x820D0000 .. 0x8245734C   (builtin FUNC pointers point here)
+//   .data  0x82470000 .. 0x84020000   (the builtin TABLE lives here)
+// An entry is { const char* name; void* func; int type; } = 12 bytes.
+// A valid entry: name in .rdata range, func in .text range, type in 0..8.
+
+static bool BW_PtrInRdata(unsigned int v)
+{
+    return (v >= 0x82000600u && v < 0x820B1000u);
+}
+static bool BW_PtrInText(unsigned int v)
+{
+    return (v >= 0x820D0000u && v < 0x82458000u);
+}
+
+static void BW_ReadCString(unsigned int va, char *out, int outsz)
+{
+    int n = 0;
+    const volatile char *s = reinterpret_cast<const volatile char *>(va);
+    for (; n < outsz - 1; ++n)
+    {
+        const char c = s[n];
+        if (c == '\0') break;
+        out[n] = (c >= 0x20 && c < 0x7F) ? c : '?';
+    }
+    out[n] = '\0';
+}
+
+static void BW_ScanBuiltinTable()
+{
+    // Search .data for a run of >=8 consecutive valid 12-byte entries.
+    const unsigned int scanStart = 0x82470000u;
+    const unsigned int scanEnd   = 0x82490000u;   // generous .data window
+    const unsigned int stride    = 12u;
+
+    DbgPrint("sv_bots: BTBL scan 0x%08X..0x%08X\n", scanStart, scanEnd);
+
+    unsigned int tableVa = 0u;
+    for (unsigned int va = scanStart; va < scanEnd - stride * 8u; va += 4u)
+    {
+        const volatile unsigned int *e =
+            reinterpret_cast<const volatile unsigned int *>(va);
+        // require 8 consecutive valid entries to lock onto the table
+        bool ok = true;
+        for (unsigned int k = 0; k < 8u; ++k)
+        {
+            const unsigned int name = e[k * 3u + 0u];
+            const unsigned int func = e[k * 3u + 1u];
+            const unsigned int typ  = e[k * 3u + 2u];
+            if (!BW_PtrInRdata(name) || !BW_PtrInText(func) || typ > 8u)
+            {
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+        {
+            tableVa = va;
+            break;
+        }
     }
 
-    DbgPrint("sv_bots: DUMP end SV_AddTestClient region\n");
+    if (tableVa == 0u)
+    {
+        DbgPrint("sv_bots: BTBL NOT FOUND in scan window\n");
+        return;
+    }
+
+    DbgPrint("sv_bots: BTBL found @0x%08X\n", tableVa);
+
+    // Walk forward printing entries until one fails validation.
+    const volatile unsigned int *e =
+        reinterpret_cast<const volatile unsigned int *>(tableVa);
+    for (unsigned int i = 0; i < 4096u; ++i)
+    {
+        const unsigned int name = e[i * 3u + 0u];
+        const unsigned int func = e[i * 3u + 1u];
+        const unsigned int typ  = e[i * 3u + 2u];
+        if (!BW_PtrInRdata(name) || !BW_PtrInText(func) || typ > 8u)
+        {
+            DbgPrint("sv_bots: BTBL end at index %u\n", i);
+            break;
+        }
+        char nm[40];
+        BW_ReadCString(name, nm, sizeof(nm));
+        DbgPrint("sv_bots: BTBL[%u] name=0x%08X func=0x%08X type=%u '%s'\n",
+                 i, name, func, typ, nm);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +302,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r330) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r331) =====\n");
 
     const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
     const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
@@ -218,9 +332,9 @@ static void BW_SystemReport()
 }
 
 // ===========================================================================
-// Detours — r330: ALL constructed but NONE installed.
+// Detours — r331: ALL constructed but NONE installed.
 // ===========================================================================
-// r327 proved the Detour MECHANISM breaks pregame. r330 installs zero detours.
+// r327 proved the Detour MECHANISM breaks pregame. r331 installs zero detours.
 // The hook/stub bodies are kept compilable for future use only.
 
 static Detour       NET_CompareBaseAdr_impl_Detour;
@@ -433,10 +547,10 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
-// r330: addtestclient IS in the dispatch table so GScr_AddTestClient runs.
+// r331: addtestclient IS in the dispatch table so GScr_AddTestClient runs.
 // NO scan-patch is applied this build, so pressing D-Pad Up WILL still freeze
-// inside SV_AddTestClient — that is expected and acceptable. The point of r330
-// is the DUMP printed at init; the spawn test is not required for r330's goal.
+// inside SV_AddTestClient — that is expected and acceptable. The point of r331
+// is the DUMP printed at init; the spawn test is not required for r331's goal.
 // (You can still press D-Pad Up if you want to re-confirm FLUSH-A1, but the
 // dump is already in the log by then.)
 //
@@ -476,7 +590,7 @@ static void GScr_AddTestClient()
     BW_SystemReport();
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A1 entering SV_AddTestClient "
-             "(r330 — NO patch, freeze here is expected)\n");
+             "(r331 — NO patch, freeze here is expected)\n");
 
     gentity_s *ent = SV_AddTestClient();
 
@@ -565,7 +679,7 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r330: addtestclient IS in the table so GScr_AddTestClient runs.
+    // r331: addtestclient IS in the table so GScr_AddTestClient runs.
     {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
@@ -612,21 +726,22 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// r330: ZERO detours installed (r327 proved the Detour mechanism breaks
+// r331: ZERO detours installed (r327 proved the Detour mechanism breaks
 // pregame). NO scan-patch (r328 proved 0x8228203C is wrong on TU7). The ONLY
-// new behaviour is BW_DumpAddTestClientRegion() — it prints the real TU7
-// bytes of SV_AddTestClient to the log for offline disassembly.
+// new behaviour is BW_DumpRegions()+BW_ScanBuiltinTable() — it prints three
+// TU7 regions plus a self-located builtin-table walk for offline analysis.
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r330 — TU7 byte-dump diagnostic)\n");
+    DbgPrint("sv_bots: T4 BW module init (r331 — TU7 byte-dump diagnostic)\n");
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
     s_botAddInProgress  = 0;
 
-    // ----- the whole point of r330 -----
-    BW_DumpAddTestClientRegion();
+    // ----- the whole point of r331 -----
+    BW_DumpRegions();
+    BW_ScanBuiltinTable();
 
     // Detours constructed but deliberately NOT installed.
     NET_CompareBaseAdr_impl_Detour =
@@ -638,7 +753,7 @@ sv_bots::sv_bots()
     SV_UserinfoChanged_Detour =
         Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
 
-    DbgPrint("sv_bots: r330 — module loaded, NO detours, NO patch, dump only\n");
+    DbgPrint("sv_bots: r331 — module loaded, NO detours, NO patch, dump only\n");
 }
 
 sv_bots::~sv_bots()
