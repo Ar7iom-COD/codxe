@@ -671,7 +671,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r320-A — guard INSTALLED, 3 detours off)\n");
+    DbgPrint("sv_bots: T4 BW module init (r322 — ZERO detours installed)\n");
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
@@ -679,8 +679,8 @@ sv_bots::sv_bots()
 
     NET_CompareBaseAdr_impl_Detour =
         Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
-    NET_CompareBaseAdr_impl_Detour.Install();   // r320-A: ENABLED — the surgical guard
-    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour INSTALLED (r320-A)\n");
+    // NET_CompareBaseAdr_impl_Detour.Install();  // r322: DISABLED — pregame "Awaiting challenge" freeze (r319 finding: detour mechanism breaks pregame)
+    DbgPrint("sv_bots: NET_CompareBaseAdr_impl detour NOT installed (r322)\n");
 
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
     // G_SelectWeaponIndex_Detour.Install();    // r320-A: NOT installed
@@ -694,7 +694,7 @@ sv_bots::sv_bots()
     // SV_UserinfoChanged_Detour.Install();     // r320-A: NOT installed
     DbgPrint("sv_bots: SV_UserinfoChanged detour NOT installed (r320-A)\n");
 
-    DbgPrint("sv_bots: r320-A — module loaded, guard active\n");
+    DbgPrint("sv_bots: r322 — module loaded, ZERO detours active\n");
 }
 
 sv_bots::~sv_bots()
