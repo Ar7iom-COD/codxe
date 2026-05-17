@@ -287,9 +287,9 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 
 // r334 — TU7 address dump. Reads raw .text words to xenia.log so the last
 // 4 BW symbols can be signature-matched offline. Pure reads, no detour,
-// no patch — runs once at module init, before any bot is spawned. Set to
-// 0 once symbols_bw_ext.h is finalised with TU7 addresses.
-#define CODXE_DIAG_DUMP4                      1
+// no patch — runs once at module init, before any bot is spawned.
+// r338: addresses are finalised in symbols_bw_ext.h — dump disabled.
+#define CODXE_DIAG_DUMP4                      0
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -495,6 +495,32 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
+// <player> istestclient()  ->  returns 1 if the client is an engine test
+// client (bot), else 0.
+//
+// Fix B: BW's GSC do_isbot() previously read self.pers["isBot"], a GSC-set
+// field the engine clears when it rebuilds pers during the connect cycle.
+// That made the is_bot() gate in _bot.gsc::connected() reject the bot, so
+// teamWatch() never started and the bot sat in spectator. This method asks
+// the engine directly via SV_IsTestClient (TU7 0x8221F6D0) — engine truth,
+// immune to pers timing. The adapter's do_isbot() should call this.
+static void PlayerCmd_IsTestClient(scr_entref_t entref)
+{
+    if (entref.classnum != 0)
+        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
+
+    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    const int result = SV_IsTestClient(static_cast<int>(entref.entnum));
+    Scr_AddInt_BW(result != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
+}
+
 // ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
@@ -504,7 +530,22 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r338 A/B TEST — addtestclient interception DISABLED.
+    //
+    // On r261 (no sv_bots.cpp) addtestclient() reached the engine's own GSC
+    // builtin and the bot JOINED A TEAM (named "Larry N" by the engine).
+    // With BW's GScr_AddTestClient intercepting, the bot is named "BOT1/2"
+    // by mod GSC and sits inert in spectator. GScr_AddTestClient only calls
+    // the bare SV_AddTestClient() — the engine builtin evidently does more
+    // (the connect/team sequence) after that call.
+    //
+    // Commenting this line out makes codxe's Scr_GetFunction_Hook fall
+    // through to the engine builtin — i.e. exactly the r261 code path.
+    // If bots now join a team, the fix belongs here (replicate or delegate
+    // to the engine builtin). If they still sit in spectator, the team-join
+    // was in r261-era mod GSC and the current mod's GSC is the regression.
+    //
+    // { "addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient) },
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -520,6 +561,7 @@ static struct
     {"botstop",           Scr_BotStop},
     {"getentitynumber",   PlayerCmd_GetEntityNumber},
     {"getguid",           PlayerCmd_GetGuid},
+    {"istestclient",      PlayerCmd_IsTestClient},
     {nullptr, nullptr},
 };
 
