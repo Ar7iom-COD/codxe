@@ -608,10 +608,17 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r321 TEST: addtestclient hijack DISABLED -- falls through to the native
+    // WaW engine builtin. GScr_AddTestClient kept defined but unreachable.
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
+
+// r321: keep GScr_AddTestClient referenced so /WX (C4505) does not flag it
+// while it is out of the dispatch table. volatile prevents the optimizer
+// dropping it. Never called.
+static const volatile BuiltinFunction s_keep_GScr_AddTestClient_alive =
+    reinterpret_cast<BuiltinFunction>(GScr_AddTestClient);
 
 static struct
 {
