@@ -33,6 +33,18 @@
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
 //
+// r339 — detour-free build:
+//
+//   All three BW server-path detours (SV_BotUserMove, SV_UserinfoChanged,
+//   G_SelectWeaponIndex) are compiled OUT via the CODXE_DIAG_* toggles below
+//   (all 0). The sv_bots module installs ZERO detours. codxe-core's own
+//   Scr_GetFunction / Player_GetMethod lookup detours are unaffected and
+//   continue to route istestclient -> PlayerCmd_IsTestClient (Fix B).
+//
+//   This build exists to compile bot_warfare (which calls istestclient from
+//   bots_adapter_pt4.gsc) and to let GSC-side Fix A + Fix B kill the bot
+//   spectator bug. Driving bots (SV_BotUserMove) is a later milestone.
+//
 // r293 — vanilla bot spawn:
 //
 //   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
@@ -282,8 +294,8 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 // r293 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r339: detour-free
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r339: detour-free
 
 // r334 — TU7 address dump. Reads raw .text words to xenia.log so the last
 // 4 BW symbols can be signature-matched offline. Pure reads, no detour,
@@ -545,7 +557,7 @@ static struct
     // to the engine builtin). If they still sit in spectator, the team-join
     // was in r261-era mod GSC and the current mod's GSC is the regression.
     //
-    // { "addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient) },
+    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},  // r339-bw: BW intercept
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -655,8 +667,8 @@ static void BW_DumpRegions()
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
-    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: r339 detour-free build (BW server-path detours compiled out)\n");
+    DbgPrint("sv_bots: [DIAG] r339-bw | weapon=%d userinfo=%d botmove=%d | addtestclient=BW-INTERCEPT\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
