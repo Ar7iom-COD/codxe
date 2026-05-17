@@ -1,47 +1,45 @@
 //
 // Bot Warfare T4 port — engine module.
 //
-// ===========================================================================
-// r332 — TU7 re-derivation build: dump SV_AddTestClient bytes to the log
-// ===========================================================================
+// Ports the codxe IW3 sv_bots.cpp to T4 X360 (TU7). Adds the BW C++ surface
+// that the GSC layer (scripts/mp/bots*.gsc + maps/mp/bots/_bot*.gsc) drives:
 //
-// WHY THIS BUILD EXISTS
-//   r328's one-instruction scan-patch @0x8228203C failed: the running TU7
-//   image reported `scan-patch SKIPPED — unexpected instruction 0x480416ED`.
-//   0x480416ED decodes to `bl 0x822C3728` — a CALL, not the expected
-//   `cmpwi cr6,r10,0`. Investigation found the Ghidra project was built from
-//   the BASE disc default_mp.xex (module version 0.0.0.8), NOT the TU7-patched
-//   image (0.0.7.8) that Xenia actually executes. Every Ghidra-derived address
-//   in the handoff doc is therefore suspect.
+//   GSC functions
+//     addtestclient(<name>)        — spawn a bot (returns the bot entity)
 //
-//   This build does NOT attempt any patch. It dumps the raw bytes of the
-//   SV_AddTestClient region straight from the running (TU7-patched) process
-//   to the log. That dump IS the real executing code — no binary-mismatch
-//   risk possible. The bytes get disassembled offline to locate the real
-//   scan loop, the real patch site, and the real register numbers.
+//   GSC entity methods (on a bot entity)
+//     <bot> botMoveTo(<vec3>)      — drive forward/strafe toward a world point
+//     <bot> botAction("+fire")     — set/clear a button bit
+//     <bot> botMirror(<player>)    — copy another client's lastUsercmd 1:1
+//     <bot> botStop()              — clear all bot input state
 //
-// HISTORY
-//   r314  deleted Path C; called the real engine SV_AddTestClient() directly.
-//   r316  proved that call hangs on T4 Xenia: FLUSH-A prints, FLUSH-B never.
-//   r317  installed all four detours -> froze in pregame.
-//   r318  gutted hook bodies -> still froze -> hook bodies cleared.
-//   r319  zero detours installed -> pregame fine, spawn still froze.
-//   r327  installed ONLY NET_CompareBaseAdr_impl -> still froze pregame ->
-//         detour mechanism itself breaks pregame. Detour route abandoned.
-//   r328  one-instruction raw scan-patch @0x8228203C -> SKIPPED (wrong binary).
-//   r332  THIS BUILD — no patch, no detours; dumps SV_AddTestClient bytes.
+// Architecture notes:
 //
-// Engine addresses below are from the OLD (base 0.0.0.8) Ghidra project and
-// are NOT trusted. SV_AddTestClient's ENTRY (0x82281F08) is trusted only
-// because FLUSH-A1 demonstrably prints from inside it on TU7.
+//   - ALL Scr_*, va, and SV_ClientThink calls go through symbols_bw_ext.h's
+//     verified addresses (suffix `_BW`). The stock codxe T4 symbols.h is
+//     largely incorrect on TU7 default_mp.xex; see audit comments in
+//     symbols_bw_ext.h.
 //
-//   SV_AddTestClient        0x82281F08   (entry — trusted: FLUSH-A1 prints)
-//   NET_CompareBaseAdr      0x82278BD0   (SUSPECT — base-image address)
-//   NET_CompareBaseAdr_impl 0x82278B20   (SUSPECT — base-image address)
-//   SV_UserinfoChanged      0x82280690   (SUSPECT)
-//   SV_BotUserMove          0x82286D68   (SUSPECT)
-//   SV_ClientThink          0x82280F38   (SUSPECT)
-//   G_SelectWeaponIndex     0x8225D6D8   (SUSPECT)
+//   - GSC builtin registration: sv_bots exports BW_LookupFunction and
+//     BW_LookupMethod (`extern "C"`). The existing gsc_functions and
+//     gsc_client_methods modules call them BEFORE falling through to the
+//     engine.
+//
+//   - gentity is at client_t + 0x21324 on T4 (stock codxe T4 struct.h says
+//     +0x213F4 — wrong; that's lastPacketTime). We access via the parallel
+//     `clientBW_t` view defined in structs_bw_ext.h.
+//
+//   - On T4 the entity-from-script-arg path is Scr_GetEntityNum (returns
+//     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
+//     gentity_s* directly; T4 does not have an equivalent.
+//
+// r293 — vanilla bot spawn:
+//
+//   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
+//   it directly, the same way CoD Jumper's GSC does. The Path C bypass
+//   from r292 is removed — it was solving a problem that didn't exist
+//   in practice (the NET_CompareBaseAdr fall-through is real in the
+//   disassembly but doesn't manifest as host corruption on Xenia).
 //
 
 #include "pch.h"
@@ -50,7 +48,13 @@
 #include <cmath>
 #include <cstring>
 
-#pragma warning(disable: 4505)  // unreferenced local fn
+// MSVC C4505: "unreferenced local function has been removed". Our static
+// hook bodies (G_SelectWeaponIndex_Hook, SV_BotUserMove_Stub,
+// SV_UserinfoChanged_Hook) are address-only references — their function
+// pointers are passed to Detour() but they are never called directly from
+// C++. The optimizer can't see the address-take through the constructor
+// argument, so it complains. /WX promotes this to an error.
+#pragma warning(disable: 4505)
 
 namespace t4
 {
@@ -58,56 +62,6 @@ namespace mp
 {
 
 using namespace t4::mp::bw;
-
-// ---------------------------------------------------------------------------
-// r332 diagnostic: dump 10 predicted TU7 windows for signature-matching
-// ---------------------------------------------------------------------------
-// ROOT CAUSE (confirmed): symbols_bw_ext.h holds BASE 0.0.0.8 addresses; the
-// running binary is TU7 0.0.7.8. codxe's own symbols.h holds the correct TU7
-// addresses (codxe-core runs fine). 10 of BW's 25 engine symbols are already
-// in codxe symbols.h -> fixed directly. The remaining 15 are not; their TU7
-// addresses are found by signature-matching the base-image prologue inside a
-// predicted window. Windows below are interpolated from codxe symbols.h
-// anchors (base->TU7 delta is piecewise-linear).
-//
-// Pure reads. No detour, no patch. Runs at init before any spawn.
-
-struct BW_DumpRegion { unsigned int base; unsigned int len; const char *tag; };
-
-static void BW_DumpRegions()
-{
-    static const BW_DumpRegion regions[] = {
-        { 0x8221F7F0u, 0x3000u, "w0" },   // SV_IsTestClient
-        { 0x82253A70u, 0x3000u, "w1" },   // Scr_Notify
-        { 0x8225FCF0u, 0x3000u, "w2" },   // G_SelectWeaponIndex
-        { 0x8227B130u, 0x3000u, "w3" },   // NET_CompareBaseAdr_impl
-        { 0x822823F0u, 0x5180u, "w4" },   // SV_DropClient/UserinfoChanged/AddTestClient/BotUserMove
-        { 0x82289590u, 0x3000u, "w5" },   // (SV_BotUserMove tail margin)
-        { 0x822C2210u, 0x3600u, "w6" },   // Info_ValueForKey / Info_SetValueForKey
-        { 0x82339890u, 0x3000u, "w7" },   // Scr_AllocString
-        { 0x82343C40u, 0x3400u, "w8" },   // Scr_AddEntityNum/AddUndefined/AddString
-        { 0x8234A320u, 0x3000u, "w9" },   // Scr_GetEntityNum
-    };
-
-    const unsigned int regionCount =
-        static_cast<unsigned int>(sizeof(regions) / sizeof(regions[0]));
-    for (unsigned int r = 0; r < regionCount; ++r)
-    {
-        const unsigned int base = regions[r].base;
-        const unsigned int len  = regions[r].len;
-        DbgPrint("sv_bots: DUMP3 begin tag=%s base=0x%08X len=0x%X\n",
-                 regions[r].tag, base, len);
-
-        const volatile unsigned int *p =
-            reinterpret_cast<const volatile unsigned int *>(base);
-        for (unsigned int off = 0; off < len; off += 4)
-        {
-            DbgPrint("sv_bots: DUMP3 %s %08X: %08X\n",
-                     regions[r].tag, base + off, p[off / 4u]);
-        }
-        DbgPrint("sv_bots: DUMP3 end tag=%s\n", regions[r].tag);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Per-client AI input state
@@ -131,7 +85,7 @@ static void CleanBotArray()
 }
 
 // ---------------------------------------------------------------------------
-// Button mapping
+// Button mapping (T4 button_mask → IW3-style names used by upstream GSC)
 // ---------------------------------------------------------------------------
 
 struct BotAction_t
@@ -163,11 +117,12 @@ static const BotAction_t BotActions[] = {
 
 static inline clientBW_t *BW_GetClient(int clientNum)
 {
-    return reinterpret_cast<clientBW_t *>(
-        reinterpret_cast<char *>(BW_svs_clients()) +
-        static_cast<unsigned int>(clientNum) * BW_CLIENT_STRIDE);
+    return &reinterpret_cast<clientBW_t *>(svsHeader->clients)[clientNum];
 }
 
+// Validate the entref points at a real player entity. T4 entref carries
+// {entnum, classnum, localclientnum}; classnum 0 means "entity" (vs world
+// or fielded object).
 static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 {
     if (entref.classnum != 0)
@@ -185,114 +140,65 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// SYSTEM REPORT — engine-global sanity dump
+// G_SelectWeaponIndex detour — track per-client weapon for usercmd synthesis
 // ---------------------------------------------------------------------------
 
-static void BW_DumpClientSlot(const char *cl, int slot)
+static Detour G_SelectWeaponIndex_Detour;
+
+static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
-    const int   state = *reinterpret_cast<const int *>(cl);
-    const char *name  = cl + BW_CLIENT_NAME_OFF;
+    if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
+        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
 
-    char namebuf[36];
-    int  n = 0;
-    for (; n < 32; ++n)
-    {
-        const char ch = name[n];
-        if (ch == '\0') break;
-        namebuf[n] = (static_cast<unsigned char>(ch) >= 0x20 &&
-                      static_cast<unsigned char>(ch) < 0x7F) ? ch : '?';
-    }
-    namebuf[n] = '\0';
-
-    DbgPrint("sv_bots:   slot %d: state=%d name=\"%s\"\n", slot, state, namebuf);
+    G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
 
-static void BW_SystemReport()
-{
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r332) =====\n");
-
-    const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
-    const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
-    const int          svTime   = BW_svs_time();
-
-    DbgPrint("sv_bots: svsHeader @0x%08X  .clients=0x%08X  .time=%d\n",
-             hdrAddr, clientsP, svTime);
-
-    if (clientsP != 0)
-    {
-        const char *base = reinterpret_cast<const char *>(clientsP);
-        BW_DumpClientSlot(base + 0 * BW_CLIENT_STRIDE, 0);
-        BW_DumpClientSlot(base + 1 * BW_CLIENT_STRIDE, 1);
-    }
-    else
-    {
-        DbgPrint("sv_bots:   svsHeader.clients is 0 — server not up?\n");
-    }
-
-    const unsigned int gentBase    = BW_ADDR_G_ENTITIES;
-    const int          gent0Number = *reinterpret_cast<const int *>(gentBase + 0x0);
-    DbgPrint("sv_bots: g_entities @0x%08X stride=0x%X  ent[0].s.number=%d\n",
-             gentBase, BW_GENTITY_STRIDE, gent0Number);
-
-    DbgPrint("sv_bots: maxclients (constant) = %d\n", MAX_CLIENTS_BW);
-    DbgPrint("sv_bots: ===== END REPORT =====\n");
-}
-
-// ===========================================================================
-// Detours — r332: ALL constructed but NONE installed.
-// ===========================================================================
-// r327 proved the Detour MECHANISM breaks pregame. r332 installs zero detours.
-// The hook/stub bodies are kept compilable for future use only.
-
-static Detour       NET_CompareBaseAdr_impl_Detour;
-static volatile int s_botAddInProgress = 0;
-
-static long long NET_CompareBaseAdr_impl_Hook(unsigned int *a,
-                                              unsigned int *b,
-                                              unsigned __int64 p3,
-                                              unsigned __int64 p4,
-                                              unsigned __int64 p5,
-                                              unsigned __int64 p6,
-                                              unsigned __int64 p7)
-{
-    if (s_botAddInProgress && a != nullptr && b != nullptr)
-    {
-        const unsigned int ta = *a;
-        const unsigned int tb = *b;
-        const bool aDegenerate = (ta == 0u || ta == 2u);
-        const bool bDegenerate = (tb == 0u || tb == 2u);
-        if (aDegenerate && bDegenerate)
-            return 1;
-    }
-
-    return NET_CompareBaseAdr_impl_Detour
-        .GetOriginal<NET_CompareBaseAdr_impl_t>()(a, b, p3, p4, p5, p6, p7);
-}
+// ---------------------------------------------------------------------------
+// SV_BotUserMove detour — core bot driver
+// ---------------------------------------------------------------------------
 
 static Detour SV_BotUserMove_Detour;
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
 
-    const int clientNum = static_cast<int>(
-        (reinterpret_cast<char *>(cl) - reinterpret_cast<char *>(BW_svs_clients()))
-        / static_cast<int>(BW_CLIENT_STRIDE));
+    const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
+
+    // Defense in depth: only inject input for real bot clients.
+    if (cl->header.netchan.remoteAddress.type != NA_BOT)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
+    if (cl->isTestClient == 0)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
 
-    cmd.serverTime = BW_svs_time();
+    cmd.serverTime = svsHeader->time;
     cmd.weapon     = g_botai[clientNum].weapon;
-    cmd.buttons    = static_cast<button_mask>(g_botai[clientNum].buttons);
+
+    cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
     if (g_botai[clientNum].doMove)
     {
         gentity_s *ent = cl->gentity;
 
+        // Vector to target (XY plane).
         float move_pos[2];
         move_pos[0] = g_botai[clientNum].moveTo[0] - ent->r.currentOrigin[0];
         move_pos[1] = g_botai[clientNum].moveTo[1] - ent->r.currentOrigin[1];
@@ -300,6 +206,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         const float distance = std::sqrt(move_pos[0] * move_pos[0] + move_pos[1] * move_pos[1]);
         g_botai[clientNum].doMove = (distance > 7.0f) ? 1 : 0;
 
+        // Rotate world-space offset into bot's local frame (negate yaw).
         const float yaw_rad = -ent->r.currentAngles[1] * (3.14159265358979323846f / 180.0f);
         const float s = std::sin(yaw_rad);
         const float c = std::cos(yaw_rad);
@@ -308,6 +215,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         move_pos[0] = rx;
         move_pos[1] = ry;
 
+        // Scale dominant axis to 127, preserve direction.
         const float absX = move_pos[0] < 0.0f ? -move_pos[0] : move_pos[0];
         const float absY = move_pos[1] < 0.0f ? -move_pos[1] : move_pos[1];
         const float maxabs = absX > absY ? absX : absY;
@@ -317,12 +225,14 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
             move_pos[1] = move_pos[1] * (127.0f / maxabs);
         }
 
+        // Floor and flip Y to match usercmd semantics.
         move_pos[0] =  std::floor(move_pos[0]);
         move_pos[1] = -std::floor(move_pos[1]);
 
         cmd.forwardmove = static_cast<char>(static_cast<int>(move_pos[0]) & 0xFF);
         cmd.rightmove   = static_cast<char>(static_cast<int>(move_pos[1]) & 0xFF);
 
+        // Edge-fire "movedone" notify on arrival.
         if (!g_botai[clientNum].doMove)
         {
             static const auto scr_const_movedone = Scr_AllocString("movedone");
@@ -330,6 +240,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         }
     }
 
+    // Mirror mode: 1:1 copy of another client's last usercmd.
     if (g_botai[clientNum].is_mirroring_client)
     {
         const int mirror_num = g_botai[clientNum].mirror_client_num;
@@ -337,8 +248,8 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         {
             const usercmd_s &last = BW_GetClient(mirror_num)->lastUsercmd;
             cmd.buttons     = last.buttons;
-            cmd.angles[0]   = last.angles[0];
-            cmd.angles[1]   = last.angles[1];
+            cmd.angles[0]   = last.angles[0]; // pitch
+            cmd.angles[1]   = last.angles[1]; // yaw
             cmd.forwardmove = last.forwardmove;
             cmd.rightmove   = last.rightmove;
         }
@@ -348,20 +259,37 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     SV_ClientThink_BW(cl, &cmd);
 }
 
-static Detour G_SelectWeaponIndex_Detour;
+// ---------------------------------------------------------------------------
+// SV_UserinfoChanged detour — stamp pending bot name before first parse
+// ---------------------------------------------------------------------------
 
-static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
-{
-    G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
-}
-
-static char   s_pendingBotName[32] = {0};
-static Detour SV_UserinfoChanged_Detour;
+static char    s_pendingBotName[32] = {0};
+static Detour  SV_UserinfoChanged_Detour;
 
 static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 {
+    if (s_pendingBotName[0] &&
+        cl->header.netchan.remoteAddress.type == NA_BOT &&
+        cl->header.state == CS_CONNECTED)
+    {
+        Info_SetValueForKey(cl->userinfo, "name", s_pendingBotName);
+    }
+
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
+
+// ===========================================================================
+// r293 DIAGNOSTIC TOGGLES
+// ===========================================================================
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
+
+// r333 — TU7 address dump. Reads raw .text words to xenia.log so the last
+// 4 BW symbols can be signature-matched offline. Pure reads, no detour,
+// no patch — runs once at module init, before any bot is spawned. Set to
+// 0 once symbols_bw_ext.h is finalised with TU7 addresses.
+#define CODXE_DIAG_DUMP4                      1
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -454,25 +382,21 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
-// r332: addtestclient IS in the dispatch table so GScr_AddTestClient runs.
-// NO scan-patch is applied this build, so pressing D-Pad Up WILL still freeze
-// inside SV_AddTestClient — that is expected and acceptable. The point of r332
-// is the DUMP printed at init; the spawn test is not required for r332's goal.
-// (You can still press D-Pad Up if you want to re-confirm FLUSH-A1, but the
-// dump is already in the log by then.)
 //
-// FLUSH markers:
-//   FLUSH-A1 : about to enter SV_AddTestClient
-//   FLUSH-A2 : SV_AddTestClient RETURNED  (not expected to print this build)
+// CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We do the
+// same thing — call it directly, capture the returned entity, push it onto
+// the GSC stack. The optional name argument is stashed and stamped onto
+// the new client's userinfo by our SV_UserinfoChanged_Hook.
 
 static void GScr_AddTestClient()
 {
+    char name[32] = "Bot";
+
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) == 1)
     {
         const char *string = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
 
-        char name[32];
-        int  i = 0, j = 0;
+        int i = 0, j = 0;
         if (string)
         {
             for (; string[i] && j < static_cast<int>(sizeof(name)) - 1; ++i)
@@ -486,23 +410,17 @@ static void GScr_AddTestClient()
         if (j < 1)
             Scr_Error_BW("AddTestClient(): name must be at least 1 character long",
                          SCRIPTINSTANCE_SERVER);
-
-        std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
-        s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
     }
 
-    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n",
-             s_pendingBotName[0] ? s_pendingBotName : "(default)");
+    DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
 
-    BW_SystemReport();
-
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A1 entering SV_AddTestClient "
-             "(r332 — NO patch, freeze here is expected)\n");
+    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
+    // the slot's userinfo during the engine's first userinfo-changed call
+    // for the new bot.
+    std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
+    s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
 
     gentity_s *ent = SV_AddTestClient();
-
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A2 SV_AddTestClient RETURNED (ent=0x%08X)\n",
-             reinterpret_cast<unsigned int>(ent));
 
     s_pendingBotName[0] = '\0';
 
@@ -513,7 +431,7 @@ static void GScr_AddTestClient()
     }
     else
     {
-        DbgPrint("sv_bots: [ADDTESTCLIENT] SV_AddTestClient returned NULL\n");
+        DbgPrint("sv_bots: [ADDTESTCLIENT] vanilla SV_AddTestClient returned NULL\n");
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
@@ -578,7 +496,7 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// Exported lookup tables
+// Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
 
 static struct
@@ -586,7 +504,6 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r332: addtestclient IS in the table so GScr_AddTestClient runs.
     {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
@@ -631,40 +548,112 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 }
 
 // ---------------------------------------------------------------------------
+// r333 — TU7 address dump (DUMP4)
+//
+// Resolves the last 4 unresolved TU7 symbols by dumping raw .text memory:
+//   SV_IsTestClient          window  0x8221A000 .. 0x82221000
+//   Scr_Add* / Scr_Get* run  window  0x82345000 .. 0x8234C000
+//
+// These run inside the live TU7 process — Xenia has already decrypted the
+// base image and applied default_mp.xexp by the time module ctors fire, so
+// the bytes read here are the real, final TU7 instruction stream. The
+// region is pure executable .text (vaddr base 0x820D0000+), so reads cannot
+// fault. No detour and no patch is installed; this is read-only.
+//
+// Output line format (8 words per line, address-prefixed):
+//   sv_bots: DUMP4 <addr>: w0 w1 w2 w3 w4 w5 w6 w7
+//
+// To match: take each base-image function prologue, mask off branch
+// displacements AND D-form immediates (lis/addi/ori — TU7 rewrites
+// data-address immediates), and search this dump. base->TU7 delta is
+// piecewise-linear, so each family must be matched independently.
+// ---------------------------------------------------------------------------
+
+static void BW_DumpRegion(unsigned int start, unsigned int end, const char *tag)
+{
+    DbgPrint("sv_bots: DUMP4 BEGIN %s [%08X .. %08X]\n", tag, start, end);
+
+    for (unsigned int addr = start; addr < end; addr += 0x20)
+    {
+        const volatile unsigned int *p =
+            reinterpret_cast<const volatile unsigned int *>(addr);
+
+        DbgPrint("sv_bots: DUMP4 %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                 addr,
+                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+    }
+
+    DbgPrint("sv_bots: DUMP4 END %s\n", tag);
+}
+
+static void BW_DumpRegions()
+{
+    DbgPrint("sv_bots: DUMP4 ==== r333 TU7 address dump start ====\n");
+    BW_DumpRegion(0x8221A000, 0x82221000, "SV_ISTESTCLIENT");
+    BW_DumpRegion(0x82345000, 0x8234C000, "SCR_FAMILY");
+    DbgPrint("sv_bots: DUMP4 ==== r333 TU7 address dump end ====\n");
+}
+
+// ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// r332: ZERO detours installed (r327 proved the Detour mechanism breaks
-// pregame). NO scan-patch (r328 proved 0x8228203C is wrong on TU7). The ONLY
-// new behaviour is BW_DumpRegions() — it prints 10 predicted TU7 windows
-// for offline signature-matching.
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r332 — TU7 byte-dump diagnostic)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
+             CODXE_DIAG_ENABLE_WEAPON_HOOK,
+             CODXE_DIAG_ENABLE_USERINFO_HOOK,
+             CODXE_DIAG_ENABLE_BOTUSERMOVE);
+
+#if CODXE_DIAG_DUMP4
+    BW_DumpRegions();
+#endif
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
-    s_botAddInProgress  = 0;
 
-    // ----- the whole point of r332 -----
-    BW_DumpRegions();
+#if CODXE_DIAG_ENABLE_WEAPON_HOOK
+    G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
+    G_SelectWeaponIndex_Detour.Install();
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: G_SelectWeaponIndex detour SKIPPED (diagnostic)\n");
+#endif
 
-    // Detours constructed but deliberately NOT installed.
-    NET_CompareBaseAdr_impl_Detour =
-        Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
-    G_SelectWeaponIndex_Detour =
-        Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-    SV_BotUserMove_Detour =
-        Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    SV_UserinfoChanged_Detour =
-        Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
+#if CODXE_DIAG_ENABLE_BOTUSERMOVE
+    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
+    SV_BotUserMove_Detour.Install();
+    DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
+#endif
 
-    DbgPrint("sv_bots: r332 — module loaded, NO detours, NO patch, dump only\n");
+#if CODXE_DIAG_ENABLE_USERINFO_HOOK
+    SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
+    SV_UserinfoChanged_Detour.Install();
+    DbgPrint("sv_bots: SV_UserinfoChanged detour INSTALLED\n");
+#else
+    DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
+#endif
+
+    // SV_CalcPings deliberately NOT detoured — see file header.
 }
 
 sv_bots::~sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module shutdown\n");
+    DbgPrint("sv_bots: removing T4 BW detours\n");
+
+#if CODXE_DIAG_ENABLE_WEAPON_HOOK
+    G_SelectWeaponIndex_Detour.Remove();
+#endif
+#if CODXE_DIAG_ENABLE_BOTUSERMOVE
+    SV_BotUserMove_Detour.Remove();
+#endif
+#if CODXE_DIAG_ENABLE_USERINFO_HOOK
+    SV_UserinfoChanged_Detour.Remove();
+#endif
+
     CleanBotArray();
 }
 
