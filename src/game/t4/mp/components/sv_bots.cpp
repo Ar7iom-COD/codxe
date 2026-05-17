@@ -2,68 +2,46 @@
 // Bot Warfare T4 port — engine module.
 //
 // ===========================================================================
-// r328 — SV_AddTestClient slot-0 skip patch (no detours)
+// r330 — TU7 re-derivation build: dump SV_AddTestClient bytes to the log
 // ===========================================================================
 //
-// THE BUG (confirmed from Ghidra decompile + disassembly of SV_AddTestClient
-// @ 0x82281F08):
-//   After SV_DirectConnect creates the bot's client slot, SV_AddTestClient
-//   runs a scan loop (0x82282038–0x8228207C) that walks every client slot
-//   calling NET_CompareBaseAdr(botAddr, slotAddr) to find which slot the bot
-//   landed in. The FIRST slot whose address "equals" the bot's is taken as
-//   the bot — marked isTestClient, sent gamestate, entered into the world.
+// WHY THIS BUILD EXISTS
+//   r328's one-instruction scan-patch @0x8228203C failed: the running TU7
+//   image reported `scan-patch SKIPPED — unexpected instruction 0x480416ED`.
+//   0x480416ED decodes to `bl 0x822C3728` — a CALL, not the expected
+//   `cmpwi cr6,r10,0`. Investigation found the Ghidra project was built from
+//   the BASE disc default_mp.xex (module version 0.0.0.8), NOT the TU7-patched
+//   image (0.0.7.8) that Xenia actually executes. Every Ghidra-derived address
+//   in the handoff doc is therefore suspect.
 //
-//   On Xenia (XLive-offline) the bot's netadr is all-zero (memset, port 0)
-//   AND the host at slot 0 also has a degenerate, port-0 netadr. For two
-//   degenerate addresses NET_CompareBaseAdr returns "equal". So the scan
-//   matches slot 0 (the HOST) on iteration 0, then runs SV_SendClientGameState
-//   + SV_ClientEnterWorld against the already-in-world host -> freeze.
-//   ("Larry" appears because SV_DirectConnect DID create the bot slot first;
-//   then the scan misidentifies the host and corrupts it.)
-//
-// THE FIX (r328):
-//   The scan loop must skip slot 0 (the host). Slot 0 is always the host on
-//   an offline/listen server; a bot is never slot 0. We patch ONE instruction
-//   inside the loop:
-//
-//     0x8228203C  original: cmpwi cr6, r10, 0   (2F 0A 00 00)
-//                           -- tests the slot's connectState
-//     0x8228203C  patched:  cmpwi cr6, r30, 0   (2F 1E 00 00)
-//                           -- tests r30, the loop counter, instead
-//
-//   The existing 'beq cr6, LAB_8228206C' immediately below then skips the
-//   iteration whenever the counter is 0 — i.e. iteration 0 (the host) is
-//   always skipped; iterations 1+ run normally. The degenerate-netadr
-//   false-match against the host can no longer occur.
-//
-//   This is codxe's own proven raw-instruction-patch pattern (see
-//   iw4/mp/components/patches.cpp): *(volatile uint32_t*)ADDR = INSTRUCTION.
-//   No detour, no trampoline, no Install(). 0x8228203C is reached ONLY by
-//   SV_AddTestClient's scan — pregame never executes it, so the r317/r327
-//   pregame-freeze failure mode is structurally impossible here.
+//   This build does NOT attempt any patch. It dumps the raw bytes of the
+//   SV_AddTestClient region straight from the running (TU7-patched) process
+//   to the log. That dump IS the real executing code — no binary-mismatch
+//   risk possible. The bytes get disassembled offline to locate the real
+//   scan loop, the real patch site, and the real register numbers.
 //
 // HISTORY
 //   r314  deleted Path C; called the real engine SV_AddTestClient() directly.
-//   r316  proved that call hangs on T4 Xenia.
-//   r317  added NET_CompareBaseAdr detour; froze in PREGAME ("Awaiting
-//         challenge") — installed all 4 detours at once.
-//   r318  gutted hook bodies — still froze in pregame (detour mechanism).
-//   r319  all detours off — pregame fine, spawn froze (guard disarmed).
-//   r322/r326  zero detours — pregame fine, spawn froze (no guard).
-//   r327  installed ONLY NET_CompareBaseAdr_impl detour — froze in pregame,
-//         proving the detour INSTALLATION on that function breaks pregame.
-//   r328  abandons detours entirely. Direct one-instruction patch to
-//         SV_AddTestClient's scan loop. addtestclient back in the dispatch
-//         table so spawn routes through GScr_AddTestClient (FLUSH markers).
+//   r316  proved that call hangs on T4 Xenia: FLUSH-A prints, FLUSH-B never.
+//   r317  installed all four detours -> froze in pregame.
+//   r318  gutted hook bodies -> still froze -> hook bodies cleared.
+//   r319  zero detours installed -> pregame fine, spawn still froze.
+//   r327  installed ONLY NET_CompareBaseAdr_impl -> still froze pregame ->
+//         detour mechanism itself breaks pregame. Detour route abandoned.
+//   r328  one-instruction raw scan-patch @0x8228203C -> SKIPPED (wrong binary).
+//   r330  THIS BUILD — no patch, no detours; dumps SV_AddTestClient bytes.
 //
-// Verified engine addresses (TU7 default_mp.xex):
-//   SV_AddTestClient        0x82281F08   (returns gentity_s*, no args)
-//   SV_AddTestClient scan   0x82282038–0x8228207C
-//   patch site              0x8228203C   (cmpwi in the scan loop)
-//   SV_UserinfoChanged      0x82280690
-//   SV_BotUserMove          0x82286D68
-//   SV_ClientThink          0x82280F38
-//   G_SelectWeaponIndex     0x8225D6D8
+// Engine addresses below are from the OLD (base 0.0.0.8) Ghidra project and
+// are NOT trusted. SV_AddTestClient's ENTRY (0x82281F08) is trusted only
+// because FLUSH-A1 demonstrably prints from inside it on TU7.
+//
+//   SV_AddTestClient        0x82281F08   (entry — trusted: FLUSH-A1 prints)
+//   NET_CompareBaseAdr      0x82278BD0   (SUSPECT — base-image address)
+//   NET_CompareBaseAdr_impl 0x82278B20   (SUSPECT — base-image address)
+//   SV_UserinfoChanged      0x82280690   (SUSPECT)
+//   SV_BotUserMove          0x82286D68   (SUSPECT)
+//   SV_ClientThink          0x82280F38   (SUSPECT)
+//   G_SelectWeaponIndex     0x8225D6D8   (SUSPECT)
 //
 
 #include "pch.h"
@@ -82,40 +60,32 @@ namespace mp
 using namespace t4::mp::bw;
 
 // ---------------------------------------------------------------------------
-// r328 — SV_AddTestClient scan-loop patch
+// r330 diagnostic: dump the SV_AddTestClient region from the live TU7 process
 // ---------------------------------------------------------------------------
-// Patch site and instruction words. See file header for full rationale.
+// SV_AddTestClient entry is 0x82281F08. We dump from a little before the entry
+// through entry + 0x380 (896 bytes / 224 instructions) so the scan loop is
+// captured with margin on both sides. Pure reads of executable memory — no
+// detour, no patch, cannot perturb anything.
 
-static const unsigned int BW_SCANPATCH_ADDR    = 0x8228203C;
-static const unsigned int BW_SCANPATCH_ORIG    = 0x2F0A0000;  // cmpwi cr6,r10,0
-static const unsigned int BW_SCANPATCH_NEW     = 0x2F1E0000;  // cmpwi cr6,r30,0
+#define BW_DUMP_BASE   0x82281F08u   // SV_AddTestClient entry
+#define BW_DUMP_LEN    0x380u        // bytes to dump (224 instructions)
 
-static void BW_ApplyScanPatch()
+static void BW_DumpAddTestClientRegion()
 {
-    volatile unsigned int *site =
-        reinterpret_cast<volatile unsigned int *>(BW_SCANPATCH_ADDR);
+    DbgPrint("sv_bots: DUMP begin SV_AddTestClient region "
+             "(base=0x%08X len=0x%X)\n", BW_DUMP_BASE, BW_DUMP_LEN);
 
-    const unsigned int before = *site;
+    const volatile unsigned int *p =
+        reinterpret_cast<const volatile unsigned int *>(BW_DUMP_BASE);
 
-    // Only patch if the site still holds the expected original instruction.
-    // Guards against patching twice or against an unexpected binary.
-    if (before == BW_SCANPATCH_ORIG)
+    for (unsigned int off = 0; off < BW_DUMP_LEN; off += 4)
     {
-        *site = BW_SCANPATCH_NEW;
-        DbgPrint("sv_bots: r328 — scan-patch APPLIED @0x%08X (0x%08X -> 0x%08X)\n",
-                 BW_SCANPATCH_ADDR, before, BW_SCANPATCH_NEW);
+        const unsigned int addr = BW_DUMP_BASE + off;
+        const unsigned int word = p[off / 4u];
+        DbgPrint("sv_bots: DUMP %08X: %08X\n", addr, word);
     }
-    else if (before == BW_SCANPATCH_NEW)
-    {
-        DbgPrint("sv_bots: r328 — scan-patch ALREADY APPLIED @0x%08X\n",
-                 BW_SCANPATCH_ADDR);
-    }
-    else
-    {
-        DbgPrint("sv_bots: r328 — scan-patch SKIPPED @0x%08X — unexpected "
-                 "instruction 0x%08X (expected 0x%08X)\n",
-                 BW_SCANPATCH_ADDR, before, BW_SCANPATCH_ORIG);
-    }
+
+    DbgPrint("sv_bots: DUMP end SV_AddTestClient region\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +188,7 @@ static void BW_DumpClientSlot(const char *cl, int slot)
 
 static void BW_SystemReport()
 {
-    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r328) =====\n");
+    DbgPrint("sv_bots: ===== BW SYSTEM REPORT (r330) =====\n");
 
     const unsigned int hdrAddr  = BW_ADDR_SVSHEADER;
     const unsigned int clientsP = *reinterpret_cast<const unsigned int *>(hdrAddr + 0x0);
@@ -248,10 +218,35 @@ static void BW_SystemReport()
 }
 
 // ===========================================================================
-// SV_BotUserMove detour — the AI input driver
+// Detours — r330: ALL constructed but NONE installed.
 // ===========================================================================
-// r328: detour constructed but NOT installed. r328 tests only spawn; the AI
-// input driver is re-enabled in a later build once spawn is confirmed.
+// r327 proved the Detour MECHANISM breaks pregame. r330 installs zero detours.
+// The hook/stub bodies are kept compilable for future use only.
+
+static Detour       NET_CompareBaseAdr_impl_Detour;
+static volatile int s_botAddInProgress = 0;
+
+static long long NET_CompareBaseAdr_impl_Hook(unsigned int *a,
+                                              unsigned int *b,
+                                              unsigned __int64 p3,
+                                              unsigned __int64 p4,
+                                              unsigned __int64 p5,
+                                              unsigned __int64 p6,
+                                              unsigned __int64 p7)
+{
+    if (s_botAddInProgress && a != nullptr && b != nullptr)
+    {
+        const unsigned int ta = *a;
+        const unsigned int tb = *b;
+        const bool aDegenerate = (ta == 0u || ta == 2u);
+        const bool bDegenerate = (tb == 0u || tb == 2u);
+        if (aDegenerate && bDegenerate)
+            return 1;
+    }
+
+    return NET_CompareBaseAdr_impl_Detour
+        .GetOriginal<NET_CompareBaseAdr_impl_t>()(a, b, p3, p4, p5, p6, p7);
+}
 
 static Detour SV_BotUserMove_Detour;
 
@@ -332,22 +327,12 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     SV_ClientThink_BW(cl, &cmd);
 }
 
-// ===========================================================================
-// G_SelectWeaponIndex detour — track per-client weapon
-// ===========================================================================
-// r328: detour constructed but NOT installed. Body is pure pass-through.
-
 static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
-
-// ===========================================================================
-// SV_UserinfoChanged detour — custom bot names
-// ===========================================================================
-// r328: detour constructed but NOT installed. Body is pure pass-through.
 
 static char   s_pendingBotName[32] = {0};
 static Detour SV_UserinfoChanged_Detour;
@@ -448,15 +433,16 @@ static void Scr_BotMirror(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
 // ---------------------------------------------------------------------------
-// r328: addtestclient IS in the dispatch table — codjumper's addtestclient()
-// routes here. GScr_AddTestClient calls the real engine SV_AddTestClient(),
-// which now has the slot-0-skip patch applied, so the host can no longer be
-// false-matched.
+// r330: addtestclient IS in the dispatch table so GScr_AddTestClient runs.
+// NO scan-patch is applied this build, so pressing D-Pad Up WILL still freeze
+// inside SV_AddTestClient — that is expected and acceptable. The point of r330
+// is the DUMP printed at init; the spawn test is not required for r330's goal.
+// (You can still press D-Pad Up if you want to re-confirm FLUSH-A1, but the
+// dump is already in the log by then.)
 //
 // FLUSH markers:
 //   FLUSH-A1 : about to enter SV_AddTestClient
-//   FLUSH-A2 : SV_AddTestClient RETURNED (r316/r319/r326 never hit this)
-//   FLUSH-B  : done
+//   FLUSH-A2 : SV_AddTestClient RETURNED  (not expected to print this build)
 
 static void GScr_AddTestClient()
 {
@@ -490,14 +476,12 @@ static void GScr_AddTestClient()
     BW_SystemReport();
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A1 entering SV_AddTestClient "
-             "(r328 — slot-0-skip patch active)\n");
+             "(r330 — NO patch, freeze here is expected)\n");
 
     gentity_s *ent = SV_AddTestClient();
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-A2 SV_AddTestClient RETURNED (ent=0x%08X)\n",
              reinterpret_cast<unsigned int>(ent));
-
-    DbgPrint("sv_bots: [ADDTESTCLIENT] FLUSH-B done\n");
 
     s_pendingBotName[0] = '\0';
 
@@ -575,14 +559,13 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // Exported lookup tables
 // ---------------------------------------------------------------------------
-// r328: addtestclient IS in the table — routes to GScr_AddTestClient, which
-// calls the real engine SV_AddTestClient() (now slot-0-skip patched).
 
 static struct
 {
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
+    // r330: addtestclient IS in the table so GScr_AddTestClient runs.
     {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
@@ -629,49 +612,38 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 // ---------------------------------------------------------------------------
 // Module lifecycle
 // ---------------------------------------------------------------------------
-// r328: NO detours installed. The only engine modification is the one-
-// instruction scan-loop patch applied by BW_ApplyScanPatch(). The three
-// detour objects are still constructed (for later builds) but never installed.
+// r330: ZERO detours installed (r327 proved the Detour mechanism breaks
+// pregame). NO scan-patch (r328 proved 0x8228203C is wrong on TU7). The ONLY
+// new behaviour is BW_DumpAddTestClientRegion() — it prints the real TU7
+// bytes of SV_AddTestClient to the log for offline disassembly.
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: T4 BW module init (r328 — SV_AddTestClient slot-0 skip patch)\n");
+    DbgPrint("sv_bots: T4 BW module init (r330 — TU7 byte-dump diagnostic)\n");
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
+    s_botAddInProgress  = 0;
 
-    // The fix: one-instruction patch to SV_AddTestClient's scan loop so it
-    // skips slot 0 (the host) and cannot false-match it as the bot.
-    BW_ApplyScanPatch();
+    // ----- the whole point of r330 -----
+    BW_DumpAddTestClientRegion();
 
-    G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
-    // G_SelectWeaponIndex_Detour.Install();    // r328: NOT installed
-    DbgPrint("sv_bots: G_SelectWeaponIndex detour NOT installed (r328)\n");
+    // Detours constructed but deliberately NOT installed.
+    NET_CompareBaseAdr_impl_Detour =
+        Detour(NET_CompareBaseAdr_impl, NET_CompareBaseAdr_impl_Hook);
+    G_SelectWeaponIndex_Detour =
+        Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
+    SV_BotUserMove_Detour =
+        Detour(SV_BotUserMove, SV_BotUserMove_Stub);
+    SV_UserinfoChanged_Detour =
+        Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
 
-    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    // SV_BotUserMove_Detour.Install();         // r328: NOT installed
-    DbgPrint("sv_bots: SV_BotUserMove detour NOT installed (r328)\n");
-
-    SV_UserinfoChanged_Detour = Detour(SV_UserinfoChanged, SV_UserinfoChanged_Hook);
-    // SV_UserinfoChanged_Detour.Install();     // r328: NOT installed
-    DbgPrint("sv_bots: SV_UserinfoChanged detour NOT installed (r328)\n");
-
-    DbgPrint("sv_bots: r328 — module loaded, NO detours, scan-patch only\n");
+    DbgPrint("sv_bots: r330 — module loaded, NO detours, NO patch, dump only\n");
 }
 
 sv_bots::~sv_bots()
 {
     DbgPrint("sv_bots: T4 BW module shutdown\n");
-
-    // Detours were never installed; Remove() on an uninstalled Detour is safe.
-    G_SelectWeaponIndex_Detour.Remove();
-    SV_BotUserMove_Detour.Remove();
-    SV_UserinfoChanged_Detour.Remove();
-
-    // NOTE: the scan-patch is intentionally NOT reverted. codxe's own
-    // patch convention (iw4/mp/components/patches.cpp) leaves patches in
-    // place; the xex is reloaded fresh each run.
-
     CleanBotArray();
 }
 
