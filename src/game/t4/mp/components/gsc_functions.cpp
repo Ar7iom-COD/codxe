@@ -63,7 +63,15 @@ BuiltinFunction Scr_GetFunction_Hook(const char **pName, int *type)
         // BW dispatch — checked after gsc_functions own table, before
         // falling through to the engine. Returns nullptr if not a BW name.
         if (BuiltinFunction bw = BW_LookupFunction(*pName))
+        {
+            DbgPrint("sv_bots: [HOOK] '%s' -> BW port handler\n", *pName);
             return bw;
+        }
+
+        // r321: log only the addtestclient lookup so the fall-through to the
+        // native engine builtin is provable, without spamming every lookup.
+        if (_stricmp(*pName, "addtestclient") == 0)
+            DbgPrint("sv_bots: [HOOK] 'addtestclient' -> fall through to engine\n");
     }
     return Scr_GetFunction_Detour.GetOriginal<decltype(&Scr_GetFunction_Hook)>()(pName, type);
 }
