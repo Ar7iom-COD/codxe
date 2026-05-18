@@ -56,6 +56,13 @@
 // argument, so it complains. /WX promotes this to an error.
 #pragma warning(disable: 4505)
 
+// Engine console sink @ 0x82271AE8. Receives a pre-formatted string in
+// r4 (no varargs). Every console line — including the GSC compiler's
+// "unknown function" error — flows through here. Detoured below to
+// mirror all output into xenia.log.
+static void* const CODXE_CON_SINK_ADDR = reinterpret_cast<void*>(0x82271AE8);
+typedef void (*Con_Sink_t)(int, const char*, int);
+
 namespace t4
 {
 namespace mp
@@ -276,6 +283,35 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
     }
 
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
+}
+
+// ---------------------------------------------------------------------------
+// Con_Sink detour — mirror ALL engine console output into xenia.log.
+//
+// Diagnostic. The GSC compiler writes "unknown function" / "bad syntax" to
+// the engine console; Xbox 360 has no console, so this copies every line
+// into DbgPrint. Leave enabled until the GSC layer compiles clean.
+// ---------------------------------------------------------------------------
+
+static Detour Con_Sink_Detour;
+
+static void Con_Sink_Hook(int arg0, const char* text, int arg2)
+{
+    if (text && text[0])
+    {
+        char buf[1024];
+        size_t n = 0;
+        for (; text[n] && n < sizeof(buf) - 1; ++n)
+            buf[n] = text[n];
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+            --n;
+        buf[n] = '\0';
+
+        if (n > 0)
+            DbgPrint("sv_bots: [CON] %s\n", buf);
+    }
+
+    Con_Sink_Detour.GetOriginal<Con_Sink_t>()(arg0, text, arg2);
 }
 
 // ===========================================================================
@@ -581,6 +617,10 @@ sv_bots::sv_bots()
     DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
 #endif
 
+    Con_Sink_Detour = Detour(CODXE_CON_SINK_ADDR, Con_Sink_Hook);
+    Con_Sink_Detour.Install();
+    DbgPrint("sv_bots: Con_Sink console-mirror detour INSTALLED @ 0x82271AE8\n");
+
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
 
@@ -597,6 +637,8 @@ sv_bots::~sv_bots()
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
 #endif
+
+    Con_Sink_Detour.Remove();
 
     CleanBotArray();
 }
