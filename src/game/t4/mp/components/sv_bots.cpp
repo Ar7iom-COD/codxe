@@ -33,17 +33,42 @@
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
 //
-// r339 — detour-free build:
+// r341 — addtestclient interception A/B (engine-builtin fall-through):
 //
-//   All three BW server-path detours (SV_BotUserMove, SV_UserinfoChanged,
-//   G_SelectWeaponIndex) are compiled OUT via the CODXE_DIAG_* toggles below
-//   (all 0). The sv_bots module installs ZERO detours. codxe-core's own
-//   Scr_GetFunction / Player_GetMethod lookup detours are unaffected and
-//   continue to route istestclient -> PlayerCmd_IsTestClient (Fix B).
+//   ISOLATION EXPERIMENT. Two r339-bw logs proved the class-select stall is
+//   NOT any BW server-path detour: both runs had weapon=0 userinfo=0
+//   botmove=0 (zero detours installed) and bw v11 bots still stuck at class.
+//   The detours are exonerated for class-select.
 //
-//   This build exists to compile bot_warfare (which calls istestclient from
-//   bots_adapter_pt4.gsc) and to let GSC-side Fix A + Fix B kill the bot
-//   spectator bug. Driving bots (SV_BotUserMove) is a later milestone.
+//   The ONLY remaining behavioural difference between r339-bw and stock
+//   r261 (which has no sv_bots.cpp and on which bw v11 bots DO pick a class
+//   and spawn) is the addtestclient GSC route:
+//     r261     addtestclient() -> engine native GSC builtin (full connect
+//              sequence: SV_AddTestClient + whatever the builtin does after)
+//     r339-bw  addtestclient() -> BW GScr_AddTestClient (bare SV_AddTestClient
+//              only; does NOT replicate the post-spawn builtin work)
+//
+//   r341 comments the addtestclient entry out of sv_bots_functions[], so
+//   codxe-core's Scr_GetFunction_Hook falls through to the engine builtin —
+//   i.e. exactly the r261 code path on the patched binary.
+//
+//   DECISIVE OUTCOMES:
+//     bots pick class + spawn  -> GScr_AddTestClient IS the regression.
+//                                 r342 reworks it to delegate to / replicate
+//                                 the engine builtin.
+//     bots still stuck         -> the regression is in a codxe-CORE change
+//                                 between r261 and HEAD, not sv_bots.cpp.
+//                                 Bisect core next.
+//
+//   All three BW server-path detours remain compiled OUT (toggles all 0).
+//   kick() interception is kept (bw v11 calls kick(); harmless, not on the
+//   class path). The BW player methods are kept (bw v11 only calls
+//   getentitynumber/getguid from them, both return entref.entnum-equivalent
+//   values identical to the engine).
+//
+//   BANNER: prints an unambiguous r341 tag + the live addtestclient route.
+//   If xenia.log does NOT show "r341" in the [DIAG] line, the installed
+//   codxe.xex is stale — the run is void, re-deploy before debugging.
 //
 // r293 — vanilla bot spawn:
 //
@@ -557,7 +582,13 @@ static struct
     // to the engine builtin). If they still sit in spectator, the team-join
     // was in r261-era mod GSC and the current mod's GSC is the regression.
     //
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},  // r339-bw: BW intercept
+    // r341 A/B: addtestclient interception DISABLED. With this line
+    // commented out, codxe-core's Scr_GetFunction_Hook finds no BW match
+    // and falls through to the engine's native addtestclient GSC builtin —
+    // exactly the stock r261 path. GScr_AddTestClient is still compiled
+    // but no longer referenced; the file-scope #pragma warning(disable:4505)
+    // at the top of this file suppresses the resulting C4505 under /WX.
+    // { "addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient) },
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -667,8 +698,8 @@ static void BW_DumpRegions()
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: r339 detour-free build (BW server-path detours compiled out)\n");
-    DbgPrint("sv_bots: [DIAG] r339-bw | weapon=%d userinfo=%d botmove=%d | addtestclient=BW-INTERCEPT\n",
+    DbgPrint("sv_bots: r341 addtestclient A/B build (engine-builtin fall-through)\n");
+    DbgPrint("sv_bots: [DIAG] r341 | weapon=%d userinfo=%d botmove=%d | addtestclient=ENGINE-BUILTIN\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
