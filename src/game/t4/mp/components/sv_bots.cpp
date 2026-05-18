@@ -33,43 +33,6 @@
 //     int entnum) → &g_entities[entnum]. IW3's Scr_GetEntity returned a
 //     gentity_s* directly; T4 does not have an equivalent.
 //
-// r341 — addtestclient interception A/B (engine-builtin fall-through):
-//
-//   ISOLATION EXPERIMENT. Two r339-bw logs proved the class-select stall is
-//   NOT any BW server-path detour: both runs had weapon=0 userinfo=0
-//   botmove=0 (zero detours installed) and bw v11 bots still stuck at class.
-//   The detours are exonerated for class-select.
-//
-//   The ONLY remaining behavioural difference between r339-bw and stock
-//   r261 (which has no sv_bots.cpp and on which bw v11 bots DO pick a class
-//   and spawn) is the addtestclient GSC route:
-//     r261     addtestclient() -> engine native GSC builtin (full connect
-//              sequence: SV_AddTestClient + whatever the builtin does after)
-//     r339-bw  addtestclient() -> BW GScr_AddTestClient (bare SV_AddTestClient
-//              only; does NOT replicate the post-spawn builtin work)
-//
-//   r341 comments the addtestclient entry out of sv_bots_functions[], so
-//   codxe-core's Scr_GetFunction_Hook falls through to the engine builtin —
-//   i.e. exactly the r261 code path on the patched binary.
-//
-//   DECISIVE OUTCOMES:
-//     bots pick class + spawn  -> GScr_AddTestClient IS the regression.
-//                                 r342 reworks it to delegate to / replicate
-//                                 the engine builtin.
-//     bots still stuck         -> the regression is in a codxe-CORE change
-//                                 between r261 and HEAD, not sv_bots.cpp.
-//                                 Bisect core next.
-//
-//   All three BW server-path detours remain compiled OUT (toggles all 0).
-//   kick() interception is kept (bw v11 calls kick(); harmless, not on the
-//   class path). The BW player methods are kept (bw v11 only calls
-//   getentitynumber/getguid from them, both return entref.entnum-equivalent
-//   values identical to the engine).
-//
-//   BANNER: prints an unambiguous r341 tag + the live addtestclient route.
-//   If xenia.log does NOT show "r341" in the [DIAG] line, the installed
-//   codxe.xex is stale — the run is void, re-deploy before debugging.
-//
 // r293 — vanilla bot spawn:
 //
 //   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
@@ -319,14 +282,8 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 // r293 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r339: detour-free
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r339: detour-free
-
-// r334 — TU7 address dump. Reads raw .text words to xenia.log so the last
-// 4 BW symbols can be signature-matched offline. Pure reads, no detour,
-// no patch — runs once at module init, before any bot is spawned.
-// r338: addresses are finalised in symbols_bw_ext.h — dump disabled.
-#define CODXE_DIAG_DUMP4                      0
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r344: detours OFF — isolate detour mechanism
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -532,32 +489,6 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
-// <player> istestclient()  ->  returns 1 if the client is an engine test
-// client (bot), else 0.
-//
-// Fix B: BW's GSC do_isbot() previously read self.pers["isBot"], a GSC-set
-// field the engine clears when it rebuilds pers during the connect cycle.
-// That made the is_bot() gate in _bot.gsc::connected() reject the bot, so
-// teamWatch() never started and the bot sat in spectator. This method asks
-// the engine directly via SV_IsTestClient (TU7 0x8221F6D0) — engine truth,
-// immune to pers timing. The adapter's do_isbot() should call this.
-static void PlayerCmd_IsTestClient(scr_entref_t entref)
-{
-    if (entref.classnum != 0)
-        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
-        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
-
-    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
-    {
-        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-        return;
-    }
-
-    const int result = SV_IsTestClient(static_cast<int>(entref.entnum));
-    Scr_AddInt_BW(result != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
-}
-
 // ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
@@ -567,28 +498,7 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r338 A/B TEST — addtestclient interception DISABLED.
-    //
-    // On r261 (no sv_bots.cpp) addtestclient() reached the engine's own GSC
-    // builtin and the bot JOINED A TEAM (named "Larry N" by the engine).
-    // With BW's GScr_AddTestClient intercepting, the bot is named "BOT1/2"
-    // by mod GSC and sits inert in spectator. GScr_AddTestClient only calls
-    // the bare SV_AddTestClient() — the engine builtin evidently does more
-    // (the connect/team sequence) after that call.
-    //
-    // Commenting this line out makes codxe's Scr_GetFunction_Hook fall
-    // through to the engine builtin — i.e. exactly the r261 code path.
-    // If bots now join a team, the fix belongs here (replicate or delegate
-    // to the engine builtin). If they still sit in spectator, the team-join
-    // was in r261-era mod GSC and the current mod's GSC is the regression.
-    //
-    // r341 A/B: addtestclient interception DISABLED. With this line
-    // commented out, codxe-core's Scr_GetFunction_Hook finds no BW match
-    // and falls through to the engine's native addtestclient GSC builtin —
-    // exactly the stock r261 path. GScr_AddTestClient is still compiled
-    // but no longer referenced; the file-scope #pragma warning(disable:4505)
-    // at the top of this file suppresses the resulting C4505 under /WX.
-    // { "addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient) },
+    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -604,27 +514,11 @@ static struct
     {"botstop",           Scr_BotStop},
     {"getentitynumber",   PlayerCmd_GetEntityNumber},
     {"getguid",           PlayerCmd_GetGuid},
-    {"istestclient",      PlayerCmd_IsTestClient},
     {nullptr, nullptr},
 };
 
 extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 {
-    // r343: inert EXCEPT kick. r342 proved (screenshot: "Server script
-    // compile error / unknown function") that kick MUST be a live BW
-    // builtin — bw v11's GSC calls kick() as a bare function and the stock
-    // T4 engine exposes no kick GSC builtin. The r342 build kept kick in
-    // sv_bots_functions[] but BW_LookupFunction never iterated it, so the
-    // lookup returned nullptr and the engine aborted compilation.
-    //
-    // r343 iterates the table again. The table contains exactly one live
-    // entry — { "kick", GScr_Kick } — because the addtestclient row is
-    // commented out (it falls through to the engine builtin, the proven
-    // r341 path). So this resolves kick and nothing else. BW_LookupMethod
-    // stays fully inert. Net effect vs r261: kick is BW-provided (it always
-    // was; r261 had no sv_bots.cpp but the engine also had no kick — the
-    // mod's kick path is BW's to supply). addtestclient + all methods are
-    // engine-routed, exactly r261.
     if (!name)
         return nullptr;
     for (const auto *f = sv_bots_functions; f->name != nullptr; ++f)
@@ -637,73 +531,14 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 
 extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 {
-    // r342 INERT: BW registers NO player methods. Every method lookup misses
-    // and falls through to the engine. bw v11 only calls getentitynumber /
-    // getguid / kick from the BW surface on the connect path; with this
-    // inert, all of those resolve to the engine, exactly as on r261.
-    (void)name;
-    (void)sv_bots_methods;
-    return nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// r334 — TU7 address dump (DUMP4)
-//
-// Resolves the last 4 unresolved TU7 symbols by dumping raw .text memory:
-//   SV_IsTestClient          window  0x8221A000 .. 0x82223000
-//   Scr_Add* / Scr_Get* run  window  0x82345000 .. 0x8234C000
-//
-// These run inside the live TU7 process — Xenia has already decrypted the
-// base image and applied default_mp.xexp by the time module ctors fire, so
-// the bytes read here are the real, final TU7 instruction stream. The
-// region is pure executable .text (vaddr base 0x820D0000+), so reads cannot
-// fault. No detour and no patch is installed; this is read-only.
-//
-// Output line format (6 words per line, address-prefixed, stride 0x18):
-//   sv_bots: DUMP4 <addr>: w0 w1 w2 w3 w4 w5
-//
-// r333 used 8 words/line and stride 0x20. T4's DbgPrint is fixed-arity and
-// only reads the PowerPC register window (r3..r10 = 8 args); words 6 and 7
-// were arg 9/10, spilled to stack, and printed as stale garbage. r334 uses
-// 6 words (7 args incl. addr) so every word is a real in-register read, and
-// stride 0x18 makes the dump fully contiguous with no 8-byte gap per row.
-//
-// NOTE: base->TU7 function ordering is NOT preserved (proven from the r333
-// Scr_Add* family — TU7 reverses AddInt/AddUndefined vs base). Match each
-// function by full-body signature, never by relative position.
-// ---------------------------------------------------------------------------
-
-static void BW_DumpRegion(unsigned int start, unsigned int end, const char *tag)
-{
-    DbgPrint("sv_bots: DUMP4 BEGIN %s [%08X .. %08X]\n", tag, start, end);
-
-    // r334: 6 words per line, stride 0x18 — fully contiguous, no gaps.
-    // The DbgPrint call passes 7 args (addr + 6 words); PowerPC passes the
-    // first 8 integer args in r3..r10, so every argument stays in-register.
-    // r333 used 8 words / 9 args — args 9 and 10 spilled to stack and
-    // T4's fixed-arity DbgPrint printed stale garbage for words 6 and 7.
-    for (unsigned int addr = start; addr < end; addr += 0x18)
+    if (!name)
+        return nullptr;
+    for (const auto *m = sv_bots_methods; m->name != nullptr; ++m)
     {
-        const volatile unsigned int *p =
-            reinterpret_cast<const volatile unsigned int *>(addr);
-
-        DbgPrint("sv_bots: DUMP4 %08X: %08X %08X %08X %08X %08X %08X\n",
-                 addr,
-                 p[0], p[1], p[2], p[3], p[4], p[5]);
+        if (_stricmp(name, m->name) == 0)
+            return m->handler;
     }
-
-    DbgPrint("sv_bots: DUMP4 END %s\n", tag);
-}
-
-static void BW_DumpRegions()
-{
-    DbgPrint("sv_bots: DUMP4 ==== r334 TU7 address dump start ====\n");
-    // SV_IsTestClient: r333 window topped out at 0x82221000 and the
-    // function (base 0x8221D1E0 + ~+0x3E20 SV-region delta) sat at/past
-    // that edge. Widened the top to 0x82223000.
-    BW_DumpRegion(0x8221A000, 0x82223000, "SV_ISTESTCLIENT");
-    BW_DumpRegion(0x82345000, 0x8234C000, "SCR_FAMILY");
-    DbgPrint("sv_bots: DUMP4 ==== r334 TU7 address dump end ====\n");
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -712,15 +547,12 @@ static void BW_DumpRegions()
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: r343 INERT-EXCEPT-KICK build (kick registered; methods+addtestclient engine-routed)\n");
-    DbgPrint("sv_bots: [DIAG] r343 | sv_bots=KICK-ONLY | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: r344 DETOURS-OFF build (full BW surface; zero engine detours)\n");
+    DbgPrint("sv_bots: [DIAG] r344 | sv_bots=DETOURS-OFF | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
-
-#if CODXE_DIAG_DUMP4
-    BW_DumpRegions();
-#endif
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
