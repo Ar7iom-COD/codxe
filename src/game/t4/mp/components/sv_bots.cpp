@@ -56,12 +56,14 @@
 // argument, so it complains. /WX promotes this to an error.
 #pragma warning(disable: 4505)
 
-// Engine console sink @ 0x82271AE8. Receives a pre-formatted string in
-// r4 (no varargs). Every console line — including the GSC compiler's
-// "unknown function" error — flows through here. Detoured below to
-// mirror all output into xenia.log.
-static void* const CODXE_CON_SINK_ADDR = reinterpret_cast<void*>(0x82271AE8);
-typedef void (*Con_Sink_t)(int, const char*, int);
+// Engine Com_Printf @ 0x82271C60. Full detourable prologue (the deeper
+// sink 0x82271AE8 is an 8-byte __savegprlr stub and cannot be detoured).
+// r3 = channel, r4 = format string. Every console line — including the
+// GSC compiler's "unknown function" error — passes through here.
+// The hook logs the format string raw; for engine error messages the
+// text is already substituted into the format string by upstream va().
+static void* const CODXE_COM_PRINTF_ADDR = reinterpret_cast<void*>(0x82271C60);
+typedef void (*Com_Printf_t)(int, const char*, ...);
 
 namespace t4
 {
@@ -286,23 +288,31 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ---------------------------------------------------------------------------
-// Con_Sink detour — mirror ALL engine console output into xenia.log.
+// Com_Printf detour — mirror ALL engine console output into xenia.log.
 //
 // Diagnostic. The GSC compiler writes "unknown function" / "bad syntax" to
 // the engine console; Xbox 360 has no console, so this copies every line
 // into DbgPrint. Leave enabled until the GSC layer compiles clean.
+//
+// Targets 0x82271C60 (full prologue, detourable). It is varargs; the hook
+// reads only the format string (r4) — sufficient for error messages, which
+// arrive pre-substituted. The original is varargs too: we forward the two
+// named args; r5-r10 (the varargs home) are preserved by the trampoline's
+// copy of the original prologue (std r5..r10), so the original still sees
+// its variadic arguments intact.
 // ---------------------------------------------------------------------------
 
-static Detour Con_Sink_Detour;
+static Detour Com_Printf_Detour;
 
-static void Con_Sink_Hook(int arg0, const char* text, int arg2)
+static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
+                            int a4, int a5, int a6)
 {
-    if (text && text[0])
+    if (fmt && fmt[0])
     {
         char buf[1024];
         size_t n = 0;
-        for (; text[n] && n < sizeof(buf) - 1; ++n)
-            buf[n] = text[n];
+        for (; fmt[n] && n < sizeof(buf) - 1; ++n)
+            buf[n] = fmt[n];
         while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
             --n;
         buf[n] = '\0';
@@ -311,7 +321,7 @@ static void Con_Sink_Hook(int arg0, const char* text, int arg2)
             DbgPrint("sv_bots: [CON] %s\n", buf);
     }
 
-    Con_Sink_Detour.GetOriginal<Con_Sink_t>()(arg0, text, arg2);
+    Com_Printf_Detour.GetOriginal<Com_Printf_t>()(channel, fmt, a2, a3, a4, a5, a6);
 }
 
 // ===========================================================================
@@ -617,9 +627,9 @@ sv_bots::sv_bots()
     DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
 #endif
 
-    Con_Sink_Detour = Detour(CODXE_CON_SINK_ADDR, Con_Sink_Hook);
-    Con_Sink_Detour.Install();
-    DbgPrint("sv_bots: Con_Sink console-mirror detour INSTALLED @ 0x82271AE8\n");
+    Com_Printf_Detour = Detour(CODXE_COM_PRINTF_ADDR, Com_Printf_Hook);
+    Com_Printf_Detour.Install();
+    DbgPrint("sv_bots: Com_Printf console-mirror detour INSTALLED @ 0x82271C60\n");
 
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
@@ -638,7 +648,7 @@ sv_bots::~sv_bots()
     SV_UserinfoChanged_Detour.Remove();
 #endif
 
-    Con_Sink_Detour.Remove();
+    Com_Printf_Detour.Remove();
 
     CleanBotArray();
 }
