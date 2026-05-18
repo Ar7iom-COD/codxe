@@ -305,11 +305,34 @@ static Detour  SV_UserinfoChanged_Detour;
 
 static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 {
-    if (s_pendingBotName[0] &&
-        cl->header.netchan.remoteAddress.type == NA_BOT &&
-        cl->header.state == CS_CONNECTED)
+    // r342-B STATE DUMP. SV_UserinfoChanged is a CONNECT-PATH callback (it
+    // fires when the engine (re)parses a client's userinfo), NOT a per-frame
+    // server callback — so detouring it is the low-risk detour class per the
+    // r340 isolation rationale. We do NOT stamp names here (r342 is inert;
+    // addtestclient is not intercepted, s_pendingBotName is never set).
+    //
+    // For each client the engine touches, print the engine-truth connect
+    // state. clientConnectState_t: CS_FREE=0 CS_ZOMBIE=1 CS_CONNECTED=2
+    // CS_ACTIVE=4. A bot that has fully entered the match reaches CS_ACTIVE;
+    // a bot stuck before spawn sits at CS_CONNECTED. SV_IsTestClient is the
+    // engine's own is-this-a-bot truth. This is the only reliable read: the
+    // GSC-side self.class field is a script var with no fixed C offset.
+    if (cl)
     {
-        Info_SetValueForKey(cl->userinfo, "name", s_pendingBotName);
+        const int clientNum = static_cast<int>(
+            cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
+        if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
+        {
+            const int isTC = SV_IsTestClient(clientNum);
+            DbgPrint("sv_bots: [UINFO-DUMP] clientNum=%d state=%d "
+                     "(0=FREE 1=ZOMBIE 2=CONNECTED 4=ACTIVE) "
+                     "istestclient=%d netadrtype=%d name='%s'\n",
+                     clientNum,
+                     static_cast<int>(cl->header.state),
+                     isTC,
+                     static_cast<int>(cl->header.netchan.remoteAddress.type),
+                     cl->name);
+        }
     }
 
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
@@ -319,7 +342,7 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 // r293 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r339: detour-free
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1   // r342-B: connect-path state dump
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r339: detour-free
 
 // r334 — TU7 address dump. Reads raw .text words to xenia.log so the last
@@ -610,25 +633,24 @@ static struct
 
 extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 {
-    if (!name)
-        return nullptr;
-    for (const auto *f = sv_bots_functions; f->name != nullptr; ++f)
-    {
-        if (_stricmp(name, f->name) == 0)
-            return f->handler;
-    }
+    // r342 INERT: BW registers NOTHING. Every GSC builtin lookup misses the
+    // BW table and falls through to the engine builtin — exactly the stock
+    // r261 path for ALL names, not just addtestclient. This is the true
+    // r261-equivalent on the patched binary: it isolates whether the
+    // class-select regression is caused by any BW registration (kick, etc).
+    (void)name;
+    (void)sv_bots_functions;
     return nullptr;
 }
 
 extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 {
-    if (!name)
-        return nullptr;
-    for (const auto *m = sv_bots_methods; m->name != nullptr; ++m)
-    {
-        if (_stricmp(name, m->name) == 0)
-            return m->handler;
-    }
+    // r342 INERT: BW registers NO player methods. Every method lookup misses
+    // and falls through to the engine. bw v11 only calls getentitynumber /
+    // getguid / kick from the BW surface on the connect path; with this
+    // inert, all of those resolve to the engine, exactly as on r261.
+    (void)name;
+    (void)sv_bots_methods;
     return nullptr;
 }
 
@@ -698,8 +720,8 @@ static void BW_DumpRegions()
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: r341 addtestclient A/B build (engine-builtin fall-through)\n");
-    DbgPrint("sv_bots: [DIAG] r341 | weapon=%d userinfo=%d botmove=%d | addtestclient=ENGINE-BUILTIN\n",
+    DbgPrint("sv_bots: r342-B INERT+UINFO-DUMP build (BW inert; SV_UserinfoChanged dumps bot state)\n");
+    DbgPrint("sv_bots: [DIAG] r342-B | sv_bots=INERT+UINFO-DUMP | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
