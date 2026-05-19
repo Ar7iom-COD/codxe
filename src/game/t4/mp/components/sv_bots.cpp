@@ -166,9 +166,13 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
 
-static Detour SV_BotUserMove_Detour;
+static Detour SV_BotFrame_Detour;
 
-static void SV_BotUserMove_Stub(clientBW_t *cl)
+// BW_DriveBot: synthesise one usercmd for a test client and push it
+// through SV_ClientThink. Formerly SV_BotUserMove_Stub. SV_BotUserMove
+// (0x8228AB98) has a __savegprlr prologue and cannot be detoured; instead
+// SV_BotFrame_Stub calls this directly per bot, replicating the engine loop.
+static void BW_DriveBot(clientBW_t *cl)
 {
     // The engine calls SV_BotUserMove for EVERY client (the host included).
     // For anything that is not a confirmed, CS_ACTIVE bot we return WITHOUT
@@ -272,6 +276,43 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 }
 
 // ---------------------------------------------------------------------------
+// SV_BotFrame detour - the real per-frame bot driver
+// ---------------------------------------------------------------------------
+// Engine SV_BotFrame (0x8228AD80) runs once per server frame, loops every
+// client slot, and calls SV_BotUserMove for each slot with state!=0 and
+// netadr.type(cl+0x20)==0. SV_BotUserMove (0x8228AB98) cannot be detoured
+// (__savegprlr prologue), so we detour SV_BotFrame itself and replicate its
+// loop, calling BW_DriveBot directly. 0x82286510 is the engine's per-frame
+// bot bookkeeping tick; we call it to stay faithful to the original.
+typedef void (*SV_BotFramePrep_t)();
+static SV_BotFramePrep_t SV_BotFramePrep =
+    reinterpret_cast<SV_BotFramePrep_t>(0x82286510);
+
+static void SV_BotFrame_Stub()
+{
+    SV_BotFramePrep();
+
+    char *clientsBase = reinterpret_cast<char *>(svsHeader->clients);
+
+    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+    {
+        clientBW_t *cl = reinterpret_cast<clientBW_t *>(
+            clientsBase + static_cast<size_t>(i) * 0xB762C);
+
+        // Engine gate 1: slot not empty (header.state != 0).
+        if (static_cast<int>(cl->header.state) == 0)
+            continue;
+
+        // Engine gate 2: netadr.type at cl+0x20 == 0 (NA_BOT).
+        if (*reinterpret_cast<int *>(reinterpret_cast<char *>(cl) + 0x20) != 0)
+            continue;
+
+        // BW_DriveBot applies its own SV_IsTestClient + CS_ACTIVE guards.
+        BW_DriveBot(cl);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SV_UserinfoChanged detour — stamp pending bot name before first parse
 // ---------------------------------------------------------------------------
 
@@ -332,7 +373,7 @@ static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r346: SV_BotUserMove detour ON — isolate spawn gate
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r349: SV_BotUserMove detour ON — isolate spawn gate
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -471,7 +512,7 @@ static void GScr_AddTestClient()
     {
         DbgPrint("sv_bots: [ADDTESTCLIENT] success, entnum=%d\n", ent->s.number);
 
-        // --- r346: NA_BOT gate fix --------------------------------------
+        // --- r349: NA_BOT gate fix --------------------------------------
         // SV_BotFrame (0x8228AD80) only calls SV_BotUserMove for a client
         // whose netadr.type at (cl + 0x20) == 0 (NA_BOT). SV_AddTestClient
         // leaves it non-zero, so the engine never drives our bots -> they
@@ -617,9 +658,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r346 SV_BotUserMove-only)\n");
-    DbgPrint("sv_bots: r346 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
-    DbgPrint("sv_bots: [DIAG] r346 | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r349 SV_BotUserMove-only)\n");
+    DbgPrint("sv_bots: r349 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
+    DbgPrint("sv_bots: [DIAG] r349 | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
@@ -636,11 +677,13 @@ sv_bots::sv_bots()
 #endif
 
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
-    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
-    SV_BotUserMove_Detour.Install();
-    DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
+    // SV_BotUserMove (0x8228AB98) is un-detourable (__savegprlr prologue).
+    // Detour SV_BotFrame (0x8228AD80) instead and drive bots ourselves.
+    SV_BotFrame_Detour = Detour(reinterpret_cast<void *>(0x8228AD80), SV_BotFrame_Stub);
+    SV_BotFrame_Detour.Install();
+    DbgPrint("sv_bots: SV_BotFrame detour INSTALLED (drives bots via BW_DriveBot)\n");
 #else
-    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: SV_BotFrame detour SKIPPED (diagnostic)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
@@ -666,7 +709,7 @@ sv_bots::~sv_bots()
     G_SelectWeaponIndex_Detour.Remove();
 #endif
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
-    SV_BotUserMove_Detour.Remove();
+    SV_BotFrame_Detour.Remove();
 #endif
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
