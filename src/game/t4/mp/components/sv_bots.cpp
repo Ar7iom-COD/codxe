@@ -78,6 +78,11 @@ using namespace t4::mp::bw;
 
 struct BotMovementInfo_t
 {
+    bool          is_bot;   // set by GScr_AddTestClient; OUR bot flag.
+                            // SV_IsTestClient is unreliable here -
+                            // it reads gclient_s+0x39BC which is not
+                            // synced with the client_t flag SV_AddTestClient
+                            // sets, so it returns 0 for live bots.
     int           buttons;
     unsigned char weapon;
     bool          is_mirroring_client;
@@ -181,7 +186,8 @@ static void BW_DriveBot(clientBW_t *cl)
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
         return;
 
-    const int isTC = SV_IsTestClient(clientNum);
+    const bool isOurBot = g_botai[clientNum].is_bot;
+    const int  isTC     = SV_IsTestClient(clientNum);  // diagnostic only
 
     // Throttled probe: log once per (clientNum) so the loop does not spam.
     {
@@ -189,12 +195,14 @@ static void BW_DriveBot(clientBW_t *cl)
         if (clientNum != s_lastBD)
         {
             s_lastBD = clientNum;
-            DbgPrint("sv_bots: [CTPROBE] BW_DriveBot cn=%d SV_IsTestClient=%d state=%d\n",
-                     clientNum, isTC, static_cast<int>(cl->header.state));
+            DbgPrint("sv_bots: [CTPROBE] BW_DriveBot cn=%d is_bot=%d (SV_IsTestClient=%d) state=%d\n",
+                     clientNum, isOurBot ? 1 : 0, isTC,
+                     static_cast<int>(cl->header.state));
         }
     }
 
-    if (isTC == 0)
+    // Gate on OUR flag, not SV_IsTestClient (unreliable on T4).
+    if (!isOurBot)
         return;
 
     // Engine truth: SV_ClientThink does `if (*(int*)cl == 4)`. Only drive a
@@ -578,6 +586,11 @@ static void GScr_AddTestClient()
         }
         // ----------------------------------------------------------------
 
+        // Mark this entnum as one of OUR bots. BW_DriveBot gates on this
+        // instead of engine SV_IsTestClient (which is unreliable on T4).
+        if (ent->s.number >= 0 && ent->s.number < MAX_CLIENTS_BW)
+            g_botai[ent->s.number].is_bot = true;
+
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
     }
     else
@@ -606,6 +619,9 @@ static void GScr_Kick()
     clientBW_t *cl = BW_GetClient(clientNum);
     if (cl && cl->header.state >= CS_CONNECTED)
         SV_DropClient(cl, reason, true);
+
+    // Clear our bot flag so a real player reusing this slot is not driven.
+    g_botai[clientNum].is_bot = false;
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
