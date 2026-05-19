@@ -174,22 +174,29 @@ static Detour SV_BotFrame_Detour;
 // SV_BotFrame_Stub calls this directly per bot, replicating the engine loop.
 static void BW_DriveBot(clientBW_t *cl)
 {
-    // The engine calls SV_BotUserMove for EVERY client (the host included).
-    // For anything that is not a confirmed, CS_ACTIVE bot we return WITHOUT
-    // calling the original — running the engine routine on a non-bot or
-    // half-initialised slot during pregame is the r317 freeze.
+    DbgPrint("sv_bots: [CTPROBE] BW_DriveBot entered\n");
+
     if (!cl->gentity)
+    {
+        DbgPrint("sv_bots: [CTPROBE] BW_DriveBot bail: cl->gentity is NULL\n");
         return;
+    }
 
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
+    DbgPrint("sv_bots: [CTPROBE] BW_DriveBot clientNum=%d\n", clientNum);
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+    {
+        DbgPrint("sv_bots: [CTPROBE] BW_DriveBot bail: clientNum out of range\n");
         return;
+    }
 
-    // Engine truth: SV_IsTestClient (0x8221F6D0) is the same check the
-    // engine's own SV_BotUserMove uses. Not fooled by zeroed memory the
-    // way the NA_BOT type field is.
-    if (SV_IsTestClient(clientNum) == 0)
+    const int isTC = SV_IsTestClient(clientNum);
+    DbgPrint("sv_bots: [CTPROBE] BW_DriveBot SV_IsTestClient(%d)=%d\n", clientNum, isTC);
+    if (isTC == 0)
+    {
+        DbgPrint("sv_bots: [CTPROBE] BW_DriveBot bail: not a test client\n");
         return;
+    }
 
     // Engine truth: SV_ClientThink does `if (*(int*)cl == 4)`. Only drive a
     // bot once it has climbed to CS_ACTIVE; stay inert during connect/pregame.
@@ -450,12 +457,18 @@ static void Scr_BotDbg(scr_entref_t entref)
 // the same work SV_BotUserMove would do, through the safe builtin channel.
 static void Scr_BotClientThink(scr_entref_t entref)
 {
+    DbgPrint("sv_bots: [CTPROBE] Scr_BotClientThink entered, entnum=%d classnum=%d\n",
+             static_cast<int>(entref.entnum), static_cast<int>(entref.classnum));
     BW_RequirePlayerEntity(entref);
+    DbgPrint("sv_bots: [CTPROBE] passed RequirePlayerEntity, entnum=%d\n",
+             static_cast<int>(entref.entnum));
 
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
         Scr_Error_BW("Usage: <bot> botClientThink();", SCRIPTINSTANCE_SERVER);
 
     clientBW_t *cl = BW_GetClient(entref.entnum);
+    DbgPrint("sv_bots: [CTPROBE] calling BW_DriveBot, entnum=%d\n",
+             static_cast<int>(entref.entnum));
     BW_DriveBot(cl);
 }
 
