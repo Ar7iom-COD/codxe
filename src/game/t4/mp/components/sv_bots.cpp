@@ -170,30 +170,33 @@ static Detour SV_BotUserMove_Detour;
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
+    // The engine calls SV_BotUserMove for EVERY client (the host included).
+    // For anything that is not a confirmed, CS_ACTIVE bot we return WITHOUT
+    // calling the original — running the engine routine on a non-bot or
+    // half-initialised slot during pregame is the r317 freeze.
     if (!cl->gentity)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
-    }
 
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+        return;
+
+    // Engine truth: SV_IsTestClient (0x8221F6D0) is the same check the
+    // engine's own SV_BotUserMove uses. Not fooled by zeroed memory the
+    // way the NA_BOT type field is.
+    if (SV_IsTestClient(clientNum) == 0)
+        return;
+
+    // Engine truth: SV_ClientThink does `if (*(int*)cl == 4)`. Only drive a
+    // bot once it has climbed to CS_ACTIVE; stay inert during connect/pregame.
+    if (static_cast<int>(cl->header.state) != 4)
     {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        DbgPrint("sv_bots: [BOTMOVE] cn=%d waiting (state=%d)\n",
+                 clientNum, static_cast<int>(cl->header.state));
         return;
     }
 
-    // Defense in depth: only inject input for real bot clients.
-    if (cl->header.netchan.remoteAddress.type != NA_BOT)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
-        return;
-    }
-    if (cl->isTestClient == 0)
-    {
-        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
-        return;
-    }
+    DbgPrint("sv_bots: [BOTMOVE] cn=%d driving (state=4)\n", clientNum);
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -329,7 +332,7 @@ static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r344: detours OFF — isolate detour mechanism
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r345: SV_BotUserMove detour ON — isolate spawn gate
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -593,9 +596,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
-    DbgPrint("sv_bots: r344 DETOURS-OFF build (full BW surface; zero engine detours)\n");
-    DbgPrint("sv_bots: [DIAG] r344 | sv_bots=DETOURS-OFF | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r345 SV_BotUserMove-only)\n");
+    DbgPrint("sv_bots: r345 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
+    DbgPrint("sv_bots: [DIAG] r345 | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
