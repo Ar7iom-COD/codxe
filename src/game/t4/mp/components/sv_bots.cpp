@@ -373,7 +373,7 @@ static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r349: SV_BotUserMove detour ON — isolate spawn gate
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r350: detours OFF — SV_BotFrame detour froze pregame (codjumper baseline). NO MORE DETOURS.
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -426,6 +426,24 @@ static void Scr_BotAction(scr_entref_t entref)
     }
     Scr_ParamError_BW(0, va_BW("Unknown bot action. Must be one of:%s.", buffer),
                       SCRIPTINSTANCE_SERVER);
+}
+
+// botclientthink(): GSC-driven per-frame bot driver. The engine routes
+// SV_BotFrame -> SV_BotUserMove -> SV_ClientThink to feed test clients a
+// usercmd; neither engine function can be detoured here (SV_BotUserMove
+// has a __savegprlr prologue; detouring SV_BotFrame freezes pregame).
+// Instead BW's GSC runs a per-bot wait-loop that calls this method every
+// frame. It builds the usercmd and calls SV_ClientThink via BW_DriveBot -
+// the same work SV_BotUserMove would do, through the safe builtin channel.
+static void Scr_BotClientThink(scr_entref_t entref)
+{
+    BW_RequirePlayerEntity(entref);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <bot> botClientThink();", SCRIPTINSTANCE_SERVER);
+
+    clientBW_t *cl = BW_GetClient(entref.entnum);
+    BW_DriveBot(cl);
 }
 
 static void Scr_BotStop(scr_entref_t entref)
@@ -620,6 +638,7 @@ static struct
     BuiltinMethod handler;
 } sv_bots_methods[] = {
     {"botmoveto",         Scr_BotMoveTo},
+    {"botclientthink",    Scr_BotClientThink},
     {"botaction",         Scr_BotAction},
     {"botmirror",         Scr_BotMirror},
     {"botstop",           Scr_BotStop},
@@ -658,9 +677,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r349 SV_BotUserMove-only)\n");
-    DbgPrint("sv_bots: r349 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
-    DbgPrint("sv_bots: [DIAG] r349 | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: init T4 BW (r350, detours disabled)\n");
+    DbgPrint("sv_bots: r350 build - all engine detours OFF (Detour mechanism freezes pregame)\n");
+    DbgPrint("sv_bots: [DIAG] r350 | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
