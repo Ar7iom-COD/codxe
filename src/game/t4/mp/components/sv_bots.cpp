@@ -428,6 +428,19 @@ static void Scr_BotAction(scr_entref_t entref)
                       SCRIPTINSTANCE_SERVER);
 }
 
+// botdbg(<tag>): diagnostic builtin. GSC has no visible logging (BW's
+// println does not reach xenia.log), so GSC calls this to emit a
+// DbgPrint that DOES appear in the log. Used to trace how far the bot
+// connect chain progresses. Pure diagnostic - safe to leave in.
+static void Scr_BotDbg(scr_entref_t entref)
+{
+    (void)entref;
+    const char *tag = "(null)";
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) >= 1)
+        tag = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    DbgPrint("sv_bots: [GSCDBG] %s\n", tag);
+}
+
 // botclientthink(): GSC-driven per-frame bot driver. The engine routes
 // SV_BotFrame -> SV_BotUserMove -> SV_ClientThink to feed test clients a
 // usercmd; neither engine function can be detoured here (SV_BotUserMove
@@ -639,6 +652,7 @@ static struct
 } sv_bots_methods[] = {
     {"botmoveto",         Scr_BotMoveTo},
     {"botclientthink",    Scr_BotClientThink},
+    {"botdbg",            Scr_BotDbg},
     {"botaction",         Scr_BotAction},
     {"botmirror",         Scr_BotMirror},
     {"botstop",           Scr_BotStop},
