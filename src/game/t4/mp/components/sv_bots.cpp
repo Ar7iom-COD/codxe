@@ -332,7 +332,7 @@ static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r345: SV_BotUserMove detour ON — isolate spawn gate
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1   // r346: SV_BotUserMove detour ON — isolate spawn gate
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -470,6 +470,27 @@ static void GScr_AddTestClient()
     if (ent)
     {
         DbgPrint("sv_bots: [ADDTESTCLIENT] success, entnum=%d\n", ent->s.number);
+
+        // --- r346: NA_BOT gate fix --------------------------------------
+        // SV_BotFrame (0x8228AD80) only calls SV_BotUserMove for a client
+        // whose netadr.type at (cl + 0x20) == 0 (NA_BOT). SV_AddTestClient
+        // leaves it non-zero, so the engine never drives our bots -> they
+        // never get a usercmd, SV_ClientThink never runs, they never spawn.
+        // Force the address type to NA_BOT here. cl + 0x20 == netchan
+        // remote-address type field (verified: SV_AddTestClient passes
+        // cl+0x20 into NET_CompareAdr; SV_BotFrame tests *(int*)(cl+0x20)).
+        {
+            clientBW_t *bw = reinterpret_cast<clientBW_t *>(
+                reinterpret_cast<char *>(svsHeader->clients) +
+                static_cast<size_t>(ent->s.number) * 0xB762C);
+            int *adrType = reinterpret_cast<int *>(
+                reinterpret_cast<char *>(bw) + 0x20);
+            DbgPrint("sv_bots: [ADDTESTCLIENT] cn=%d netadr.type was %d -> forcing 0 (NA_BOT)\n",
+                     ent->s.number, *adrType);
+            *adrType = 0;
+        }
+        // ----------------------------------------------------------------
+
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
     }
     else
@@ -596,9 +617,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r345 SV_BotUserMove-only)\n");
-    DbgPrint("sv_bots: r345 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
-    DbgPrint("sv_bots: [DIAG] r345 | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r346 SV_BotUserMove-only)\n");
+    DbgPrint("sv_bots: r346 build - SV_BotUserMove detour ON, weapon/userinfo OFF\n");
+    DbgPrint("sv_bots: [DIAG] r346 | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
