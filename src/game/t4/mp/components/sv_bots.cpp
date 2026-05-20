@@ -78,11 +78,6 @@ using namespace t4::mp::bw;
 
 struct BotMovementInfo_t
 {
-    bool          is_bot;   // set by GScr_AddTestClient; OUR bot flag.
-                            // SV_IsTestClient is unreliable here -
-                            // it reads gclient_s+0x39BC which is not
-                            // synced with the client_t flag SV_AddTestClient
-                            // sets, so it returns 0 for live bots.
     int           buttons;
     unsigned char weapon;
     bool          is_mirroring_client;
@@ -171,50 +166,34 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
 
-static Detour SV_BotFrame_Detour;
+static Detour SV_BotUserMove_Detour;
 
-// BW_DriveBot: synthesise one usercmd for a test client and push it
-// through SV_ClientThink. Formerly SV_BotUserMove_Stub. SV_BotUserMove
-// (0x8228AB98) has a __savegprlr prologue and cannot be detoured; instead
-// SV_BotFrame_Stub calls this directly per bot, replicating the engine loop.
-static void BW_DriveBot(clientBW_t *cl)
+static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
     if (!cl->gentity)
-        return;  // no entity yet - silent (throttled probe below covers state)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
 
     const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
-        return;
-
-    const bool isOurBot = g_botai[clientNum].is_bot;
-    const int  isTC     = SV_IsTestClient(clientNum);  // diagnostic only
-
-    // Throttled probe: log once per (clientNum) so the loop does not spam.
     {
-        static int s_lastBD = -999;
-        if (clientNum != s_lastBD)
-        {
-            s_lastBD = clientNum;
-            DbgPrint("sv_bots: [CTPROBE] BW_DriveBot cn=%d is_bot=%d (SV_IsTestClient=%d) state=%d\n",
-                     clientNum, isOurBot ? 1 : 0, isTC,
-                     static_cast<int>(cl->header.state));
-        }
-    }
-
-    // Gate on OUR flag, not SV_IsTestClient (unreliable on T4).
-    if (!isOurBot)
-        return;
-
-    // Engine truth: SV_ClientThink does `if (*(int*)cl == 4)`. Only drive a
-    // bot once it has climbed to CS_ACTIVE; stay inert during connect/pregame.
-    if (static_cast<int>(cl->header.state) != 4)
-    {
-        DbgPrint("sv_bots: [BOTMOVE] cn=%d waiting (state=%d)\n",
-                 clientNum, static_cast<int>(cl->header.state));
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
 
-    DbgPrint("sv_bots: [BOTMOVE] cn=%d driving (state=4)\n", clientNum);
+    // Defense in depth: only inject input for real bot clients.
+    if (cl->header.netchan.remoteAddress.type != NA_BOT)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
+    if (cl->isTestClient == 0)
+    {
+        SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
+        return;
+    }
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
@@ -290,43 +269,6 @@ static void BW_DriveBot(clientBW_t *cl)
 }
 
 // ---------------------------------------------------------------------------
-// SV_BotFrame detour - the real per-frame bot driver
-// ---------------------------------------------------------------------------
-// Engine SV_BotFrame (0x8228AD80) runs once per server frame, loops every
-// client slot, and calls SV_BotUserMove for each slot with state!=0 and
-// netadr.type(cl+0x20)==0. SV_BotUserMove (0x8228AB98) cannot be detoured
-// (__savegprlr prologue), so we detour SV_BotFrame itself and replicate its
-// loop, calling BW_DriveBot directly. 0x82286510 is the engine's per-frame
-// bot bookkeeping tick; we call it to stay faithful to the original.
-typedef void (*SV_BotFramePrep_t)();
-static SV_BotFramePrep_t SV_BotFramePrep =
-    reinterpret_cast<SV_BotFramePrep_t>(0x82286510);
-
-static void SV_BotFrame_Stub()
-{
-    SV_BotFramePrep();
-
-    char *clientsBase = reinterpret_cast<char *>(svsHeader->clients);
-
-    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
-    {
-        clientBW_t *cl = reinterpret_cast<clientBW_t *>(
-            clientsBase + static_cast<size_t>(i) * 0xB762C);
-
-        // Engine gate 1: slot not empty (header.state != 0).
-        if (static_cast<int>(cl->header.state) == 0)
-            continue;
-
-        // Engine gate 2: netadr.type at cl+0x20 == 0 (NA_BOT).
-        if (*reinterpret_cast<int *>(reinterpret_cast<char *>(cl) + 0x20) != 0)
-            continue;
-
-        // BW_DriveBot applies its own SV_IsTestClient + CS_ACTIVE guards.
-        BW_DriveBot(cl);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // SV_UserinfoChanged detour — stamp pending bot name before first parse
 // ---------------------------------------------------------------------------
 
@@ -387,7 +329,7 @@ static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r350: detours OFF — SV_BotFrame detour froze pregame (codjumper baseline). NO MORE DETOURS.
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r344: detours OFF — isolate detour mechanism
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -442,46 +384,6 @@ static void Scr_BotAction(scr_entref_t entref)
                       SCRIPTINSTANCE_SERVER);
 }
 
-// botdbg(<tag>): diagnostic builtin. GSC has no visible logging (BW's
-// println does not reach xenia.log), so GSC calls this to emit a
-// DbgPrint that DOES appear in the log. Used to trace how far the bot
-// connect chain progresses. Pure diagnostic - safe to leave in.
-static void Scr_BotDbg(scr_entref_t entref)
-{
-    (void)entref;
-    const char *tag = "(null)";
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) >= 1)
-        tag = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
-    DbgPrint("sv_bots: [GSCDBG] %s\n", tag);
-}
-
-// botclientthink(): GSC-driven per-frame bot driver. The engine routes
-// SV_BotFrame -> SV_BotUserMove -> SV_ClientThink to feed test clients a
-// usercmd; neither engine function can be detoured here (SV_BotUserMove
-// has a __savegprlr prologue; detouring SV_BotFrame freezes pregame).
-// Instead BW's GSC runs a per-bot wait-loop that calls this method every
-// frame. It builds the usercmd and calls SV_ClientThink via BW_DriveBot -
-// the same work SV_BotUserMove would do, through the safe builtin channel.
-static void Scr_BotClientThink(scr_entref_t entref)
-{
-    {
-        static int s_lastCT = -999;
-        if (static_cast<int>(entref.entnum) != s_lastCT)
-        {
-            s_lastCT = static_cast<int>(entref.entnum);
-            DbgPrint("sv_bots: [CTPROBE] Scr_BotClientThink called, entnum=%d classnum=%d\n",
-                     static_cast<int>(entref.entnum), static_cast<int>(entref.classnum));
-        }
-    }
-    BW_RequirePlayerEntity(entref);
-
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
-        Scr_Error_BW("Usage: <bot> botClientThink();", SCRIPTINSTANCE_SERVER);
-
-    clientBW_t *cl = BW_GetClient(entref.entnum);
-    BW_DriveBot(cl);
-}
-
 static void Scr_BotStop(scr_entref_t entref)
 {
     BW_RequirePlayerEntity(entref);
@@ -516,6 +418,10 @@ static void Scr_BotMirror(scr_entref_t entref)
     g_botai[entref.entnum].is_mirroring_client = true;
     g_botai[entref.entnum].mirror_client_num   = targetEntNum;
 }
+#if 0  // r346 Option A: GScr_AddTestClient retired - engine native
+       // addtestclient builtin is used instead. Keeping the body for
+       // reference; if Option A fails, restore the registration in
+       // sv_bots_functions[] and flip this guard back to 1.
 
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
@@ -565,32 +471,6 @@ static void GScr_AddTestClient()
     if (ent)
     {
         DbgPrint("sv_bots: [ADDTESTCLIENT] success, entnum=%d\n", ent->s.number);
-
-        // --- r349: NA_BOT gate fix --------------------------------------
-        // SV_BotFrame (0x8228AD80) only calls SV_BotUserMove for a client
-        // whose netadr.type at (cl + 0x20) == 0 (NA_BOT). SV_AddTestClient
-        // leaves it non-zero, so the engine never drives our bots -> they
-        // never get a usercmd, SV_ClientThink never runs, they never spawn.
-        // Force the address type to NA_BOT here. cl + 0x20 == netchan
-        // remote-address type field (verified: SV_AddTestClient passes
-        // cl+0x20 into NET_CompareAdr; SV_BotFrame tests *(int*)(cl+0x20)).
-        {
-            clientBW_t *bw = reinterpret_cast<clientBW_t *>(
-                reinterpret_cast<char *>(svsHeader->clients) +
-                static_cast<size_t>(ent->s.number) * 0xB762C);
-            int *adrType = reinterpret_cast<int *>(
-                reinterpret_cast<char *>(bw) + 0x20);
-            DbgPrint("sv_bots: [ADDTESTCLIENT] cn=%d netadr.type was %d -> forcing 0 (NA_BOT)\n",
-                     ent->s.number, *adrType);
-            *adrType = 0;
-        }
-        // ----------------------------------------------------------------
-
-        // Mark this entnum as one of OUR bots. BW_DriveBot gates on this
-        // instead of engine SV_IsTestClient (which is unreliable on T4).
-        if (ent->s.number >= 0 && ent->s.number < MAX_CLIENTS_BW)
-            g_botai[ent->s.number].is_bot = true;
-
         Scr_AddEntityNum(ent->s.number, SCRIPTINSTANCE_SERVER);
     }
     else
@@ -599,6 +479,7 @@ static void GScr_AddTestClient()
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
+#endif  // GScr_AddTestClient
 
 static void GScr_Kick()
 {
@@ -619,9 +500,6 @@ static void GScr_Kick()
     clientBW_t *cl = BW_GetClient(clientNum);
     if (cl && cl->header.state >= CS_CONNECTED)
         SV_DropClient(cl, reason, true);
-
-    // Clear our bot flag so a real player reusing this slot is not driven.
-    g_botai[clientNum].is_bot = false;
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -671,7 +549,13 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r346 Option A: stop intercepting addtestclient. Let the engine
+    // native builtin handle the GSC call. Stock codxe r261 spawned bots
+    // fine via that path; our GScr_AddTestClient apparently missed the
+    // post-SV_AddTestClient world-entry step (e.g. ClientBegin) that the
+    // native builtin performs. GScr_AddTestClient kept as dead code for
+    // now; can be removed once Option A is confirmed working.
+    // {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -682,8 +566,6 @@ static struct
     BuiltinMethod handler;
 } sv_bots_methods[] = {
     {"botmoveto",         Scr_BotMoveTo},
-    {"botclientthink",    Scr_BotClientThink},
-    {"botdbg",            Scr_BotDbg},
     {"botaction",         Scr_BotAction},
     {"botmirror",         Scr_BotMirror},
     {"botstop",           Scr_BotStop},
@@ -722,9 +604,9 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: init T4 BW (r350, detours disabled)\n");
-    DbgPrint("sv_bots: r350 build - all engine detours OFF (Detour mechanism freezes pregame)\n");
-    DbgPrint("sv_bots: [DIAG] r350 | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: r344 DETOURS-OFF build (full BW surface; zero engine detours)\n");
+    DbgPrint("sv_bots: [DIAG] r344 | sv_bots=DETOURS-OFF | weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
@@ -741,13 +623,11 @@ sv_bots::sv_bots()
 #endif
 
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
-    // SV_BotUserMove (0x8228AB98) is un-detourable (__savegprlr prologue).
-    // Detour SV_BotFrame (0x8228AD80) instead and drive bots ourselves.
-    SV_BotFrame_Detour = Detour(reinterpret_cast<void *>(0x8228AD80), SV_BotFrame_Stub);
-    SV_BotFrame_Detour.Install();
-    DbgPrint("sv_bots: SV_BotFrame detour INSTALLED (drives bots via BW_DriveBot)\n");
+    SV_BotUserMove_Detour = Detour(SV_BotUserMove, SV_BotUserMove_Stub);
+    SV_BotUserMove_Detour.Install();
+    DbgPrint("sv_bots: SV_BotUserMove detour INSTALLED\n");
 #else
-    DbgPrint("sv_bots: SV_BotFrame detour SKIPPED (diagnostic)\n");
+    DbgPrint("sv_bots: SV_BotUserMove detour SKIPPED (diagnostic)\n");
 #endif
 
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
@@ -773,7 +653,7 @@ sv_bots::~sv_bots()
     G_SelectWeaponIndex_Detour.Remove();
 #endif
 #if CODXE_DIAG_ENABLE_BOTUSERMOVE
-    SV_BotFrame_Detour.Remove();
+    SV_BotUserMove_Detour.Remove();
 #endif
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
