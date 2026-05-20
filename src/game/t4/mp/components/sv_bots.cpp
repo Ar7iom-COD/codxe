@@ -41,23 +41,24 @@
 //   in practice (the NET_CompareBaseAdr fall-through is real in the
 //   disassembly but doesn't manifest as host corruption on Xenia).
 //
-// r295 — weapon hook enabled:
+// r295 — weapon hook enabled (superseded by r296 below):
 //
-//   Bots own their primary (getcurrentweapon() returns type99rifle_mp etc.)
-//   and drop it on death, but visually walk around empty-handed and use
-//   melee instead of firing. Diagnosis: our SV_BotUserMove_Stub stamps
-//   cmd.weapon from g_botai[clientNum].weapon, but with WEAPON_HOOK
-//   disabled that field is never written — so cmd.weapon is permanently 0
-//   ("none"). Engine pmove sees weapon=0 in every usercmd and renders
-//   them as not holding anything, even though the player slot owns the
-//   rifle.
+//   Enabling G_SelectWeaponIndex_Hook captured weapon-select calls for
+//   each client at connect time, but the engine ONLY ever called it once
+//   per client with weaponIndex=35 (an offhand/grenade slot) and never
+//   again. Cached g_botai[].weapon therefore reports an offhand, not the
+//   class primary that the player slot actually holds. In-game result:
+//   bots visibly hold a grenade / gas / equipment instead of their rifle.
 //
-//   Fix: re-enable CODXE_DIAG_ENABLE_WEAPON_HOOK. G_SelectWeaponIndex_Hook
-//   now captures the engine's weapon-select call for each client and
-//   keeps g_botai[].weapon in sync, so the synthesized usercmd reports
-//   the correct weapon and the engine renders/handles it accordingly.
-//   The hook itself is one assignment plus the original call-through, so
-//   it cannot affect normal players or the pregame state machine.
+// r296 — read engine truth directly:
+//
+//   getcurrentweapon() in GSC returned the correct class primary
+//   (type99rifle_mp etc.) because GSC reads cl->gentity->s.weapon directly,
+//   bypassing whatever hook system the engine uses. We do the same:
+//   SV_BotUserMove_Stub now stamps cmd.weapon from cl->gentity->s.weapon
+//   on every tick, not from the stale hook-captured cache. The hook is
+//   kept enabled purely for diagnostic logging; the bot driver no longer
+//   depends on its value.
 //
 
 #include "pch.h"
@@ -158,13 +159,13 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// G_SelectWeaponIndex detour — track per-client weapon for usercmd synthesis
+// G_SelectWeaponIndex detour — diagnostic only (r296)
 // ---------------------------------------------------------------------------
 //
-// r295: rate-limited DbgPrint so we can confirm in xenia.log that the engine
-// is calling this for each bot client at spawn / weapon-switch time. The
-// rate-limit avoids spamming the log when bots switch weapons mid-match.
-// We only print when the index actually changes for a given client.
+// We still install this hook so its DbgPrint helps us trace weapon-select
+// events from the engine, but the bot driver no longer depends on the
+// cached value (see r296 note in header). Kept rate-limited so the log
+// doesn't get spammed by per-tick re-selects.
 
 static Detour G_SelectWeaponIndex_Detour;
 
@@ -189,8 +190,19 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // ---------------------------------------------------------------------------
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
+//
+// r296: cmd.weapon now comes from cl->gentity->s.weapon (engine truth) on
+// every tick, NOT from the stale g_botai[].weapon cache. The cache was
+// only populated by G_SelectWeaponIndex_Hook firing once at connect with
+// weaponIndex=35 (an offhand), which made bots visibly hold a grenade
+// instead of their assigned class primary.
 
 static Detour SV_BotUserMove_Detour;
+
+// Rate-limit the weapon trace DbgPrint so each bot reports its current
+// gentity weapon at most once per second (svsHeader->time is in ms).
+static int s_lastWeaponLogMs[MAX_CLIENTS_BW] = {0};
+static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1};
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
@@ -223,7 +235,23 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     std::memset(&cmd, 0, sizeof(cmd));
 
     cmd.serverTime = svsHeader->time;
-    cmd.weapon     = g_botai[clientNum].weapon;
+
+    // r296: read the engine's authoritative current weapon directly from
+    // the gentity's entityState. This is what GSC's getcurrentweapon()
+    // returns and what the player struct considers held.
+    const int gentityWeapon = cl->gentity->s.weapon;
+    cmd.weapon = static_cast<unsigned __int8>(gentityWeapon & 0xFF);
+
+    // Trace at most once per second per client, and only when the value
+    // changes, so the log isn't flooded.
+    if (s_lastWeaponLogVal[clientNum] != gentityWeapon &&
+        (svsHeader->time - s_lastWeaponLogMs[clientNum]) > 500)
+    {
+        DbgPrint("sv_bots: bot weapon clientNum=%d gentity.s.weapon=%d (was %d)\n",
+                 clientNum, gentityWeapon, s_lastWeaponLogVal[clientNum]);
+        s_lastWeaponLogVal[clientNum] = gentityWeapon;
+        s_lastWeaponLogMs[clientNum]  = svsHeader->time;
+    }
 
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
@@ -337,7 +365,7 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r295 DIAGNOSTIC TOGGLES
+// r296 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         1
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
@@ -612,7 +640,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r295 weapon-hook-enabled)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r296 gentity-weapon-readback)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
@@ -620,6 +648,12 @@ sv_bots::sv_bots()
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
+
+    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+    {
+        s_lastWeaponLogMs[i]  = 0;
+        s_lastWeaponLogVal[i] = -1;
+    }
 
 #if CODXE_DIAG_ENABLE_WEAPON_HOOK
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
