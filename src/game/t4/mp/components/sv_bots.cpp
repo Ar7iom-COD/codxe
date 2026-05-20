@@ -41,6 +41,24 @@
 //   in practice (the NET_CompareBaseAdr fall-through is real in the
 //   disassembly but doesn't manifest as host corruption on Xenia).
 //
+// r295 — weapon hook enabled:
+//
+//   Bots own their primary (getcurrentweapon() returns type99rifle_mp etc.)
+//   and drop it on death, but visually walk around empty-handed and use
+//   melee instead of firing. Diagnosis: our SV_BotUserMove_Stub stamps
+//   cmd.weapon from g_botai[clientNum].weapon, but with WEAPON_HOOK
+//   disabled that field is never written — so cmd.weapon is permanently 0
+//   ("none"). Engine pmove sees weapon=0 in every usercmd and renders
+//   them as not holding anything, even though the player slot owns the
+//   rifle.
+//
+//   Fix: re-enable CODXE_DIAG_ENABLE_WEAPON_HOOK. G_SelectWeaponIndex_Hook
+//   now captures the engine's weapon-select call for each client and
+//   keeps g_botai[].weapon in sync, so the synthesized usercmd reports
+//   the correct weapon and the engine renders/handles it accordingly.
+//   The hook itself is one assignment plus the original call-through, so
+//   it cannot affect normal players or the pregame state machine.
+//
 
 #include "pch.h"
 #include "sv_bots.h"
@@ -142,13 +160,28 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 // ---------------------------------------------------------------------------
 // G_SelectWeaponIndex detour — track per-client weapon for usercmd synthesis
 // ---------------------------------------------------------------------------
+//
+// r295: rate-limited DbgPrint so we can confirm in xenia.log that the engine
+// is calling this for each bot client at spawn / weapon-switch time. The
+// rate-limit avoids spamming the log when bots switch weapons mid-match.
+// We only print when the index actually changes for a given client.
 
 static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
-        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
+    {
+        const unsigned char prev = g_botai[clientNum].weapon;
+        const unsigned char next = static_cast<unsigned char>(iWeaponIndex);
+        g_botai[clientNum].weapon = next;
+
+        if (prev != next)
+        {
+            DbgPrint("sv_bots: G_SelectWeaponIndex clientNum=%d weaponIndex=%d (prev=%d)\n",
+                     clientNum, iWeaponIndex, static_cast<int>(prev));
+        }
+    }
 
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
@@ -304,9 +337,9 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r293 DIAGNOSTIC TOGGLES
+// r295 DIAGNOSTIC TOGGLES
 // ===========================================================================
-#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK         1
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
 
@@ -579,7 +612,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r295 weapon-hook-enabled)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
