@@ -36,94 +36,17 @@
 // r293 — vanilla bot spawn:
 //
 //   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
-//   it directly. The Path C bypass from r292 is removed.
-//
-// r295 — weapon hook enabled (superseded by r296):
-//
-//   G_SelectWeaponIndex_Hook captures weapon-select calls but the engine
-//   only calls it once per client with an offhand slot. Cached value was
-//   wrong for "current weapon".
-//
-// r296 — read engine truth directly:
-//
-//   cmd.weapon now comes from cl->gentity->s.weapon every tick. Same field
-//   GSC getcurrentweapon() reads. Bots visibly hold their primaries.
-//
-// r299 — T4 console-name aliases for botAction:
-//
-//   Bot Warfare's GSC uses different action strings on T4 vs IW3:
-//     IW3 BW: "+fire", "+ads",         "+gocrouch", "+goprone"
-//     T4  BW: "+attack", "+speed_throw", "+crouch",   "+prone"
-//
-//   The PT4 upstream and the deployed T4 mod both use T4's native console
-//   bind names (the strings the engine itself recognises in /bind), which
-//   is the correct local idiom for T4. Our Scr_BotAction was a direct port
-//   of the IW3 codxe table, which carries IW3-localized BW names. Strings
-//   that didn't match raised Scr_ParamError silently — the button bit was
-//   never set and BW never knew its call failed.
-//
-//   Net symptom: bots knife at close range (which uses "+melee", in both
-//   tables) and jump (which uses "+gostand", in both tables) but never
-//   fire, never ADS, never change stance via "+crouch"/"+prone". Fixed by
-//   adding the four T4 names as aliases that map to the same bit values
-//   as their IW3 counterparts.
-//
-
-// r298 — fs_* GSC builtins added for waypoint CSV loading:
-//
-//   On stock codxe T4 the fs_testfile / fs_fopen / fs_fclose / fs_readline /
-//   fs_writeline GSC builtins didn't exist — these are codxe IW3 additions
-//   (gsc_functions.cpp on the IW3 side). Bot Warfare's _bot_utility.gsc
-//   waypoint loader is built around them: readWpsFromFile() asks
-//   BotBuiltinFileExists("waypoints/<map>_wp.csv") first, then walks the
-//   file line-by-line via BotBuiltinReadLine. With no engine-side
-//   implementation, the deployed T4 adapter had to stub everything to
-//   false/-1/"" — meaning level.waypoints stayed empty no matter what was
-//   sitting in scriptdata/waypoints/. BW's combat AI ran (the bots would
-//   knife you up close, the engine's class loadouts were assigned), but
-//   the navigation graph was empty and _bot_internal::astar_move had
-//   nothing to drive cmd.forwardmove / cmd.rightmove against, so the bots
-//   stood still.
-//
-//   r298 lifts the IW3 implementation directly: 8 FILE* slots in a static
-//   table, <cstdio> stdio, paths joined under Config::GetModBasePath().
-//   The deployed adapter prefixes "scriptdata/" before calling these, so
-//   relative paths land at e.g. _codxe\mods\bot_warfare\scriptdata\
-//   waypoints\mp_asylum_wp.csv — exactly where the CSVs already ship.
-//
-//   No detour. Pure GSC builtin registration via sv_bots_functions[]; the
-//   Scr_GetFunction_Hook in gsc_functions.cpp routes these into us before
-//   falling through to the engine. T4 MP has no Events::OnVMShutdown hook
-//   (unlike IW3), so handles are flushed in sv_bots::~sv_bots() instead.
-//
-
-// r297 — BW drives all input, engine fallback removed:
-//
-//   The r294 "Path 2-light" walk-forward + KEY_FIRE-pulse default was a
-//   diagnostic to prove the SV_BotUserMove -> SV_ClientThink path was
-//   live. It worked too well: bots literally walked forward and fired
-//   into the air, looking like broken AI when in fact they had NO AI —
-//   our fallback was their only input. That fallback is now removed.
-//
-//   When no GSC AI is driving a bot (g_botai[].doMove == 0 and not
-//   mirroring), cmd stays at default (zero forwardmove/rightmove, zero
-//   buttons). The bot stands still until BW's _bot_script::connected
-//   threads its waypoint navigation and target acquisition and starts
-//   calling botMoveTo / botAction +fire through Scr_BotMoveTo and
-//   Scr_BotAction. Standing still is the correct idle behavior.
-//
-//   This relies on _callbacksetup.gsc r297 stamping pers["isBot"] = true
-//   for engine-spawned test clients so BW's _bot.gsc::onPlayerConnect
-//   actually recognises them and threads its AI tree.
+//   it directly, the same way CoD Jumper's GSC does. The Path C bypass
+//   from r292 is removed — it was solving a problem that didn't exist
+//   in practice (the NET_CompareBaseAdr fall-through is real in the
+//   disassembly but doesn't manifest as host corruption on Xenia).
 //
 
 #include "pch.h"
 #include "sv_bots.h"
 
 #include <cmath>
-#include <cstdio>
 #include <cstring>
-#include <string>
 
 // MSVC C4505: "unreferenced local function has been removed". Our static
 // hook bodies (G_SelectWeaponIndex_Hook, SV_BotUserMove_Stub,
@@ -172,31 +95,20 @@ struct BotAction_t
 };
 
 static const BotAction_t BotActions[] = {
-    // IW3-style names (kept so this table stays a one-to-one port of the
-    // upstream IW3 codxe BotActions[], and any IW3 GSC script ported in
-    // continues to work as-is).
-    {"gostand",     KEY_GOSTAND},
-    {"gocrouch",    KEY_CROUCH},
-    {"goprone",     KEY_PRONE},
-    {"fire",        KEY_FIRE},
-    {"melee",       KEY_MELEE},
-    {"frag",        KEY_FRAG},
-    {"smoke",       KEY_SMOKE},
-    {"reload",      KEY_RELOAD},
-    {"sprint",      KEY_SPRINT},
-    {"leanleft",    KEY_LEANLEFT},
-    {"leanright",   KEY_LEANRIGHT},
-    {"ads",         KEY_ADSMODE | KEY_ADS},
-    {"holdbreath",  KEY_HOLDBREATH},
-    {"activate",    KEY_USE},
-
-    // r299: T4 console-name aliases. Deployed T4 BW GSC (and the upstream
-    // PT4 PC source it was derived from) uses these instead of the IW3
-    // names. Same bit values as their IW3 counterparts above.
-    {"attack",      KEY_FIRE},                  // alias of "fire"
-    {"speed_throw", KEY_ADSMODE | KEY_ADS},     // alias of "ads"
-    {"crouch",      KEY_CROUCH},                // alias of "gocrouch"
-    {"prone",       KEY_PRONE},                 // alias of "goprone"
+    {"gostand",    KEY_GOSTAND},
+    {"gocrouch",   KEY_CROUCH},
+    {"goprone",    KEY_PRONE},
+    {"fire",       KEY_FIRE},
+    {"melee",      KEY_MELEE},
+    {"frag",       KEY_FRAG},
+    {"smoke",      KEY_SMOKE},
+    {"reload",     KEY_RELOAD},
+    {"sprint",     KEY_SPRINT},
+    {"leanleft",   KEY_LEANLEFT},
+    {"leanright",  KEY_LEANRIGHT},
+    {"ads",        KEY_ADSMODE | KEY_ADS},
+    {"holdbreath", KEY_HOLDBREATH},
+    {"activate",   KEY_USE},
 };
 
 // ---------------------------------------------------------------------------
@@ -228,23 +140,22 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// G_SelectWeaponIndex detour — diagnostic only
+// G_SelectWeaponIndex detour — track per-client weapon for usercmd synthesis
 // ---------------------------------------------------------------------------
-//
-// Kept installed for trace value but no longer drives anything. cmd.weapon
-// reads cl->gentity->s.weapon directly in the stub. Rate-limited DbgPrint
-// fires only when the value actually changes per client.
 
 static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
+    // r294: trace every weapon-select call so we can correlate engine activity
+    // with what GSC's getcurrentweapon() sees a moment later. We still write
+    // g_botai[].weapon as a fallback cache, but cmd.weapon now reads directly
+    // from the gentity (see SV_BotUserMove_Stub) — this hook is informational.
     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
     {
         const unsigned char prev = g_botai[clientNum].weapon;
         const unsigned char next = static_cast<unsigned char>(iWeaponIndex);
         g_botai[clientNum].weapon = next;
-
         if (prev != next)
         {
             DbgPrint("sv_bots: G_SelectWeaponIndex clientNum=%d weaponIndex=%d (prev=%d)\n",
@@ -258,18 +169,15 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // ---------------------------------------------------------------------------
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
-//
-// r297: walk-forward+fire fallback removed. When BW isn't driving the bot
-// (doMove == 0, not mirroring), cmd stays zeroed and the bot stands still.
-// BW's _bot_script::connected drives botMoveTo / botAction through GSC,
-// which writes into g_botai[] via Scr_BotMoveTo / Scr_BotAction.
 
 static Detour SV_BotUserMove_Detour;
 
-// Rate-limit the weapon trace DbgPrint so each bot reports its current
-// gentity weapon at most once per change.
-static int s_lastWeaponLogMs[MAX_CLIENTS_BW] = {0};
-static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1};
+// r296: per-client rate-limit state for the gentity-weapon trace.
+// Initialised to "no log yet" sentinel (-1 weapon value, 0 ms).
+static int s_lastWeaponLogMs[MAX_CLIENTS_BW]  = {0};
+static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                                                  -1, -1, -1, -1, -1, -1, -1, -1,
+                                                  -1, -1};
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
@@ -305,12 +213,16 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 
     // r296: read the engine's authoritative current weapon directly from
     // the gentity's entityState. This is what GSC's getcurrentweapon()
-    // returns and what the player struct considers held.
+    // returns and what the player struct considers held. Caching via
+    // G_SelectWeaponIndex_Hook turned out to be wrong for "current
+    // weapon" because the engine only calls G_SelectWeaponIndex on
+    // initial spawn for an offhand slot — bots held grenades until they
+    // fired. Reading the gentity each tick fixes it.
     const int gentityWeapon = cl->gentity->s.weapon;
     cmd.weapon = static_cast<unsigned __int8>(gentityWeapon & 0xFF);
 
-    // Trace at most once per second per client, and only when the value
-    // changes, so the log isn't flooded.
+    // Rate-limited trace so the log isn't flooded: only when the value
+    // changes per client, and at most once per 500 ms.
     if (s_lastWeaponLogVal[clientNum] != gentityWeapon &&
         (svsHeader->time - s_lastWeaponLogMs[clientNum]) > 500)
     {
@@ -320,15 +232,8 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         s_lastWeaponLogMs[clientNum]  = svsHeader->time;
     }
 
-    // Buttons come from BW (Scr_BotAction writes here). Zero until BW drives.
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
-    // r297: when BW is driving via botMoveTo, compute the local-frame move
-    // vector toward the target and stamp forwardmove/rightmove. When not
-    // driving, cmd.forwardmove and cmd.rightmove stay zero (memset above)
-    // and the bot stands still — engine renders idle, no random forward
-    // movement, no fire-into-the-air. Standing still is the correct idle
-    // state.
     if (g_botai[clientNum].doMove)
     {
         gentity_s *ent = cl->gentity;
@@ -414,9 +319,9 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r297 DIAGNOSTIC TOGGLES
+// r293 DIAGNOSTIC TOGGLES
 // ===========================================================================
-#define CODXE_DIAG_ENABLE_WEAPON_HOOK         1
+#define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
 #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
 
@@ -543,6 +448,9 @@ static void GScr_AddTestClient()
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
 
+    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
+    // the slot's userinfo during the engine's first userinfo-changed call
+    // for the new bot.
     std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
     s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
 
@@ -581,211 +489,6 @@ static void GScr_Kick()
     clientBW_t *cl = BW_GetClient(clientNum);
     if (cl && cl->header.state >= CS_CONNECTED)
         SV_DropClient(cl, reason, true);
-}
-
-// ===========================================================================
-// fs_* GSC builtins (r298)
-//
-// Ports codxe IW3's gsc_functions.cpp fs_* family to T4 MP. Used by BW's
-// scripts/mp/bots_adapter_pt4.gsc do_fs_* functions, which BW's
-// _bot_utility.gsc routes BotBuiltinFileExists / BotBuiltinFileOpen / etc.
-// through. The deployed adapter prefixes paths with "scriptdata/" so a BW
-// call for "waypoints/mp_asylum_wp.csv" lands here as
-// "scriptdata/waypoints/mp_asylum_wp.csv" and joins under
-// Config::GetModBasePath() to the on-disk mod folder.
-//
-// 8 slots is the IW3 cap; BW never holds more than one at a time, and the
-// w/p_editor menu (host-only) reaches 2. Slot 0 reserved (handle 0 == fail
-// per IW3 convention).
-// ===========================================================================
-
-namespace
-{
-
-constexpr int MAX_SCRIPT_FILEHANDLES = 8;
-
-struct ScriptFileHandle_t
-{
-    FILE *fh;
-    char  filename[256];
-};
-
-static ScriptFileHandle_t s_scriptFiles[MAX_SCRIPT_FILEHANDLES];
-
-static std::string BuildScriptFilePath(const char *filename)
-{
-    if (!filename || !*filename)
-        return std::string();
-
-    // Already absolute / virtual path? Don't second-guess it.
-    if ((filename[0] && filename[1] == ':') || std::strncmp(filename, "game:\\", 6) == 0)
-        return filename;
-
-    std::string base = Config::GetModBasePath();
-    if (base.empty())
-        return filename;
-
-    std::string rel(filename);
-    for (size_t i = 0; i < rel.size(); ++i)
-        if (rel[i] == '/')
-            rel[i] = '\\';
-
-    return base + "\\" + rel;
-}
-
-static void CloseAllScriptFiles()
-{
-    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
-    {
-        if (s_scriptFiles[i].fh)
-        {
-            std::fclose(s_scriptFiles[i].fh);
-            std::memset(&s_scriptFiles[i], 0, sizeof(ScriptFileHandle_t));
-        }
-    }
-}
-
-} // anonymous namespace
-
-static void GScr_FS_TestFile()
-{
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error_BW("Usage: fs_testfile(<filename>)", SCRIPTINSTANCE_SERVER);
-
-    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
-    std::string fullpath = BuildScriptFilePath(filename);
-
-    FILE *f = std::fopen(fullpath.c_str(), "r");
-    if (f)
-    {
-        std::fclose(f);
-        Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
-    }
-    else
-    {
-        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-    }
-}
-
-static void GScr_FS_FOpen()
-{
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
-        Scr_Error_BW("Usage: fs_fopen(<filename>, <mode>)", SCRIPTINSTANCE_SERVER);
-
-    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
-    const char *modeStr  = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
-    const char *fmode;
-
-    if (modeStr && _stricmp(modeStr, "read") == 0)
-        fmode = "rt";
-    else if (modeStr && _stricmp(modeStr, "write") == 0)
-        fmode = "wt";
-    else if (modeStr && _stricmp(modeStr, "append") == 0)
-        fmode = "at";
-    else
-    {
-        Scr_Error_BW("fs_fopen: invalid mode. Valid modes are: read, write, append",
-                     SCRIPTINSTANCE_SERVER);
-        return;
-    }
-
-    std::string fullpath = BuildScriptFilePath(filename);
-
-    // Write/append: don't bother creating parent directories — codxe T4's
-    // filesystem helpers aren't exposed here and BW only ever writes into
-    // pre-existing scriptdata/ (which is guaranteed to exist because GSC
-    // loaded from it). If the host wants a new folder they make it manually.
-
-    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
-    {
-        if (!s_scriptFiles[i].fh)
-        {
-            s_scriptFiles[i].fh = std::fopen(fullpath.c_str(), fmode);
-            if (!s_scriptFiles[i].fh)
-            {
-                Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-                return;
-            }
-            std::strncpy(s_scriptFiles[i].filename, filename ? filename : "",
-                         sizeof(s_scriptFiles[i].filename) - 1);
-            s_scriptFiles[i].filename[sizeof(s_scriptFiles[i].filename) - 1] = '\0';
-            Scr_AddInt_BW(i + 1, SCRIPTINSTANCE_SERVER);
-            return;
-        }
-    }
-
-    Scr_Error_BW("fs_fopen: exceeded maximum open file handles", SCRIPTINSTANCE_SERVER);
-}
-
-static void GScr_FS_FClose()
-{
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error_BW("Usage: fs_fclose(<filehandle>)", SCRIPTINSTANCE_SERVER);
-
-    const int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error_BW("fs_fclose: invalid filehandle", SCRIPTINSTANCE_SERVER);
-
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (slot.fh)
-    {
-        std::fclose(slot.fh);
-        std::memset(&slot, 0, sizeof(ScriptFileHandle_t));
-    }
-}
-
-static void GScr_FS_ReadLine()
-{
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error_BW("Usage: fs_readline(<filehandle>)", SCRIPTINSTANCE_SERVER);
-
-    const int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error_BW("fs_readline: invalid filehandle", SCRIPTINSTANCE_SERVER);
-
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (!slot.fh)
-        Scr_Error_BW("fs_readline: filehandle is not open", SCRIPTINSTANCE_SERVER);
-
-    char buffer[8192];
-    if (!std::fgets(buffer, sizeof(buffer), slot.fh))
-    {
-        Scr_AddUndefined_BW(SCRIPTINSTANCE_SERVER);
-        return;
-    }
-
-    // Strip trailing CR/LF in either order (CRLF, LF, or bare CR).
-    int len = static_cast<int>(std::strlen(buffer));
-    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r'))
-    {
-        buffer[--len] = '\0';
-    }
-
-    Scr_AddString(buffer, SCRIPTINSTANCE_SERVER);
-}
-
-static void GScr_FS_WriteLine()
-{
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
-        Scr_Error_BW("Usage: fs_writeline(<filehandle>, <data>)", SCRIPTINSTANCE_SERVER);
-
-    const int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error_BW("fs_writeline: invalid filehandle", SCRIPTINSTANCE_SERVER);
-
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (!slot.fh)
-        Scr_Error_BW("fs_writeline: filehandle is not open", SCRIPTINSTANCE_SERVER);
-
-    const char *data = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
-    if (!data) data = "";
-    if (std::fprintf(slot.fh, "%s\n", data) < 0)
-    {
-        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-        return;
-    }
-
-    Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -835,24 +538,12 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r294: addtestclient falls through to the engine native builtin.
-    // GScr_AddTestClient is incomplete — engine native drives the client
-    // through ClientBegin, raises "begin", completes Callback_PlayerConnect,
-    // which is what gets bots onto teams with ranks. The function body is
-    // kept compiled (warning 4505 disabled at file scope) so the revert is
-    // one line to undo.
-    // {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r294: "addtestclient" deliberately omitted — BW_LookupFunction
+    // routes it to a fall-through so the engine's stock GScr_AddTestClient
+    // handles bot spawn. Our GScr_AddTestClient is kept in this file
+    // (further up) only as reference; nothing dispatches to it. See
+    // BW_LookupFunction above for the routing.
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
-
-    // r298: file I/O for waypoint CSVs (and the in-game wp_editor save path).
-    // Paths land under Config::GetModBasePath() after the adapter prefixes
-    // "scriptdata/" — see do_fs_* in scripts/mp/bots_adapter_pt4.gsc.
-    {"fs_testfile",   reinterpret_cast<BuiltinFunction>(GScr_FS_TestFile)},
-    {"fs_fopen",      reinterpret_cast<BuiltinFunction>(GScr_FS_FOpen)},
-    {"fs_fclose",     reinterpret_cast<BuiltinFunction>(GScr_FS_FClose)},
-    {"fs_readline",   reinterpret_cast<BuiltinFunction>(GScr_FS_ReadLine)},
-    {"fs_writeline",  reinterpret_cast<BuiltinFunction>(GScr_FS_WriteLine)},
-
     {nullptr, nullptr},
 };
 
@@ -874,10 +565,28 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 {
     if (!name)
         return nullptr;
+
+    // r294: route "addtestclient" to engine native. Our GScr_AddTestClient
+    // doesn't drive ClientBegin, so test clients connected but never picked
+    // a class — they stayed in spectators while the engine's stock spawn
+    // path runs the full ClientBegin chain. Falling through here lets the
+    // stock GScr_AddTestClient handle the call. The wider effect: bots
+    // spawn with engine-assigned classes, ranks, and primaries.
+    if (_stricmp(name, "addtestclient") == 0)
+    {
+        DbgPrint("sv_bots: [HOOK] 'addtestclient' -> fall through to engine\n");
+        return nullptr;
+    }
+
     for (const auto *f = sv_bots_functions; f->name != nullptr; ++f)
     {
         if (_stricmp(name, f->name) == 0)
+        {
+            // Heartbeat trace: first GSC use of any BW function tells us
+            // the dispatch chain is alive. Cheap; one log line per name.
+            DbgPrint("sv_bots: [HOOK] '%s' -> BW port handler\n", name);
             return f->handler;
+        }
     }
     return nullptr;
 }
@@ -900,7 +609,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r299 t4-actions)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r296 gentity-weapon-readback)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
@@ -908,12 +617,6 @@ sv_bots::sv_bots()
 
     CleanBotArray();
     s_pendingBotName[0] = '\0';
-
-    for (int i = 0; i < MAX_CLIENTS_BW; ++i)
-    {
-        s_lastWeaponLogMs[i]  = 0;
-        s_lastWeaponLogVal[i] = -1;
-    }
 
 #if CODXE_DIAG_ENABLE_WEAPON_HOOK
     G_SelectWeaponIndex_Detour = Detour(G_SelectWeaponIndex, G_SelectWeaponIndex_Hook);
@@ -957,12 +660,6 @@ sv_bots::~sv_bots()
 #endif
 
     CleanBotArray();
-
-    // r298: flush any GSC-opened file handles. T4 MP has no
-    // Events::OnVMShutdown subsystem (unlike IW3), so this runs only on
-    // plugin teardown rather than per-VM-restart. Acceptable: handles
-    // are bounded at 8 and BW always pairs fopen/fclose in load_waypoints.
-    CloseAllScriptFiles();
 }
 
 } // namespace mp
