@@ -36,29 +36,37 @@
 // r293 — vanilla bot spawn:
 //
 //   CoD Jumper proves vanilla SV_AddTestClient() works on Xenia. We call
-//   it directly, the same way CoD Jumper's GSC does. The Path C bypass
-//   from r292 is removed — it was solving a problem that didn't exist
-//   in practice (the NET_CompareBaseAdr fall-through is real in the
-//   disassembly but doesn't manifest as host corruption on Xenia).
+//   it directly. The Path C bypass from r292 is removed.
 //
-// r295 — weapon hook enabled (superseded by r296 below):
+// r295 — weapon hook enabled (superseded by r296):
 //
-//   Enabling G_SelectWeaponIndex_Hook captured weapon-select calls for
-//   each client at connect time, but the engine ONLY ever called it once
-//   per client with weaponIndex=35 (an offhand/grenade slot) and never
-//   again. Cached g_botai[].weapon therefore reports an offhand, not the
-//   class primary that the player slot actually holds. In-game result:
-//   bots visibly hold a grenade / gas / equipment instead of their rifle.
+//   G_SelectWeaponIndex_Hook captures weapon-select calls but the engine
+//   only calls it once per client with an offhand slot. Cached value was
+//   wrong for "current weapon".
 //
 // r296 — read engine truth directly:
 //
-//   getcurrentweapon() in GSC returned the correct class primary
-//   (type99rifle_mp etc.) because GSC reads cl->gentity->s.weapon directly,
-//   bypassing whatever hook system the engine uses. We do the same:
-//   SV_BotUserMove_Stub now stamps cmd.weapon from cl->gentity->s.weapon
-//   on every tick, not from the stale hook-captured cache. The hook is
-//   kept enabled purely for diagnostic logging; the bot driver no longer
-//   depends on its value.
+//   cmd.weapon now comes from cl->gentity->s.weapon every tick. Same field
+//   GSC getcurrentweapon() reads. Bots visibly hold their primaries.
+//
+// r297 — BW drives all input, engine fallback removed:
+//
+//   The r294 "Path 2-light" walk-forward + KEY_FIRE-pulse default was a
+//   diagnostic to prove the SV_BotUserMove -> SV_ClientThink path was
+//   live. It worked too well: bots literally walked forward and fired
+//   into the air, looking like broken AI when in fact they had NO AI —
+//   our fallback was their only input. That fallback is now removed.
+//
+//   When no GSC AI is driving a bot (g_botai[].doMove == 0 and not
+//   mirroring), cmd stays at default (zero forwardmove/rightmove, zero
+//   buttons). The bot stands still until BW's _bot_script::connected
+//   threads its waypoint navigation and target acquisition and starts
+//   calling botMoveTo / botAction +fire through Scr_BotMoveTo and
+//   Scr_BotAction. Standing still is the correct idle behavior.
+//
+//   This relies on _callbacksetup.gsc r297 stamping pers["isBot"] = true
+//   for engine-spawned test clients so BW's _bot.gsc::onPlayerConnect
+//   actually recognises them and threads its AI tree.
 //
 
 #include "pch.h"
@@ -159,13 +167,12 @@ static gentity_s *BW_RequirePlayerEntity(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// G_SelectWeaponIndex detour — diagnostic only (r296)
+// G_SelectWeaponIndex detour — diagnostic only
 // ---------------------------------------------------------------------------
 //
-// We still install this hook so its DbgPrint helps us trace weapon-select
-// events from the engine, but the bot driver no longer depends on the
-// cached value (see r296 note in header). Kept rate-limited so the log
-// doesn't get spammed by per-tick re-selects.
+// Kept installed for trace value but no longer drives anything. cmd.weapon
+// reads cl->gentity->s.weapon directly in the stub. Rate-limited DbgPrint
+// fires only when the value actually changes per client.
 
 static Detour G_SelectWeaponIndex_Detour;
 
@@ -191,16 +198,15 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
 //
-// r296: cmd.weapon now comes from cl->gentity->s.weapon (engine truth) on
-// every tick, NOT from the stale g_botai[].weapon cache. The cache was
-// only populated by G_SelectWeaponIndex_Hook firing once at connect with
-// weaponIndex=35 (an offhand), which made bots visibly hold a grenade
-// instead of their assigned class primary.
+// r297: walk-forward+fire fallback removed. When BW isn't driving the bot
+// (doMove == 0, not mirroring), cmd stays zeroed and the bot stands still.
+// BW's _bot_script::connected drives botMoveTo / botAction through GSC,
+// which writes into g_botai[] via Scr_BotMoveTo / Scr_BotAction.
 
 static Detour SV_BotUserMove_Detour;
 
 // Rate-limit the weapon trace DbgPrint so each bot reports its current
-// gentity weapon at most once per second (svsHeader->time is in ms).
+// gentity weapon at most once per change.
 static int s_lastWeaponLogMs[MAX_CLIENTS_BW] = {0};
 static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1};
 
@@ -253,33 +259,15 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         s_lastWeaponLogMs[clientNum]  = svsHeader->time;
     }
 
+    // Buttons come from BW (Scr_BotAction writes here). Zero until BW drives.
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
-    // ----------------------------------------------------------------------
-    // r294 Path 2-light: default walk-forward + periodic fire.
-    //
-    // When no GSC AI is driving this bot (no botMoveTo active, not mirroring),
-    // synthesise a constant forward usercmd so the engine-spawned bot visibly
-    // moves the moment it spawns. This is diagnostic: it proves the entire
-    // SV_BotUserMove -> SV_ClientThink path is wired up, without needing
-    // waypoint AI on top. Once BW threads start driving g_botai[] for real,
-    // doMove will be 1 and this default is bypassed.
-    //
-    // Fire is pulsed in a duty cycle (~20%) so we can see the bots are alive
-    // and so the engine has a reason to call into weapon/animation paths.
-    // T4 button bits: KEY_FIRE = 0x1 (verified in mp/structs.h).
-    // ----------------------------------------------------------------------
-    if (!g_botai[clientNum].doMove && !g_botai[clientNum].is_mirroring_client)
-    {
-        cmd.forwardmove = 100;
-        cmd.rightmove   = 0;
-
-        // ~20% duty cycle at 1s period: fire for ~200ms every second.
-        const int phase = (svsHeader->time / 100) % 10;
-        if (phase < 2)
-            cmd.buttons = static_cast<button_mask>(static_cast<int>(cmd.buttons) | KEY_FIRE);
-    }
-
+    // r297: when BW is driving via botMoveTo, compute the local-frame move
+    // vector toward the target and stamp forwardmove/rightmove. When not
+    // driving, cmd.forwardmove and cmd.rightmove stay zero (memset above)
+    // and the bot stands still — engine renders idle, no random forward
+    // movement, no fire-into-the-air. Standing still is the correct idle
+    // state.
     if (g_botai[clientNum].doMove)
     {
         gentity_s *ent = cl->gentity;
@@ -365,7 +353,7 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
 }
 
 // ===========================================================================
-// r296 DIAGNOSTIC TOGGLES
+// r297 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         1
 #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
@@ -494,9 +482,6 @@ static void GScr_AddTestClient()
 
     DbgPrint("sv_bots: [ADDTESTCLIENT] name='%s'\n", name);
 
-    // Stash the requested name. SV_UserinfoChanged_Hook will stamp it onto
-    // the slot's userinfo during the engine's first userinfo-changed call
-    // for the new bot.
     std::strncpy(s_pendingBotName, name, sizeof(s_pendingBotName) - 1);
     s_pendingBotName[sizeof(s_pendingBotName) - 1] = '\0';
 
@@ -587,10 +572,9 @@ static struct
     // r294: addtestclient falls through to the engine native builtin.
     // GScr_AddTestClient is incomplete — engine native drives the client
     // through ClientBegin, raises "begin", completes Callback_PlayerConnect,
-    // which is what gets bots onto teams with ranks (verified working
-    // state: Larry0-3 in a War match per session handoff screenshot).
-    // The function body is kept compiled (warning 4505 already disabled at
-    // file scope) so the revert is one line to undo.
+    // which is what gets bots onto teams with ranks. The function body is
+    // kept compiled (warning 4505 disabled at file scope) so the revert is
+    // one line to undo.
     // {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
@@ -640,7 +624,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r296 gentity-weapon-readback)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r297 bw-drives-input)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
