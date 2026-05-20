@@ -56,15 +56,6 @@
 // argument, so it complains. /WX promotes this to an error.
 #pragma warning(disable: 4505)
 
-// Engine Com_Printf @ 0x82271C60. Full detourable prologue (the deeper
-// sink 0x82271AE8 is an 8-byte __savegprlr stub and cannot be detoured).
-// r3 = channel, r4 = format string. Every console line — including the
-// GSC compiler's "unknown function" error — passes through here.
-// The hook logs the format string raw; for engine error messages the
-// text is already substituted into the format string by upstream va().
-static void* const CODXE_COM_PRINTF_ADDR = reinterpret_cast<void*>(0x82271C60);
-typedef void (*Com_Printf_t)(int, const char*, ...);
-
 namespace t4
 {
 namespace mp
@@ -203,6 +194,31 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
+    // ----------------------------------------------------------------------
+    // r294 Path 2-light: default walk-forward + periodic fire.
+    //
+    // When no GSC AI is driving this bot (no botMoveTo active, not mirroring),
+    // synthesise a constant forward usercmd so the engine-spawned bot visibly
+    // moves the moment it spawns. This is diagnostic: it proves the entire
+    // SV_BotUserMove -> SV_ClientThink path is wired up, without needing
+    // waypoint AI on top. Once BW threads start driving g_botai[] for real,
+    // doMove will be 1 and this default is bypassed.
+    //
+    // Fire is pulsed in a duty cycle (~20%) so we can see the bots are alive
+    // and so the engine has a reason to call into weapon/animation paths.
+    // T4 button bits: KEY_FIRE = 0x1 (verified in mp/structs.h).
+    // ----------------------------------------------------------------------
+    if (!g_botai[clientNum].doMove && !g_botai[clientNum].is_mirroring_client)
+    {
+        cmd.forwardmove = 100;
+        cmd.rightmove   = 0;
+
+        // ~20% duty cycle at 1s period: fire for ~200ms every second.
+        const int phase = (svsHeader->time / 100) % 10;
+        if (phase < 2)
+            cmd.buttons = static_cast<button_mask>(static_cast<int>(cmd.buttons) | KEY_FIRE);
+    }
+
     if (g_botai[clientNum].doMove)
     {
         gentity_s *ent = cl->gentity;
@@ -287,49 +303,12 @@ static void SV_UserinfoChanged_Hook(clientBW_t *cl)
     SV_UserinfoChanged_Detour.GetOriginal<SV_UserinfoChanged_t>()(cl);
 }
 
-// ---------------------------------------------------------------------------
-// Com_Printf detour — mirror ALL engine console output into xenia.log.
-//
-// Diagnostic. The GSC compiler writes "unknown function" / "bad syntax" to
-// the engine console; Xbox 360 has no console, so this copies every line
-// into DbgPrint. Leave enabled until the GSC layer compiles clean.
-//
-// Targets 0x82271C60 (full prologue, detourable). It is varargs; the hook
-// reads only the format string (r4) — sufficient for error messages, which
-// arrive pre-substituted. The original is varargs too: we forward the two
-// named args; r5-r10 (the varargs home) are preserved by the trampoline's
-// copy of the original prologue (std r5..r10), so the original still sees
-// its variadic arguments intact.
-// ---------------------------------------------------------------------------
-
-static Detour Com_Printf_Detour;
-
-static void Com_Printf_Hook(int channel, const char* fmt, int a2, int a3,
-                            int a4, int a5, int a6)
-{
-    if (fmt && fmt[0])
-    {
-        char buf[1024];
-        size_t n = 0;
-        for (; fmt[n] && n < sizeof(buf) - 1; ++n)
-            buf[n] = fmt[n];
-        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-            --n;
-        buf[n] = '\0';
-
-        if (n > 0)
-            DbgPrint("sv_bots: [CON] %s\n", buf);
-    }
-
-    Com_Printf_Detour.GetOriginal<Com_Printf_t>()(channel, fmt, a2, a3, a4, a5, a6);
-}
-
 // ===========================================================================
 // r293 DIAGNOSTIC TOGGLES
 // ===========================================================================
 #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-#define CODXE_DIAG_ENABLE_USERINFO_HOOK       0   // r344: detours OFF — isolate detour mechanism
-#define CODXE_DIAG_ENABLE_BOTUSERMOVE         0   // r344: detours OFF — isolate detour mechanism
+#define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
+#define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
 
 // ---------------------------------------------------------------------------
 // GSC entity methods
@@ -536,38 +515,6 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
-// GSC entity method - istestclient()
-// ---------------------------------------------------------------------------
-// Returns 1 if the client is engine-spawned test client (NA_BOT), else 0.
-// This mirrors the NA_BOT check PlayerCmd_GetGuid already uses successfully.
-// Required because BW _bot.gsc::connected() gates AI thread attachment on
-// is_bot() -> do_isbot() -> self.pers["isBot"], which is only set inside
-// BW's own add_bot() path. Bots spawned by the engine (bots_manage_add /
-// stock test-client logic) never run add_bot() and so never get the flag,
-// so BW discards them as humans. With this method, the GSC adapter can ask
-// the engine directly and tag them on connect.
-static void PlayerCmd_IsTestClient(scr_entref_t entref)
-{
-    if (entref.classnum != 0)
-        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
-    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
-        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
-    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
-    {
-        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-        return;
-    }
-    clientBW_t *cl = BW_GetClient(entref.entnum);
-    if (!cl)
-    {
-        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
-        return;
-    }
-    const int isBot = (cl->header.netchan.remoteAddress.type == NA_BOT) ? 1 : 0;
-    Scr_AddInt_BW(isBot, SCRIPTINSTANCE_SERVER);
-}
-
-// ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
 
@@ -576,7 +523,14 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r294: addtestclient falls through to the engine native builtin.
+    // GScr_AddTestClient is incomplete — engine native drives the client
+    // through ClientBegin, raises "begin", completes Callback_PlayerConnect,
+    // which is what gets bots onto teams with ranks (verified working
+    // state: Larry0-3 in a War match per session handoff screenshot).
+    // The function body is kept compiled (warning 4505 already disabled at
+    // file scope) so the revert is one line to undo.
+    // {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -592,7 +546,6 @@ static struct
     {"botstop",           Scr_BotStop},
     {"getentitynumber",   PlayerCmd_GetEntityNumber},
     {"getguid",           PlayerCmd_GetGuid},
-    {"istestclient",      PlayerCmd_IsTestClient},
     {nullptr, nullptr},
 };
 
@@ -627,8 +580,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 sv_bots::sv_bots()
 {
     DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
-    DbgPrint("sv_bots: r344 DETOURS-OFF build (full BW surface; zero engine detours)\n");
-    DbgPrint("sv_bots: [DIAG] r344 | sv_bots=DETOURS-OFF | weapon=%d userinfo=%d botmove=%d\n",
+    DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
              CODXE_DIAG_ENABLE_BOTUSERMOVE);
@@ -660,10 +612,6 @@ sv_bots::sv_bots()
     DbgPrint("sv_bots: SV_UserinfoChanged detour SKIPPED (diagnostic)\n");
 #endif
 
-    Com_Printf_Detour = Detour(CODXE_COM_PRINTF_ADDR, Com_Printf_Hook);
-    Com_Printf_Detour.Install();
-    DbgPrint("sv_bots: Com_Printf console-mirror detour INSTALLED @ 0x82271C60\n");
-
     // SV_CalcPings deliberately NOT detoured — see file header.
 }
 
@@ -680,8 +628,6 @@ sv_bots::~sv_bots()
 #if CODXE_DIAG_ENABLE_USERINFO_HOOK
     SV_UserinfoChanged_Detour.Remove();
 #endif
-
-    Com_Printf_Detour.Remove();
 
     CleanBotArray();
 }
