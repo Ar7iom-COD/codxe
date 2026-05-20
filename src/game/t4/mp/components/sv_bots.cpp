@@ -418,10 +418,6 @@ static void Scr_BotMirror(scr_entref_t entref)
     g_botai[entref.entnum].is_mirroring_client = true;
     g_botai[entref.entnum].mirror_client_num   = targetEntNum;
 }
-#if 0  // r346 Option A: GScr_AddTestClient retired - engine native
-       // addtestclient builtin is used instead. Keeping the body for
-       // reference; if Option A fails, restore the registration in
-       // sv_bots_functions[] and flip this guard back to 1.
 
 // ---------------------------------------------------------------------------
 // GSC global function — addtestclient(<name>)
@@ -479,7 +475,6 @@ static void GScr_AddTestClient()
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
-#endif  // GScr_AddTestClient
 
 static void GScr_Kick()
 {
@@ -541,6 +536,38 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
 }
 
 // ---------------------------------------------------------------------------
+// GSC entity method - istestclient()
+// ---------------------------------------------------------------------------
+// Returns 1 if the client is engine-spawned test client (NA_BOT), else 0.
+// This mirrors the NA_BOT check PlayerCmd_GetGuid already uses successfully.
+// Required because BW _bot.gsc::connected() gates AI thread attachment on
+// is_bot() -> do_isbot() -> self.pers["isBot"], which is only set inside
+// BW's own add_bot() path. Bots spawned by the engine (bots_manage_add /
+// stock test-client logic) never run add_bot() and so never get the flag,
+// so BW discards them as humans. With this method, the GSC adapter can ask
+// the engine directly and tag them on connect.
+static void PlayerCmd_IsTestClient(scr_entref_t entref)
+{
+    if (entref.classnum != 0)
+        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
+    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+    clientBW_t *cl = BW_GetClient(entref.entnum);
+    if (!cl)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+    const int isBot = (cl->header.netchan.remoteAddress.type == NA_BOT) ? 1 : 0;
+    Scr_AddInt_BW(isBot, SCRIPTINSTANCE_SERVER);
+}
+
+// ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
 
@@ -549,13 +576,7 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r346 Option A: stop intercepting addtestclient. Let the engine
-    // native builtin handle the GSC call. Stock codxe r261 spawned bots
-    // fine via that path; our GScr_AddTestClient apparently missed the
-    // post-SV_AddTestClient world-entry step (e.g. ClientBegin) that the
-    // native builtin performs. GScr_AddTestClient kept as dead code for
-    // now; can be removed once Option A is confirmed working.
-    // {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -571,6 +592,7 @@ static struct
     {"botstop",           Scr_BotStop},
     {"getentitynumber",   PlayerCmd_GetEntityNumber},
     {"getguid",           PlayerCmd_GetGuid},
+    {"istestclient",      PlayerCmd_IsTestClient},
     {nullptr, nullptr},
 };
 
