@@ -190,11 +190,15 @@ static Scr_AddFloat_BW_t Scr_AddFloat_BW =
 // pointer to 3 floats; the engine interns/refcounts the vector and stores
 // the resulting handle in the slot.
 //   Discovered via Ghidra signature match against tu7_default_mp.xex: body
-//   uses `li r9, 0x4` (VAR_VECTOR), passes the vector pointer to helper
-//   0x8233CD18 (vector intern/dedupe), then stores returned handle.
+//   at 0x82345B70 uses `li r9, 0x4` (VAR_VECTOR), passes the vector pointer
+//   to helper 0x8233CD18 (vector intern/dedupe), then stores returned
+//   handle. The entry-point (mfspr/bl __savegprlr prologue) is at
+//   0x82345B68 — calling the body directly at 0x82345B70 corrupts r30/r31
+//   because __savegprlr never ran to save them, and the matching
+//   __restgprlr at exit pops garbage.
 typedef void (*Scr_AddVector_BW_t)(const float *vec, scriptInstance_t inst);
 static Scr_AddVector_BW_t Scr_AddVector_BW =
-    reinterpret_cast<Scr_AddVector_BW_t>(0x82345B70);
+    reinterpret_cast<Scr_AddVector_BW_t>(0x82345B68);
 
 // Array primitives. Scr_MakeArray opens a fresh empty array on the GSC
 // stack; subsequent Scr_AddArray takes the last pushed value and appends it
