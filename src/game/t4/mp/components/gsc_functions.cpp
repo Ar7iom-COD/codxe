@@ -262,6 +262,212 @@ static void GScr_FS_ReadAllLines()
     DbgPrint("sv_bots: fs_readall_lines loaded %d lines from %s\n", lineCount, filename);
 }
 
+// ===========================================================================
+// fs_load_waypoints: parse Bot Warfare waypoint CSV entirely in C++.
+//
+// Why: even with fs_readall_lines collapsing the file-read loop to one host
+// call, BW's parseTokensIntoWaypoint runs strtok + float_old + int per line
+// — ~15-20 GSC builtin calls per waypoint × 200-300 waypoints = 3000-6000
+// cross-boundary calls. Xenia's stackpoints pool (65536 lifetime) cannot
+// keep up with tight GSC loops that call builtins each iteration.
+//
+// fs_load_waypoints reads + tokenizes + pushes the entire result as one
+// GSC array. Each element is itself a 5-slot array describing one waypoint.
+// GSC then unpacks with one spawnstruct per waypoint and pure array reads
+// (no host calls inside the read).
+//
+// Returns a GSC array of waypoint records. Each record is a 5-element array:
+//
+//   [0] origin     vec3   (always present)
+//   [1] children   array of ints (may be empty, never undefined)
+//   [2] type       string
+//   [3] angles     vec3   (zero-vector if not present in CSV)
+//   [4] has_angles int    (1 if angles were in the CSV, else 0)
+//
+// CSV row format expected (matches BW writeWpsToFile):
+//   "<x> <y> <z>,<c1> <c2> ...,<type>[,<pitch> <yaw> <roll>]"
+//   First line of file = waypoint count (advisory only; loop terminates on EOF).
+//
+// Returns `undefined` if the file cannot be opened.
+// ===========================================================================
+
+// Parse up to `limit` space-separated floats from src into out. Returns
+// the number of values actually parsed.
+static int ParseFloats(const char *src, float *out, int limit)
+{
+    int count = 0;
+    if (!src) return 0;
+
+    const char *p = src;
+    while (*p && count < limit)
+    {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+
+        char scratch[32];
+        int  len = static_cast<int>(p - start);
+        if (len <= 0 || len >= static_cast<int>(sizeof(scratch))) continue;
+        std::memcpy(scratch, start, len);
+        scratch[len] = '\0';
+        out[count++] = static_cast<float>(std::atof(scratch));
+    }
+    return count;
+}
+
+// Parse up to `limit` space-separated ints from src into out. Same shape.
+static int ParseInts(const char *src, int *out, int limit)
+{
+    int count = 0;
+    if (!src) return 0;
+
+    const char *p = src;
+    while (*p && count < limit)
+    {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+
+        char scratch[16];
+        int  len = static_cast<int>(p - start);
+        if (len <= 0 || len >= static_cast<int>(sizeof(scratch))) continue;
+        std::memcpy(scratch, start, len);
+        scratch[len] = '\0';
+        out[count++] = std::atoi(scratch);
+    }
+    return count;
+}
+
+// Split a comma-delimited line into up to `limit` field pointers in `out`.
+// MUTATES line in place (writes nulls over the commas). Returns field count.
+static int SplitOnComma(char *line, char **out, int limit)
+{
+    int  count = 0;
+    char *p    = line;
+    if (!*p) return 0;
+
+    out[count++] = p;
+    while (*p && count < limit)
+    {
+        if (*p == ',')
+        {
+            *p = '\0';
+            ++p;
+            if (count < limit)
+                out[count++] = p;
+        }
+        else
+        {
+            ++p;
+        }
+    }
+    return count;
+}
+
+static void GScr_FS_LoadWaypoints()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_load_waypoints(<filename>)", SCRIPTINSTANCE_SERVER);
+
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    std::string fullpath = BuildScriptFilePath(filename);
+
+    FILE *f = std::fopen(fullpath.c_str(), "rt");
+    if (!f)
+    {
+        Scr_AddUndefined_BW(SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    // First line: waypoint count. Advisory only — we terminate on EOF so a
+    // wrong header doesn't truncate the data.
+    char headerBuf[64];
+    int  declaredCount = 0;
+    if (std::fgets(headerBuf, sizeof(headerBuf), f))
+        declaredCount = std::atoi(headerBuf);
+
+    // Open outer GSC array.
+    Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+
+    char buffer[MAX_LINE_LENGTH];
+    int  builtCount = 0;
+    while (std::fgets(buffer, sizeof(buffer), f))
+    {
+        // Strip trailing newline so the last field doesn't carry it.
+        int len = static_cast<int>(std::strlen(buffer));
+        if (len > 0 && buffer[len - 1] == '\n') { buffer[--len] = '\0'; }
+        if (len > 0 && buffer[len - 1] == '\r') { buffer[--len] = '\0'; }
+        if (len == 0) continue;
+
+        // Split into up to 4 comma fields: origin, children, type, angles.
+        char *fields[4] = {0};
+        int   fieldCount = SplitOnComma(buffer, fields, 4);
+        if (fieldCount < 3) continue; // need at least origin + children + type
+
+        // [0] origin vec3.
+        float origin[3] = {0, 0, 0};
+        ParseFloats(fields[0], origin, 3);
+
+        // [1] children — space-separated ints, capped at 32. BW waypoints
+        // typically have 2-8 children but be generous.
+        int childIds[32];
+        int childCount = ParseInts(fields[1], childIds, 32);
+
+        // [2] type string.
+        const char *type = fields[2];
+
+        // [3] angles (optional).
+        float angles[3] = {0, 0, 0};
+        int   hasAngles = 0;
+        if (fieldCount >= 4 && fields[3] && fields[3][0])
+        {
+            if (ParseFloats(fields[3], angles, 3) >= 3)
+                hasAngles = 1;
+        }
+
+        // Open inner array for this waypoint record.
+        Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [0] origin vec3.
+        Scr_AddVector_BW(origin, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [1] children — nested array of ints.
+        Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+        for (int c = 0; c < childCount; ++c)
+        {
+            Scr_AddInt_BW(childIds[c], SCRIPTINSTANCE_SERVER);
+            Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+        }
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER); // append children array to wp record
+
+        // [2] type string.
+        Scr_AddString(type ? type : "crouch", SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [3] angles vec3 (zero if absent).
+        Scr_AddVector_BW(angles, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [4] has_angles flag.
+        Scr_AddInt_BW(hasAngles, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // Append this inner array to the outer result.
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+        ++builtCount;
+    }
+
+    std::fclose(f);
+
+    DbgPrint("sv_bots: fs_load_waypoints built %d waypoints (declared %d) from %s\n",
+             builtCount, declaredCount, filename);
+}
+
 static void GScr_FS_WriteLine()
 {
     if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
@@ -326,6 +532,7 @@ static struct
     {"fs_fclose",                           GScr_FS_FClose},
     {"fs_readline",                         GScr_FS_ReadLine},
     {"fs_readall_lines",                    GScr_FS_ReadAllLines},
+    {"fs_load_waypoints",                   GScr_FS_LoadWaypoints},
     {"fs_writeline",                        GScr_FS_WriteLine},
     {nullptr, nullptr} // Terminator
 };
