@@ -177,6 +177,36 @@ typedef void (*Scr_AddUndefined_BW_t)(scriptInstance_t inst);
 static Scr_AddUndefined_BW_t Scr_AddUndefined_BW =
     reinterpret_cast<Scr_AddUndefined_BW_t>(0x82345808);
 
+// Float-push primitive. Pushes a VAR_FLOAT (type tag 5).
+//   Discovered via Ghidra signature match against tu7_default_mp.xex:
+//   identical body shape to Scr_AddInt (0x82345668) — fmr f31,f1 saves the
+//   float arg, then `li r9, 0x5` tags VAR_FLOAT, then `stfs f31, 0x0(r5)`
+//   writes 4 bytes. Sibling slot in the Scr_Add* family.
+typedef void (*Scr_AddFloat_BW_t)(float value, scriptInstance_t inst);
+static Scr_AddFloat_BW_t Scr_AddFloat_BW =
+    reinterpret_cast<Scr_AddFloat_BW_t>(0x823456F0);
+
+// Vector-push primitive. Pushes a VAR_VECTOR (type tag 4). Caller passes a
+// pointer to 3 floats; the engine interns/refcounts the vector and stores
+// the resulting handle in the slot.
+//   Discovered via Ghidra signature match against tu7_default_mp.xex: body
+//   uses `li r9, 0x4` (VAR_VECTOR), passes the vector pointer to helper
+//   0x8233CD18 (vector intern/dedupe), then stores returned handle.
+typedef void (*Scr_AddVector_BW_t)(const float *vec, scriptInstance_t inst);
+static Scr_AddVector_BW_t Scr_AddVector_BW =
+    reinterpret_cast<Scr_AddVector_BW_t>(0x82345B70);
+
+// Array primitives. Scr_MakeArray opens a fresh empty array on the GSC
+// stack; subsequent Scr_AddArray takes the last pushed value and appends it
+// as the next array element.
+typedef void (*Scr_MakeArray_BW_t)(scriptInstance_t inst);
+static Scr_MakeArray_BW_t Scr_MakeArray_BW =
+    reinterpret_cast<Scr_MakeArray_BW_t>(0x82345BF8);
+
+typedef void (*Scr_AddArray_BW_t)(scriptInstance_t inst);
+static Scr_AddArray_BW_t Scr_AddArray_BW =
+    reinterpret_cast<Scr_AddArray_BW_t>(0x82345C80);
+
 // --- Scr_Get* (read from GSC stack at index) ---
 
 typedef int (*Scr_GetInt_BW_t)(unsigned int index, scriptInstance_t inst);
