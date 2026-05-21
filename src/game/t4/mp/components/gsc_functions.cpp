@@ -17,22 +17,20 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name);
 // ---------------------------------------------------------------------------
 // fs_* file I/O (ported from IW3 codxe gsc_functions.cpp)
 //
-// Provides waypoint CSV loading for Bot Warfare. The deployed
-// bots_adapter_pt4.gsc previously stubbed these out by default
-// (returns false/-1/empty) because stock codxe T4 didn't expose them.
-// With these handlers wired into gsc_functions[] below, the adapter
-// dispatches to the real engine fs_* calls and BW hot-loads CSVs from
-// <mod>/scriptdata/waypoints/.
+// Provides waypoint CSV loading for Bot Warfare. Without these, the deployed
+// bots_adapter_pt4.gsc has to stub them out (false/-1/empty), and BW skips
+// waypoint hot-load. With them wired into gsc_functions[] below, the adapter
+// dispatches real fs_* calls and BW loads CSVs from <mod>/scriptdata/waypoints/.
 //
 // Implementation notes:
 //   - Uses stdlib fopen/fclose/fgets/fprintf. Same approach as IW3 codxe.
-//     Xenia's host filesystem accepts paths beginning with "game:\".
 //   - Path resolution: Config::GetModBasePath() returns "game:\_codxe\mods\<active>".
 //     BuildScriptFilePath joins that with the relative path BW provides.
-//     Forward slashes are normalized to backslashes for Xbox 360.
+//     Forward slashes are normalized to backslashes for Xbox 360 host FS.
 //   - Handle slots are 1-indexed (BW expects 0/-1 to mean "no handle").
-//   - Scr_* calls use the _BW variants from symbols_bw_ext.h — stock
-//     symbols.h has wrong addresses for several of these on TU7.
+//   - Scr_* calls use the _BW variants from symbols_bw_ext.h — stock symbols.h
+//     has wrong addresses for several Scr_* on TU7. Audit comments live in
+//     symbols_bw_ext.h.
 // ---------------------------------------------------------------------------
 
 #define MAX_SCRIPT_FILEHANDLES 8
@@ -234,11 +232,6 @@ static void GScr_FS_WriteLine()
     Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
 }
 
-// ---------------------------------------------------------------------------
-// Existing T4 builtin: getplayerclipbrushescontainingpoint
-// (Untouched; used by codjumper and other GSC mods.)
-// ---------------------------------------------------------------------------
-
 /**
  * Checks if a 3D point is contained within an axis-aligned bounding box
  */
@@ -269,13 +262,9 @@ void GSCrGetPlayerclipBrushesContainingPoint()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Function dispatch table
-// ---------------------------------------------------------------------------
-
 static struct
 {
-    const char     *name;
+    const char *name;
     BuiltinFunction handler;
 } gsc_functions[] = {
     {"getplayerclipbrushescontainingpoint", GSCrGetPlayerclipBrushesContainingPoint},
@@ -318,9 +307,7 @@ BuiltinFunction Scr_GetFunction_Hook(const char **pName, int *type)
 
 GSCFunctions::GSCFunctions()
 {
-    // Reset filehandle slots on module bring-up. Without this they'd carry
-    // over any FILE* from a previous run if the binary state ever survived
-    // a level transition (it doesn't, but be explicit).
+    // Reset filehandle slots on module bring-up.
     std::memset(s_scriptFiles, 0, sizeof(s_scriptFiles));
 
     Scr_GetFunction_Detour = Detour(Scr_GetFunction, Scr_GetFunction_Hook);
