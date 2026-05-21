@@ -30,27 +30,19 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name);
 //   is 65536 entries. The IW3 BW CSV-read pattern is a tight GSC for-loop
 //   calling fs_readline 200+ times back-to-back, which on T4-via-Xenia
 //   accumulates stackpoints faster than they recycle and crashes the
-//   emulator with "Overflowed stackpoints!" mid-loop. This was confirmed
-//   in two production logs on Cliffside and Asylum.
+//   emulator with "Overflowed stackpoints!" mid-loop. Confirmed in two
+//   production logs on Cliffside and Asylum.
 //
 //   fs_readall_lines collapses N readline calls into 1 host call by
-//   slurping the entire file and pushing all lines as a GSC array in one
-//   pass. BW's readWpsFromFile is patched to call it. The crash goes away
-//   because the engine only crosses the guest/host boundary once per CSV.
+//   slurping the whole file and pushing all lines as a GSC array. BW's
+//   readWpsFromFile is patched to call it. Crash mechanism eliminated.
 //
-//   Each Scr_AddString inside the array build still costs stackpoints, but
-//   the cost is bounded by file size (up to ~1000 lines) and happens during
-//   a single GSC builtin invocation that returns before the next GSC tick.
-//   No GSC for-loop = no per-iteration accumulation.
-//
-// Implementation notes:
-//   - Plain stdlib fopen/fclose/fgets/fprintf. Xenia accepts "game:\" paths.
-//   - Config::GetModBasePath() resolves to "game:\_codxe\mods\<active>".
-//   - Handle slots 1-indexed (BW expects 0/-1 = "no handle").
-//   - Per symbols_bw_ext.h audit (r335), stock T4 symbols.h has the correct
-//     TU7 addresses for Scr_AddInt/GetInt/GetString/Error/GetNumParam. Only
-//     Scr_AddString and Scr_AddUndefined need the _BW-namespace versions
-//     (provided by `using namespace t4::mp::bw;` above).
+// Why every Scr_* call uses the _BW suffix:
+//   Stock T4 symbols.h declares Scr_GetInt/GetVector with extra trailing
+//   __int64 dummy args (PPC ABI quirk). The _BW variants in
+//   symbols_bw_ext.h are typedef'd to the cleaner 2-arg signatures that
+//   match sv_bots.cpp's usage. `using namespace t4::mp::bw;` above pulls
+//   them in unqualified.
 // ---------------------------------------------------------------------------
 
 #define MAX_SCRIPT_FILEHANDLES 8
@@ -106,31 +98,31 @@ static inline void StripTrailingNewline(char *buf, int len)
 
 static void GScr_FS_TestFile()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error("Usage: fs_testfile(<filename>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_testfile(<filename>)", SCRIPTINSTANCE_SERVER);
 
-    const char *filename = Scr_GetString(0, SCRIPTINSTANCE_SERVER);
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
     std::string fullpath = BuildScriptFilePath(filename);
 
     FILE *f = std::fopen(fullpath.c_str(), "r");
     if (f)
     {
         std::fclose(f);
-        Scr_AddInt(1, SCRIPTINSTANCE_SERVER);
+        Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
     }
     else
     {
-        Scr_AddInt(0, SCRIPTINSTANCE_SERVER);
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
     }
 }
 
 static void GScr_FS_FOpen()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 2)
-        Scr_Error("Usage: fs_fopen(<filename>, <mode>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: fs_fopen(<filename>, <mode>)", SCRIPTINSTANCE_SERVER);
 
-    const char *filename = Scr_GetString(0, SCRIPTINSTANCE_SERVER);
-    const char *mode_str = Scr_GetString(1, SCRIPTINSTANCE_SERVER);
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    const char *mode_str = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
     const char *fmode;
 
     if (_stricmp(mode_str, "read") == 0)
@@ -141,8 +133,8 @@ static void GScr_FS_FOpen()
         fmode = "at";
     else
     {
-        Scr_Error("fs_fopen: invalid mode. Valid modes are: read, write, append",
-                  SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_fopen: invalid mode. Valid modes are: read, write, append",
+                     SCRIPTINSTANCE_SERVER);
         return;
     }
 
@@ -170,27 +162,27 @@ static void GScr_FS_FOpen()
             if (!s_scriptFiles[i].fh)
             {
                 // Failed open: return 0 so GSC can detect it.
-                Scr_AddInt(0, SCRIPTINSTANCE_SERVER);
+                Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
                 return;
             }
             std::strncpy(s_scriptFiles[i].filename, filename,
                          sizeof(s_scriptFiles[i].filename) - 1);
-            Scr_AddInt(i + 1, SCRIPTINSTANCE_SERVER);
+            Scr_AddInt_BW(i + 1, SCRIPTINSTANCE_SERVER);
             return;
         }
     }
 
-    Scr_Error("fs_fopen: exceeded maximum open file handles", SCRIPTINSTANCE_SERVER);
+    Scr_Error_BW("fs_fopen: exceeded maximum open file handles", SCRIPTINSTANCE_SERVER);
 }
 
 static void GScr_FS_FClose()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error("Usage: fs_fclose(<filehandle>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_fclose(<filehandle>)", SCRIPTINSTANCE_SERVER);
 
-    int fh = Scr_GetInt(0, SCRIPTINSTANCE_SERVER);
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
     if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_fclose: invalid filehandle", SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_fclose: invalid filehandle", SCRIPTINSTANCE_SERVER);
 
     ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
     if (slot.fh)
@@ -205,16 +197,16 @@ static void GScr_FS_FClose()
 // Xenia stackpoints overflow described at the top of this section.
 static void GScr_FS_ReadLine()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error("Usage: fs_readline(<filehandle>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_readline(<filehandle>)", SCRIPTINSTANCE_SERVER);
 
-    int fh = Scr_GetInt(0, SCRIPTINSTANCE_SERVER);
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
     if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_readline: invalid filehandle", SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_readline: invalid filehandle", SCRIPTINSTANCE_SERVER);
 
     ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
     if (!slot.fh)
-        Scr_Error("fs_readline: filehandle is not open", SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_readline: filehandle is not open", SCRIPTINSTANCE_SERVER);
 
     char buffer[MAX_LINE_LENGTH];
     if (!std::fgets(buffer, sizeof(buffer), slot.fh))
@@ -227,9 +219,9 @@ static void GScr_FS_ReadLine()
     Scr_AddString(buffer, SCRIPTINSTANCE_SERVER);
 }
 
-// Bulk read: open the file by path, slurp every line, return as a GSC array
-// of strings. Returns `undefined` if the file cannot be opened. Closes the
-// file before returning — caller does NOT need to call fs_fclose afterward.
+// Bulk read: open file by path, slurp every line, return a GSC array of
+// strings. Returns `undefined` if the file cannot be opened. Closes the file
+// before returning — caller does NOT call fs_fclose afterward.
 //
 // Single GSC builtin invocation. One host-call boundary cross. Per-line cost
 // stays inside the call. This is the fix for Xenia's stackpoints overflow.
@@ -237,10 +229,10 @@ static void GScr_FS_ReadLine()
 // Signature: fs_readall_lines(<filename>) -> array of string  | undefined
 static void GScr_FS_ReadAllLines()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 1)
-        Scr_Error("Usage: fs_readall_lines(<filename>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_readall_lines(<filename>)", SCRIPTINSTANCE_SERVER);
 
-    const char *filename = Scr_GetString(0, SCRIPTINSTANCE_SERVER);
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
     std::string fullpath = BuildScriptFilePath(filename);
 
     FILE *f = std::fopen(fullpath.c_str(), "rt");
@@ -272,25 +264,25 @@ static void GScr_FS_ReadAllLines()
 
 static void GScr_FS_WriteLine()
 {
-    if (Scr_GetNumParam(SCRIPTINSTANCE_SERVER) != 2)
-        Scr_Error("Usage: fs_writeline(<filehandle>, <data>)", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: fs_writeline(<filehandle>, <data>)", SCRIPTINSTANCE_SERVER);
 
-    int fh = Scr_GetInt(0, SCRIPTINSTANCE_SERVER);
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
     if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_writeline: invalid filehandle", SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_writeline: invalid filehandle", SCRIPTINSTANCE_SERVER);
 
     ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
     if (!slot.fh)
-        Scr_Error("fs_writeline: filehandle is not open", SCRIPTINSTANCE_SERVER);
+        Scr_Error_BW("fs_writeline: filehandle is not open", SCRIPTINSTANCE_SERVER);
 
-    const char *data = Scr_GetString(1, SCRIPTINSTANCE_SERVER);
+    const char *data = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
     if (std::fprintf(slot.fh, "%s\n", data) < 0)
     {
-        Scr_AddInt(0, SCRIPTINSTANCE_SERVER);
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
         return;
     }
 
-    Scr_AddInt(1, SCRIPTINSTANCE_SERVER);
+    Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
 }
 
 /**
@@ -369,6 +361,7 @@ BuiltinFunction Scr_GetFunction_Hook(const char **pName, int *type)
 
 GSCFunctions::GSCFunctions()
 {
+    // Reset filehandle slots on module bring-up.
     std::memset(s_scriptFiles, 0, sizeof(s_scriptFiles));
 
     Scr_GetFunction_Detour = Detour(Scr_GetFunction, Scr_GetFunction_Hook);
@@ -377,6 +370,7 @@ GSCFunctions::GSCFunctions()
 
 GSCFunctions::~GSCFunctions()
 {
+    // Close any still-open files so handles aren't leaked on shutdown.
     CloseAllScriptFiles();
     Scr_GetFunction_Detour.Remove();
 }
