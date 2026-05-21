@@ -147,21 +147,8 @@ static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
-    // r294: trace every weapon-select call so we can correlate engine activity
-    // with what GSC's getcurrentweapon() sees a moment later. We still write
-    // g_botai[].weapon as a fallback cache, but cmd.weapon now reads directly
-    // from the gentity (see SV_BotUserMove_Stub) — this hook is informational.
     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
-    {
-        const unsigned char prev = g_botai[clientNum].weapon;
-        const unsigned char next = static_cast<unsigned char>(iWeaponIndex);
-        g_botai[clientNum].weapon = next;
-        if (prev != next)
-        {
-            DbgPrint("sv_bots: G_SelectWeaponIndex clientNum=%d weaponIndex=%d (prev=%d)\n",
-                     clientNum, iWeaponIndex, static_cast<int>(prev));
-        }
-    }
+        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
 
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
@@ -171,13 +158,6 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 // ---------------------------------------------------------------------------
 
 static Detour SV_BotUserMove_Detour;
-
-// r296: per-client rate-limit state for the gentity-weapon trace.
-// Initialised to "no log yet" sentinel (-1 weapon value, 0 ms).
-static int s_lastWeaponLogMs[MAX_CLIENTS_BW]  = {0};
-static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1, -1, -1, -1, -1, -1, -1, -1,
-                                                  -1, -1, -1, -1, -1, -1, -1, -1,
-                                                  -1, -1};
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
@@ -210,27 +190,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     std::memset(&cmd, 0, sizeof(cmd));
 
     cmd.serverTime = svsHeader->time;
-
-    // r296: read the engine's authoritative current weapon directly from
-    // the gentity's entityState. This is what GSC's getcurrentweapon()
-    // returns and what the player struct considers held. Caching via
-    // G_SelectWeaponIndex_Hook turned out to be wrong for "current
-    // weapon" because the engine only calls G_SelectWeaponIndex on
-    // initial spawn for an offhand slot — bots held grenades until they
-    // fired. Reading the gentity each tick fixes it.
-    const int gentityWeapon = cl->gentity->s.weapon;
-    cmd.weapon = static_cast<unsigned __int8>(gentityWeapon & 0xFF);
-
-    // Rate-limited trace so the log isn't flooded: only when the value
-    // changes per client, and at most once per 500 ms.
-    if (s_lastWeaponLogVal[clientNum] != gentityWeapon &&
-        (svsHeader->time - s_lastWeaponLogMs[clientNum]) > 500)
-    {
-        DbgPrint("sv_bots: bot weapon clientNum=%d gentity.s.weapon=%d (was %d)\n",
-                 clientNum, gentityWeapon, s_lastWeaponLogVal[clientNum]);
-        s_lastWeaponLogVal[clientNum] = gentityWeapon;
-        s_lastWeaponLogMs[clientNum]  = svsHeader->time;
-    }
+    cmd.weapon     = g_botai[clientNum].weapon;
 
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
@@ -538,11 +498,7 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    // r294: "addtestclient" deliberately omitted — BW_LookupFunction
-    // routes it to a fall-through so the engine's stock GScr_AddTestClient
-    // handles bot spawn. Our GScr_AddTestClient is kept in this file
-    // (further up) only as reference; nothing dispatches to it. See
-    // BW_LookupFunction above for the routing.
+    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -565,28 +521,10 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 {
     if (!name)
         return nullptr;
-
-    // r294: route "addtestclient" to engine native. Our GScr_AddTestClient
-    // doesn't drive ClientBegin, so test clients connected but never picked
-    // a class — they stayed in spectators while the engine's stock spawn
-    // path runs the full ClientBegin chain. Falling through here lets the
-    // stock GScr_AddTestClient handle the call. The wider effect: bots
-    // spawn with engine-assigned classes, ranks, and primaries.
-    if (_stricmp(name, "addtestclient") == 0)
-    {
-        DbgPrint("sv_bots: [HOOK] 'addtestclient' -> fall through to engine\n");
-        return nullptr;
-    }
-
     for (const auto *f = sv_bots_functions; f->name != nullptr; ++f)
     {
         if (_stricmp(name, f->name) == 0)
-        {
-            // Heartbeat trace: first GSC use of any BW function tells us
-            // the dispatch chain is alive. Cheap; one log line per name.
-            DbgPrint("sv_bots: [HOOK] '%s' -> BW port handler\n", name);
             return f->handler;
-        }
     }
     return nullptr;
 }
@@ -609,7 +547,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r296 gentity-weapon-readback)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
