@@ -75,6 +75,15 @@ struct BotMovementInfo_t
     int           mirror_client_num;
     float         moveTo[2];
     int           doMove;
+    // r297: raw forward/right components written by Scr_BotMovement.
+    // BW's PT4-style doBotMovement_loop computes dir[0]/dir[1] every 50ms
+    // and calls BotBuiltinBotMovement(forward, right). With doMove unset
+    // (BW never calls botMoveTo), SV_BotUserMove_Stub left forwardmove
+    // and rightmove at zero and bots stood still. These two fields let
+    // the stub honor BW's existing computation without changing GSC.
+    signed char   forwardMove;
+    signed char   rightMove;
+    int           hasRawMove;  // 1 if forward/right were set this tick
 };
 
 static BotMovementInfo_t g_botai[MAX_CLIENTS_BW];
@@ -279,6 +288,15 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
             Scr_Notify(ent, static_cast<unsigned __int16>(scr_const_movedone), 0);
         }
     }
+    else if (g_botai[clientNum].hasRawMove)
+    {
+        // r297: PT4 BW's doBotMovement_loop computes forward/right in bot
+        // local frame every 50ms and pushes it through Scr_BotMovement.
+        // The values were already projected into bot space and clamped to
+        // [-127, 127] by GSC, so apply verbatim.
+        cmd.forwardmove = g_botai[clientNum].forwardMove;
+        cmd.rightmove   = g_botai[clientNum].rightMove;
+    }
 
     // Mirror mode: 1:1 copy of another client's last usercmd.
     if (g_botai[clientNum].is_mirroring_client)
@@ -344,6 +362,34 @@ static void Scr_BotMoveTo(scr_entref_t entref)
     g_botai[entref.entnum].doMove    = 1;
 }
 
+// r297: raw forward/right input from GSC. T4 BW's doBotMovement_loop in
+// _bot_internal.gsc computes a 2D direction every 50ms and calls
+// self botmovement(int(dir[0]), int(dir[1])). Without this method bound,
+// BW's adapter would no-op the call and bots would stand still.
+//
+// Inputs are signed bytes in [-127, 127]. Bot's local frame: +forward
+// moves the bot in the direction it's facing, +right strafes right.
+static void Scr_BotMovement(scr_entref_t entref)
+{
+    BW_RequirePlayerEntity(entref);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: <bot> botMovement(<forward>, <right>);", SCRIPTINSTANCE_SERVER);
+
+    int forward = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    int right   = Scr_GetInt_BW(1, SCRIPTINSTANCE_SERVER);
+
+    // Clamp to signed-byte range (engine usercmd uses signed char).
+    if (forward >  127) forward =  127;
+    if (forward < -127) forward = -127;
+    if (right   >  127) right   =  127;
+    if (right   < -127) right   = -127;
+
+    g_botai[entref.entnum].forwardMove = static_cast<signed char>(forward);
+    g_botai[entref.entnum].rightMove   = static_cast<signed char>(right);
+    g_botai[entref.entnum].hasRawMove  = 1;
+}
+
 static void Scr_BotAction(scr_entref_t entref)
 {
     BW_RequirePlayerEntity(entref);
@@ -388,6 +434,7 @@ static void Scr_BotStop(scr_entref_t entref)
     g_botai[entref.entnum].buttons             = 0;
     g_botai[entref.entnum].is_mirroring_client = false;
     g_botai[entref.entnum].doMove              = 0;
+    g_botai[entref.entnum].hasRawMove          = 0;
 }
 
 static void Scr_BotMirror(scr_entref_t entref)
@@ -553,6 +600,7 @@ static struct
     BuiltinMethod handler;
 } sv_bots_methods[] = {
     {"botmoveto",         Scr_BotMoveTo},
+    {"botmovement",       Scr_BotMovement},
     {"botaction",         Scr_BotAction},
     {"botmirror",         Scr_BotMirror},
     {"botstop",           Scr_BotStop},
@@ -609,7 +657,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r296 gentity-weapon-readback)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r297 botmovement-method)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
