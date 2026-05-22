@@ -1,54 +1,69 @@
 // ===========================================================================
-// DIAGNOSTIC patch for sv_bots.cpp — r299-diag
+// PATCH for sv_bots.cpp — r299 angles-from-lastUsercmd
 // ===========================================================================
 //
-// PURPOSE: gather data about who enters SV_BotUserMove_Stub. Two theories
-// in play, this patch tests THEORY B without applying any behavior fix.
+// FINDING: CoD4x's SV_BotUserMove (which T4 mirrors) does:
 //
-//   THEORY B (test target): host slipping through guards on Xenia.
-//     On XLive-offline, host's netchan.remoteAddress.type may default to
-//     0 (NA_BOT). If so, the host enters the stub. Our guards check
-//     remAdr.type != NA_BOT AND isTestClient == 0 to skip — but if EITHER
-//     is wrong for the host on Xenia, the stub runs ClientThink for host
-//     with a synthesized cmd, breaking host ADS damage.
+//     VectorCopy(ent->client->sess.cmd.angles, ucmd.angles);
 //
-// HOW TO READ THE LOG (xenia.log):
+// to preserve the bot's current view angles in the synthesized usercmd.
 //
-//   Look for lines like:
-//     sv_bots: BUM_Stub entry cn=N remAdr.type=X isTest=Y state=Z
+// Our T4 SV_BotUserMove_Stub never sets cmd.angles[] outside the mirror
+// branch. cmd was memset to 0, so angles stay (0, 0, 0). Every server
+// tick we ship (0, 0, 0) to SV_ClientThink, which writes those into
+// ps.viewangles, snapping the bot to face world-north-flat regardless
+// of what GSC's setplayerangles set on r.currentAngles.
 //
-//   Expected if guards work (host safe):
-//     cn=1..18 (bots), remAdr.type=0 (NA_BOT), isTest=1, state=3 (CS_ACTIVE)
-//     NO line for cn=0 (host).
+// Since clientBW_t exposes lastUsercmd directly (verified offset 0x20EF4
+// in structs_bw_ext.h), we copy from cl->lastUsercmd.angles. That's the
+// bot's most recent processed usercmd angles, in the same packed-int
+// format (verified via CoD4x q_shared.h: `int angles[3]` PACKED_ANGLE).
 //
-//   Bug confirmed if you see:
-//     cn=0 ANYTHING                     <- host entered stub at all
-//   especially:
-//     cn=0 remAdr.type=0 isTest=0       <- host's remAdr.type leaks NA_BOT,
-//                                          isTest guard saved us THIS TICK
-//                                          but the OUTER caller still
-//                                          fires for the host => check
-//                                          state and tick frequency
+// VERIFIED via CoD4x's usercmd_s definition:
+//     typedef struct usercmd_s
+//     {
+//         int serverTime;
+//         int buttons;
+//         int angles[3];        // <-- int, PACKED_ANGLE format
+//         byte weapon;
+//         ...
+//     } usercmd_t;
 //
-// TWO HOSTS scenario (split-screen): cn=0 and cn=1 are both human, the
-// second human shows up via the same mechanism.
+// Plus CoD4x's SV_BotUserMove explicitly wraps angles to [0, 0xFFFF]
+// confirming the packed-16-bit-in-int convention.
 //
 // ===========================================================================
 //
 // HOW TO APPLY:
 //
 // 1. Open sv_bots.cpp
-// 2. Find the toggle defines block near "r293 DIAGNOSTIC TOGGLES":
 //
-//        #define CODXE_DIAG_ENABLE_WEAPON_HOOK         0
-//        #define CODXE_DIAG_ENABLE_USERINFO_HOOK       1
-//        #define CODXE_DIAG_ENABLE_BOTUSERMOVE         1
+// 2. In the toggle defines block near "r293 DIAGNOSTIC TOGGLES", ADD:
 //
-//    Add BELOW these:
+//        #define BW_R299_FIX_BOT_ANGLES       1
+//        #define BW_R299_DIAG_LOG_ENTRY       1
 //
-//        #define BW_R299_DIAG_LOG_ENTRY                1
+// 3. In SV_BotUserMove_Stub, locate this line:
 //
-// 3. Find SV_BotUserMove_Stub function. After this block near the top:
+//        cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
+//
+//    INSERT immediately AFTER it:
+//
+// ---------------- BEGIN INSERT 1 (angle fix) ----------------
+#if BW_R299_FIX_BOT_ANGLES
+    // [r299] Preserve the bot's current usercmd angles. Without this,
+    // memset()-zeroed angles snap the bot's viewangles to (0,0,0) every
+    // tick when SV_ClientThink processes the synthesized cmd, breaking
+    // aim. CoD4x SV_BotUserMove does the equivalent via
+    // ent->client->sess.cmd.angles; we use the same source from a
+    // different struct path (clientBW_t.lastUsercmd at +0x20EF4).
+    cmd.angles[0] = cl->lastUsercmd.angles[0];
+    cmd.angles[1] = cl->lastUsercmd.angles[1];
+    cmd.angles[2] = cl->lastUsercmd.angles[2];
+#endif
+// ----------------  END INSERT 1  ----------------
+//
+// 4. ALSO insert the diagnostic logging block. Locate where you have:
 //
 //        const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
 //        if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
@@ -57,9 +72,10 @@
 //            return;
 //        }
 //
-//    INSERT the diagnostic block BEFORE the "Defense in depth" comment:
+//    INSERT immediately AFTER the closing brace of that if, BEFORE the
+//    "Defense in depth" guards:
 //
-// ---------------- BEGIN INSERT ----------------
+// ---------------- BEGIN INSERT 2 (diag) ----------------
 #if BW_R299_DIAG_LOG_ENTRY
     {
         static int s_lastEntryLogMs[MAX_CLIENTS_BW] = {0};
@@ -75,10 +91,53 @@
         }
     }
 #endif
-// ----------------  END INSERT  ----------------
+// ----------------  END INSERT 2  ----------------
 //
-// 4. Build (Run workflow on GitHub Actions, NOT Re-run all jobs)
-// 5. Boot a match. Add a few bots. Play for ~30 seconds.
-// 6. Inspect xenia.log for "BUM_Stub entry" lines
+// 5. Build (Run workflow on GitHub Actions, NOT Re-run all jobs).
+//
+// 6. Boot a match, add bots, observe.
+//
+// ===========================================================================
+//
+// WHAT TO LOOK FOR AFTER DEPLOYING:
+//
+// A) On-screen behavior:
+//    - Bots should aim more naturally. Look for bots that previously
+//      stood still while staring north now tracking enemies.
+//    - Bot bullet KILLS should appear in the killfeed (not just knife).
+//    - Critical test: bot-vs-bot ADS should now register damage.
+//
+//    NOTE: this fix is about BOT aim. If the player-ADS-no-damage bug
+//    is the SAME root cause (host slipping into bot code path), this
+//    fix alone WON'T address it. The diag log answers whether host
+//    is in the path.
+//
+// B) Log lines from BW_R299_DIAG_LOG_ENTRY:
+//
+//    Look for "sv_bots: BUM_Stub entry" lines in xenia.log.
+//
+//    EXPECTED (guards work, host safe):
+//       BUM_Stub entry cn=1 remAdr.type=0 isTest=1 state=4
+//       BUM_Stub entry cn=2 remAdr.type=0 isTest=1 state=4
+//       ... no cn=0
+//
+//    BUG CONFIRMED (host leaks as bot):
+//       BUM_Stub entry cn=0 remAdr.type=0 isTest=0 state=4
+//       (host clientNum=0 appears; guards catch it via isTest=0 check
+//        and early-return, so host view should NOT be corrupted by our
+//        stub. If cn=0 appears with isTest=1, that's a real problem.)
+//
+// ===========================================================================
+//
+// IF BOT-VS-BOT ADS WORKS BUT PLAYER ADS STILL BROKEN:
+//
+// Two separate bugs. The angle fix solves bot-side. Player-side is a
+// different mechanism — possibly:
+//   - Engine bullet trace using wrong origin/direction for ADS shots
+//   - Codxe binary patch affecting player usercmd path
+//   - default_mp.ff weapon data (silenced variants specifically)
+//
+// IF NEITHER CHANGES: angles weren't the issue and we need to look at
+// the engine bullet trace path itself.
 //
 // ===========================================================================
