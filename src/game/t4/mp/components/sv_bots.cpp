@@ -104,20 +104,26 @@ struct BotAction_t
 };
 
 static const BotAction_t BotActions[] = {
-    {"gostand",    KEY_GOSTAND},
-    {"gocrouch",   KEY_CROUCH},
-    {"goprone",    KEY_PRONE},
-    {"fire",       KEY_FIRE},
-    {"melee",      KEY_MELEE},
-    {"frag",       KEY_FRAG},
-    {"smoke",      KEY_SMOKE},
-    {"reload",     KEY_RELOAD},
-    {"sprint",     KEY_SPRINT},
-    {"leanleft",   KEY_LEANLEFT},
-    {"leanright",  KEY_LEANRIGHT},
-    {"ads",        KEY_ADSMODE | KEY_ADS},
-    {"holdbreath", KEY_HOLDBREATH},
-    {"activate",   KEY_USE},
+    {"gostand",     KEY_GOSTAND},
+    {"gocrouch",    KEY_CROUCH},
+    {"crouch",      KEY_CROUCH},    // r297: PT4 BW alias for "gocrouch"
+    {"goprone",     KEY_PRONE},
+    {"prone",       KEY_PRONE},     // r297: PT4 BW alias for "goprone"
+    {"fire",        KEY_FIRE},
+    {"attack",      KEY_FIRE},      // r297: PT4 BW alias for "fire"
+                                    //       (IW3 BW used "fire", PT4 uses "attack")
+    {"melee",       KEY_MELEE},
+    {"frag",        KEY_FRAG},
+    {"smoke",       KEY_SMOKE},
+    {"reload",      KEY_RELOAD},
+    {"sprint",      KEY_SPRINT},
+    {"leanleft",    KEY_LEANLEFT},
+    {"leanright",   KEY_LEANRIGHT},
+    {"ads",         KEY_ADSMODE | KEY_ADS},
+    {"speed_throw", KEY_ADSMODE | KEY_ADS},  // r297: PT4 BW alias for "ads"
+                                             //       (used while throwing grenades)
+    {"holdbreath",  KEY_HOLDBREATH},
+    {"activate",    KEY_USE},
 };
 
 // ---------------------------------------------------------------------------
@@ -657,7 +663,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r297 botmovement-method)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r298 attack-action-aliases)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
