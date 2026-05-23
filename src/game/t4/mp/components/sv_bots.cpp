@@ -625,6 +625,33 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
+// r304: register jumpbuttonpressed() as a player method.
+// T4 TU7 does NOT expose jumpbuttonpressed natively (absent from all 6
+// PLAYER_METHODS sub-tables — verified via namespace dump). BW's _menu.gsc
+// MenuSelect() waits on self jumpbuttonpressed() which silently no-ops
+// without this, so menu select never fires — kick (and every other menu
+// confirm) silently does nothing.
+//
+// Implementation mirrors codjumper-iw3's PlayerCmd_JumpButtonPressed:
+// read player's current + just-pressed buttons, AND with the jump bit.
+// On T4 there is no KEY_JUMP — jump maps to KEY_GOSTAND (0x400).
+static void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
+{
+    gentity_s *ent = BW_RequirePlayerEntity(entref);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> jumpbuttonpressed()", SCRIPTINSTANCE_SERVER);
+
+    if (!ent->client)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    const int combined = ent->client->buttons | ent->client->buttonsSinceLastFrame;
+    Scr_AddInt_BW((combined & KEY_GOSTAND) != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
+}
+
 // ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
@@ -648,13 +675,14 @@ static struct
     const char   *name;
     BuiltinMethod handler;
 } sv_bots_methods[] = {
-    {"botmoveto",         Scr_BotMoveTo},
-    {"botmovement",       Scr_BotMovement},
-    {"botaction",         Scr_BotAction},
-    {"botmirror",         Scr_BotMirror},
-    {"botstop",           Scr_BotStop},
-    {"getentitynumber",   PlayerCmd_GetEntityNumber},
-    {"getguid",           PlayerCmd_GetGuid},
+    {"botmoveto",          Scr_BotMoveTo},
+    {"botmovement",        Scr_BotMovement},
+    {"botaction",          Scr_BotAction},
+    {"botmirror",          Scr_BotMirror},
+    {"botstop",            Scr_BotStop},
+    {"getentitynumber",    PlayerCmd_GetEntityNumber},
+    {"getguid",            PlayerCmd_GetGuid},
+    {"jumpbuttonpressed",  PlayerCmd_JumpButtonPressed},  // r304: needed for BW menu select
     {nullptr, nullptr},
 };
 
@@ -706,7 +734,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r299 angles-and-diag)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r304 jumpbuttonpressed-registered)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
