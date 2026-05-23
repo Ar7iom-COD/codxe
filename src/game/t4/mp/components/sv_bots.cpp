@@ -568,23 +568,70 @@ static void GScr_AddTestClient()
 
 static void GScr_Kick()
 {
+    // r306: full diagnostic trace. We've shipped three failed fixes on kick;
+    // the only honest path forward is to log every step and see what's
+    // actually broken. Each DbgPrint is gated nowhere — we want them ALL on
+    // a kick attempt so the log line sequence tells us where the chain
+    // breaks. After kick works, these can be removed.
+    DbgPrint("sv_bots: [KICK] handler entered\n");
+
     const int nparam = Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER);
+    DbgPrint("sv_bots: [KICK] nparam=%d\n", nparam);
+
     if (nparam < 1 || nparam > 2)
+    {
+        DbgPrint("sv_bots: [KICK] BAD nparam — calling Scr_Error_BW\n");
         Scr_Error_BW("Usage: kick(<clientNum>) or kick(<clientNum>, <reason>)",
                      SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
     const int clientNum = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    DbgPrint("sv_bots: [KICK] clientNum=%d\n", clientNum);
+
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+    {
+        DbgPrint("sv_bots: [KICK] clientNum %d out of range (MAX=%d)\n",
+                 clientNum, MAX_CLIENTS_BW);
         Scr_ParamError_BW(0, va_BW("kick: clientNum %i out of range", clientNum),
                           SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
     const char *reason = "EXE_PLAYERKICKED";
     if (nparam == 2)
     {
         const char *r = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
+        DbgPrint("sv_bots: [KICK] reason arg = %s\n", r ? r : "(null)");
         if (r && *r) reason = r;
     }
+    DbgPrint("sv_bots: [KICK] final reason='%s'\n", reason);
+
     clientBW_t *cl = BW_GetClient(clientNum);
-    if (cl && cl->header.state >= CS_CONNECTED)
-        SV_DropClient(cl, reason, true);
+    DbgPrint("sv_bots: [KICK] BW_GetClient(%d) = %p\n", clientNum, (void *)cl);
+
+    if (!cl)
+    {
+        DbgPrint("sv_bots: [KICK] NULL client — abort\n");
+        return;
+    }
+
+    DbgPrint("sv_bots: [KICK] cl->header.state = %d (CS_CONNECTED=%d)\n",
+             cl->header.state, CS_CONNECTED);
+
+    if (cl->header.state < CS_CONNECTED)
+    {
+        DbgPrint("sv_bots: [KICK] state < CONNECTED — abort drop\n");
+        return;
+    }
+
+    // r307: SV_DropClient_BW declared in symbols_bw_ext.h with TU7-verified
+    // address 0x82283BF0 (Ghidra fingerprint match — see header comment).
+    // Diagnostic prints retained one revision; will remove in r308 if green.
+    DbgPrint("sv_bots: [KICK] >>> calling SV_DropClient_BW(cl=%p, '%s', true)\n",
+             (void *)cl, reason);
+    SV_DropClient_BW(cl, reason, 1);
+    DbgPrint("sv_bots: [KICK] <<< SV_DropClient_BW returned\n");
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -734,7 +781,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r305 stock-jumpbtn-bypassed)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r307 sv-dropclient-verified)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
