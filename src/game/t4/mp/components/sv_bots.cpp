@@ -239,6 +239,22 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         }
     }
 
+    // r307: state guard for zombie/free slots.
+    // PROVEN BUG (r306b kick diagnostic, 2026-05-24):
+    //   SV_DropClient correctly set cl->state = CS_ZOMBIE on kicked bot.
+    //   But our stub kept injecting input every frame because the guards
+    //   below only check NA_BOT and isTestClient — both still true on a
+    //   zombie. Engine sees inputs flowing → never transitions zombie to
+    //   CS_FREE. Bot stuck forever. Kick "doesn't work" symptom.
+    //
+    // Fix: skip the stub entirely if not CS_ACTIVE. We DON'T fall through
+    // to the engine path for non-active either — zombies should be left
+    // alone by the bot-input path so SV_CheckTimeouts can reap them.
+    if (cl->header.state != CS_ACTIVE)
+    {
+        return;  // no input for non-active clients; do not call the engine path
+    }
+
     // Defense in depth: only inject input for real bot clients.
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
@@ -785,7 +801,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r306b kick-diag-correct-symbols)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r307 zombie-state-guard)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
