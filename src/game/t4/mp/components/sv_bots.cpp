@@ -584,31 +584,22 @@ static void GScr_AddTestClient()
 
 static void GScr_Kick()
 {
-    // r306: full diagnostic trace. We've shipped three failed fixes on kick;
-    // the only honest path forward is to log every step and see what's
-    // actually broken. Each DbgPrint is gated nowhere — we want them ALL on
-    // a kick attempt so the log line sequence tells us where the chain
-    // breaks. After kick works, these can be removed.
-    DbgPrint("sv_bots: [KICK] handler entered\n");
-
+    // GSC: kick(<clientNum>) or kick(<clientNum>, <reason>)
+    // Drops the client via SV_DropClient (Ghidra-verified TU7 address
+    // 0x82283BF0 in symbols_bw_ext.h). Used by BW _menu.gsc when the user
+    // selects "Kick a bot" — passes the bot's entity number and the
+    // localized reason string "EXE_PLAYERKICKED".
     const int nparam = Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER);
-    DbgPrint("sv_bots: [KICK] nparam=%d\n", nparam);
-
     if (nparam < 1 || nparam > 2)
     {
-        DbgPrint("sv_bots: [KICK] BAD nparam — calling Scr_Error_BW\n");
         Scr_Error_BW("Usage: kick(<clientNum>) or kick(<clientNum>, <reason>)",
                      SCRIPTINSTANCE_SERVER);
         return;
     }
 
     const int clientNum = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
-    DbgPrint("sv_bots: [KICK] clientNum=%d\n", clientNum);
-
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
     {
-        DbgPrint("sv_bots: [KICK] clientNum %d out of range (MAX=%d)\n",
-                 clientNum, MAX_CLIENTS_BW);
         Scr_ParamError_BW(0, va_BW("kick: clientNum %i out of range", clientNum),
                           SCRIPTINSTANCE_SERVER);
         return;
@@ -618,40 +609,14 @@ static void GScr_Kick()
     if (nparam == 2)
     {
         const char *r = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
-        DbgPrint("sv_bots: [KICK] reason arg = %s\n", r ? r : "(null)");
         if (r && *r) reason = r;
     }
-    DbgPrint("sv_bots: [KICK] final reason='%s'\n", reason);
 
     clientBW_t *cl = BW_GetClient(clientNum);
-    DbgPrint("sv_bots: [KICK] BW_GetClient(%d) = %p\n", clientNum, (void *)cl);
-
-    if (!cl)
-    {
-        DbgPrint("sv_bots: [KICK] NULL client — abort\n");
+    if (!cl || cl->header.state < CS_CONNECTED)
         return;
-    }
 
-    DbgPrint("sv_bots: [KICK] cl->header.state = %d (CS_CONNECTED=%d)\n",
-             cl->header.state, CS_CONNECTED);
-
-    if (cl->header.state < CS_CONNECTED)
-    {
-        DbgPrint("sv_bots: [KICK] state < CONNECTED — abort drop\n");
-        return;
-    }
-
-    // r306b: SV_DropClient declared in symbols_bw_ext.h (r335 TU7 audit) at
-    // 0x82283BF0. Address Ghidra-fingerprinted today against EXE_PLAYERKICKED
-    // xref chain: state==CS_ZOMBIE guard, name read from cl+0x21328,
-    // clientNum via stride 0xB762C, sets state=CS_ZOMBIE before return.
-    // If kick still doesn't work after this build, the bug is upstream of
-    // the call (struct offsets, cl pointer, gsc params) or downstream
-    // (game-loop client cleanup not running, not a wrong-address problem).
-    DbgPrint("sv_bots: [KICK] >>> calling SV_DropClient(cl=%p, '%s', true)\n",
-             (void *)cl, reason);
     SV_DropClient(cl, reason, true);
-    DbgPrint("sv_bots: [KICK] <<< SV_DropClient returned\n");
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -719,22 +684,22 @@ static void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
     Scr_AddInt_BW((combined & KEY_GOSTAND) != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
 }
 
-// r308c: istestclient — DIRECT read of svs.clients[N]->isTestClient.
+// GSC method: <player> istestclient() -> int (0 or 1)
 //
-// Previous revision (r308b) called SV_IsTestClient(0x8221F6D0). That returned
-// 0 for actual bots in the field (verified by on-screen "BW: do_isbot istc=0"
-// while Larry bots were visibly in the world). Likely cause: SV_IsTestClient
-// indexes gclient_s (game-side), and T4 does not copy isTestClient from
-// svs.clients (server-side) into gclient at bot spawn time. So gclient's
-// field stays zero-initialized.
+// Returns whether the client slot was spawned via SV_AddTestClient (i.e. a
+// bot). Reads svs.clients[N].isTestClient directly via BW_GetClient at
+// offset 0xB561C — set by SV_AddTestClient itself when the bot connects.
 //
-// Workaround: read from svs.clients[N].isTestClient directly via BW_GetClient,
-// which we already use successfully in GScr_Kick. client_t.isTestClient is
-// at offset 0xB561C — set by SV_AddTestClient itself when the bot connects.
-// This is the canonical source of truth for "is this slot a test client".
+// We deliberately do NOT use the engine's SV_IsTestClient (0x8221F6D0).
+// On TU7 that function indexes gclient_s (game-side) at offset 0x39BC,
+// and the engine never copies the flag from svs.clients into gclient at
+// spawn time, so the gclient field stays zero. Verified with [ISTC]
+// diagnostic in r308c — direct read worked, SV_IsTestClient did not.
 //
-// Diagnostic: log both reads so we can see what each path returns. After
-// kick ships, the diagnostic can be removed.
+// Used by bw11's bots_adapter_pt4.gsc::do_isbot as the engine-side
+// fallback when pers["isBot"] wasn't stamped (which happens on T4
+// because PlayerConnect fires before userinfo is parsed, defeating the
+// "Larry" name-prefix check).
 static void PlayerCmd_IsTestClient(scr_entref_t entref)
 {
     if (entref.classnum != 0)
@@ -747,23 +712,8 @@ static void PlayerCmd_IsTestClient(scr_entref_t entref)
         return;
     }
 
-    const int clientNum = static_cast<int>(entref.entnum);
-
-    // Path A: stock symbol (may be wrong on TU7 — known to return 0 for bots).
-    const int svIsTC = SV_IsTestClient(clientNum);
-
-    // Path B: direct read from svs.clients[N].isTestClient.
-    int directIsTC = 0;
-    clientBW_t *cl = BW_GetClient(clientNum);
-    if (cl)
-        directIsTC = cl->isTestClient;
-
-    DbgPrint("sv_bots: [ISTC] cn=%d sv=%d direct=%d state=%d\n",
-             clientNum, svIsTC, directIsTC,
-             cl ? static_cast<int>(cl->header.state) : -1);
-
-    // Return TRUE if either path says yes. Belt and suspenders.
-    const int result = (svIsTC != 0 || directIsTC != 0) ? 1 : 0;
+    clientBW_t *cl = BW_GetClient(static_cast<int>(entref.entnum));
+    const int result = (cl && cl->isTestClient != 0) ? 1 : 0;
     Scr_AddInt_BW(result, SCRIPTINSTANCE_SERVER);
 }
 
@@ -850,7 +800,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r308c istc-direct-read)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r309 kick-shipped)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
