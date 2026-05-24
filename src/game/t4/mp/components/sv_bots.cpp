@@ -719,12 +719,22 @@ static void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
     Scr_AddInt_BW((combined & KEY_GOSTAND) != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
 }
 
-// r308: istestclient — engine-native bot detection.
-// Reads cl->isTestClient via SV_IsTestClient(clientNum). bw11's
-// `do_isbot` fallback chain checks this when self.pers["isBot"] isn't set
-// (which happens if PlayerConnect fires before userinfo is parsed, so the
-// "Larry" name-prefix branch never matched). Mirrors what CoD4x IW3 BW
-// achieves with `return self.isbot;` — same outcome, different access path.
+// r308c: istestclient — DIRECT read of svs.clients[N]->isTestClient.
+//
+// Previous revision (r308b) called SV_IsTestClient(0x8221F6D0). That returned
+// 0 for actual bots in the field (verified by on-screen "BW: do_isbot istc=0"
+// while Larry bots were visibly in the world). Likely cause: SV_IsTestClient
+// indexes gclient_s (game-side), and T4 does not copy isTestClient from
+// svs.clients (server-side) into gclient at bot spawn time. So gclient's
+// field stays zero-initialized.
+//
+// Workaround: read from svs.clients[N].isTestClient directly via BW_GetClient,
+// which we already use successfully in GScr_Kick. client_t.isTestClient is
+// at offset 0xB561C — set by SV_AddTestClient itself when the bot connects.
+// This is the canonical source of truth for "is this slot a test client".
+//
+// Diagnostic: log both reads so we can see what each path returns. After
+// kick ships, the diagnostic can be removed.
 static void PlayerCmd_IsTestClient(scr_entref_t entref)
 {
     if (entref.classnum != 0)
@@ -736,8 +746,25 @@ static void PlayerCmd_IsTestClient(scr_entref_t entref)
         Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
         return;
     }
-    const int result = SV_IsTestClient(static_cast<int>(entref.entnum));
-    Scr_AddInt_BW(result != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
+
+    const int clientNum = static_cast<int>(entref.entnum);
+
+    // Path A: stock symbol (may be wrong on TU7 — known to return 0 for bots).
+    const int svIsTC = SV_IsTestClient(clientNum);
+
+    // Path B: direct read from svs.clients[N].isTestClient.
+    int directIsTC = 0;
+    clientBW_t *cl = BW_GetClient(clientNum);
+    if (cl)
+        directIsTC = cl->isTestClient;
+
+    DbgPrint("sv_bots: [ISTC] cn=%d sv=%d direct=%d state=%d\n",
+             clientNum, svIsTC, directIsTC,
+             cl ? static_cast<int>(cl->header.state) : -1);
+
+    // Return TRUE if either path says yes. Belt and suspenders.
+    const int result = (svIsTC != 0 || directIsTC != 0) ? 1 : 0;
+    Scr_AddInt_BW(result, SCRIPTINSTANCE_SERVER);
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +850,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r308 istestclient-method)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r308c istc-direct-read)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
