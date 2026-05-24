@@ -625,13 +625,17 @@ static void GScr_Kick()
         return;
     }
 
-    // r307: SV_DropClient_BW declared in symbols_bw_ext.h with TU7-verified
-    // address 0x82283BF0 (Ghidra fingerprint match — see header comment).
-    // Diagnostic prints retained one revision; will remove in r308 if green.
-    DbgPrint("sv_bots: [KICK] >>> calling SV_DropClient_BW(cl=%p, '%s', true)\n",
+    // r306b: SV_DropClient declared in symbols_bw_ext.h (r335 TU7 audit) at
+    // 0x82283BF0. Address Ghidra-fingerprinted today against EXE_PLAYERKICKED
+    // xref chain: state==CS_ZOMBIE guard, name read from cl+0x21328,
+    // clientNum via stride 0xB762C, sets state=CS_ZOMBIE before return.
+    // If kick still doesn't work after this build, the bug is upstream of
+    // the call (struct offsets, cl pointer, gsc params) or downstream
+    // (game-loop client cleanup not running, not a wrong-address problem).
+    DbgPrint("sv_bots: [KICK] >>> calling SV_DropClient(cl=%p, '%s', true)\n",
              (void *)cl, reason);
-    SV_DropClient_BW(cl, reason, 1);
-    DbgPrint("sv_bots: [KICK] <<< SV_DropClient_BW returned\n");
+    SV_DropClient(cl, reason, true);
+    DbgPrint("sv_bots: [KICK] <<< SV_DropClient returned\n");
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -781,7 +785,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r307 sv-dropclient-verified)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r306b kick-diag-correct-symbols)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
