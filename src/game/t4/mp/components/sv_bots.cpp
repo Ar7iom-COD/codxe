@@ -719,6 +719,27 @@ static void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
     Scr_AddInt_BW((combined & KEY_GOSTAND) != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
 }
 
+// r308: istestclient — engine-native bot detection.
+// Reads cl->isTestClient via SV_IsTestClient(clientNum). bw11's
+// `do_isbot` fallback chain checks this when self.pers["isBot"] isn't set
+// (which happens if PlayerConnect fires before userinfo is parsed, so the
+// "Larry" name-prefix branch never matched). Mirrors what CoD4x IW3 BW
+// achieves with `return self.isbot;` — same outcome, different access path.
+static void PlayerCmd_IsTestClient(scr_entref_t entref)
+{
+    if (entref.classnum != 0)
+        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
+    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+    const int result = SV_IsTestClient(static_cast<int>(entref.entnum));
+    Scr_AddInt_BW(result != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
+}
+
 // ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
@@ -750,6 +771,7 @@ static struct
     {"getentitynumber",    PlayerCmd_GetEntityNumber},
     {"getguid",            PlayerCmd_GetGuid},
     {"jumpbuttonpressed",  PlayerCmd_JumpButtonPressed},  // r304: needed for BW menu select
+    {"istestclient",       PlayerCmd_IsTestClient},        // r308: engine bot detection
     {nullptr, nullptr},
 };
 
@@ -801,7 +823,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r307 zombie-state-guard)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r308 istestclient-method)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
