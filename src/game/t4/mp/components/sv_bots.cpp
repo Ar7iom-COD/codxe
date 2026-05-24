@@ -192,6 +192,126 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 }
 
 // ---------------------------------------------------------------------------
+// r310: instrumentation for hard-freeze hunt (bot-count-linear freeze)
+// ---------------------------------------------------------------------------
+//
+// Three probes, all driven from the existing SV_BotUserMove_Stub callsite —
+// no new detours, no new symbols, no header changes.
+//
+//   Probe A  BW_Heartbeat()     adaptive per-tick health snapshot
+//   Probe B  BW_WalkClients()   piggyback svs.clients[] scan on print
+//   Probe C  BW_LogAnomaly()    first-fail latched corruption logger
+//
+// Output: DbgPrint lines tagged [HB], [HBSPK], [GUARD]
+// Cadence: quiet baseline every 5s; alarm immediately on dt > 50ms or
+//          bot/active-count delta.
+
+namespace
+{
+    // --- tunables (must be `const`, not `constexpr` — VS2010) ---
+    const unsigned int BW_HB_QUIET_MS    = 5000;
+    const unsigned int BW_HB_ALARM_DT_MS = 50;
+
+    // --- heartbeat state ---
+    unsigned int g_bw_hb_last_print_ms = 0;
+    unsigned int g_bw_hb_last_tick_ms  = 0;
+    unsigned int g_bw_hb_tick_count    = 0;
+    unsigned int g_bw_hb_alarm_count   = 0;
+    int          g_bw_hb_last_bots     = -1;
+    int          g_bw_hb_last_active   = -1;
+    unsigned int g_bw_hb_guard_logs    = 0;
+
+    // --- Probe C: per-client first-fail latch ---
+    unsigned char g_bw_guard_logged[MAX_CLIENTS_BW] = {0};
+
+    // --- Probe B ---
+    void BW_WalkClients(int *outBots, int *outActive, int *outZombies,
+                        int *outConnecting)
+    {
+        int bots = 0, active = 0, zombies = 0, connecting = 0;
+        clientBW_t *base = reinterpret_cast<clientBW_t *>(svsHeader->clients);
+
+        for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+        {
+            clientBW_t *cl = base + i;
+
+            switch (cl->header.state)
+            {
+                case CS_FREE:          break;
+                case CS_ZOMBIE:        ++zombies;    break;
+                case CS_CONNECTED:
+                case CS_CLIENTLOADING: ++connecting; break;
+                case CS_ACTIVE:        ++active;     break;
+                default:               break;
+            }
+
+            if (cl->isTestClient) ++bots;
+        }
+
+        if (outBots)       *outBots       = bots;
+        if (outActive)     *outActive     = active;
+        if (outZombies)    *outZombies    = zombies;
+        if (outConnecting) *outConnecting = connecting;
+    }
+
+    // --- Probe A ---
+    void BW_Heartbeat(void)
+    {
+        const unsigned int now = static_cast<unsigned int>(svsHeader->time);
+        const unsigned int dt  = (g_bw_hb_last_tick_ms == 0) ? 0u
+                                 : (now - g_bw_hb_last_tick_ms);
+
+        g_bw_hb_last_tick_ms = now;
+        ++g_bw_hb_tick_count;
+
+        bool alarm = false;
+        if (dt > BW_HB_ALARM_DT_MS && g_bw_hb_tick_count > 1)
+        {
+            ++g_bw_hb_alarm_count;
+            alarm = true;
+            DbgPrint("sv_bots: [HBSPK] dt=%ums ticks=%u alarms=%u\n",
+                     dt, g_bw_hb_tick_count, g_bw_hb_alarm_count);
+        }
+
+        const unsigned int sincePrint = now - g_bw_hb_last_print_ms;
+        if (!alarm && sincePrint < BW_HB_QUIET_MS) return;
+
+        int bots = 0, active = 0, zombies = 0, connecting = 0;
+        BW_WalkClients(&bots, &active, &zombies, &connecting);
+
+        const bool botDelta    = (g_bw_hb_last_bots   >= 0) && (bots   != g_bw_hb_last_bots);
+        const bool activeDelta = (g_bw_hb_last_active >= 0) && (active != g_bw_hb_last_active);
+
+        if (alarm || sincePrint >= BW_HB_QUIET_MS || botDelta || activeDelta)
+        {
+            DbgPrint("sv_bots: [HB] bots=%d active=%d zomb=%d conn=%d "
+                     "ticks=%u alarms=%u guards=%u svtime=%ums\n",
+                     bots, active, zombies, connecting,
+                     g_bw_hb_tick_count, g_bw_hb_alarm_count,
+                     g_bw_hb_guard_logs, now);
+            g_bw_hb_last_print_ms = now;
+            g_bw_hb_last_bots     = bots;
+            g_bw_hb_last_active   = active;
+        }
+    }
+
+    // --- Probe C ---
+    void BW_LogAnomaly(int clientNum, clientBW_t *cl, const char *tag)
+    {
+        if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW) return;
+        if (g_bw_guard_logged[clientNum]) return;
+        g_bw_guard_logged[clientNum] = 1;
+        ++g_bw_hb_guard_logs;
+        DbgPrint("sv_bots: [GUARD] cn=%d %s state=%d isTest=%d remAdr=%d gent=%p\n",
+                 clientNum, tag,
+                 static_cast<int>(cl->header.state),
+                 static_cast<int>(cl->isTestClient),
+                 static_cast<int>(cl->header.netchan.remoteAddress.type),
+                 reinterpret_cast<void *>(cl->gentity));
+    }
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
 // SV_BotUserMove detour — core bot driver
 // ---------------------------------------------------------------------------
 
@@ -206,6 +326,8 @@ static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1, -1, -1, -1, -1, -1, -1, -1,
 
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
+    BW_Heartbeat();   // r310 Probe A — runs every tick regardless of guards
+
     if (!cl->gentity)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -253,6 +375,19 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     if (cl->header.state != CS_ACTIVE)
     {
         return;  // no input for non-active clients; do not call the engine path
+    }
+
+    // r310 Probe C: first-fail logging for active-slot anomalies.
+    // Behavior unchanged — these are observation-only.
+    {
+        if (cl->gentity == 0)
+            BW_LogAnomaly(clientNum, cl, "ACTIVE_NO_GENTITY");
+        if (cl->isTestClient &&
+            cl->header.netchan.remoteAddress.type != NA_BOT)
+            BW_LogAnomaly(clientNum, cl, "BOT_NOT_NA_BOT");
+        if (!cl->isTestClient &&
+            cl->header.netchan.remoteAddress.type == NA_BOT)
+            BW_LogAnomaly(clientNum, cl, "NA_BOT_NOT_BOT");
     }
 
     // Defense in depth: only inject input for real bot clients.
