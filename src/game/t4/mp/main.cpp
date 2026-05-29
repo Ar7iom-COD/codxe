@@ -18,46 +18,23 @@ namespace mp
 {
 T4_MP_Plugin::T4_MP_Plugin()
 {
-    DbgPrint("T4 MP: Plugin loaded (r313 minimal-bw-only)\n");
+    DbgPrint("T4 MP: Plugin loaded (r314 minimal-bw + GSCClientMethods)\n");
 
     // ========================================================================
-    // r313 — STRIPPED MODULE SET for freeze diagnosis + BW-only operation
+    // r314 — GSCClientMethods restored.
     //
-    // Confirmed (2026-05-29): stock codxe T4 MP freezes ~3-6 min into any
-    // match on Xenia, even with 0 bots, just walking around. Vanilla WaW on
-    // the same Xenia finishes matches normally. Process Explorer stack at
-    // freeze shows 3 PPC JIT threads parked in:
-    //     ntdll!NtWaitForSingleObject
-    //     xenia!curl_formfree+0xXXX  (x3 threads)
+    // r313 build (6 modules) compiled clean but BW scripts failed at load with
+    // "Server script compile error / unknown function". One of the stripped
+    // modules was load-bearing for BW's GSC surface.
     //
-    // Guest code is blocked in a libcurl/kernel wait that never returns.
-    // codxe doesn't link libcurl directly — something it detours/hooks must
-    // be calling a guest function that fans out to Xenia's network or XAM
-    // emulation, which uses libcurl internally.
+    // GSCClientMethods is the most likely culprit: it detours T4's player
+    // method dispatcher to register methods like ButtonPressed, SetVelocity,
+    // SetStance, etc. BW's scripts likely call one of these (probably
+    // ButtonPressed for menu input).
     //
-    // STRATEGY: drop every non-essential module in one pass.
-    //   - If freeze disappears: the answer was in the stripped set, ship it.
-    //   - If freeze persists: narrowed to {Config, Branding, GSCClientFields,
-    //     GSCLoader, sv_bots, ui}, or codxe Plugin/RegisterModule machinery.
-    //
-    // KEPT MODULES (6):
-    //   Config          — reads codxe.json, selects active mod (required)
-    //   Branding        — "CoDxe rXXX" build banner (cosmetic, kept by user req)
-    //   GSCClientFields — self.god / self.noclip / self.ufo (kept by user req)
-    //   GSCLoader       — loads .gsc from mod folder (required for BW scripts)
-    //   sv_bots         — BW bot driver (the whole point of this port)
-    //   ui              — splitscreen + StartServer fixes (needed for testing)
-    //
-    // STRIPPED MODULES (5 plus 2 already-off):
-    //   BrushCollision  — noclip_brushes dvar; dev tool; CG_DrawActive per-frame
-    //   GSCClientMethods — SetVelocity, SetStance, ButtonPressed; BW doesn't use
-    //   GSCFunctions    — only registers getplayerclipbrushescontainingpoint
-    //   Map             — .ents override loader; BW doesn't use map ents
-    //   TestModule      — empty
-    //   cg              — already off since r301 (ADS bug)
-    //   ImageLoader     — already off upstream
-    //
-    // Inline weapon NOP patches also stripped (already off since r300).
+    // Re-adding it. If BW now loads -> confirmed minimum viable set is 7
+    // modules. If error persists -> it's a different missing function and
+    // we capture the actual name from Xenia console.
     // ========================================================================
 
     RegisterModule(new Config());
@@ -65,7 +42,7 @@ T4_MP_Plugin::T4_MP_Plugin()
     // RegisterModule(new BrushCollision());     // [r313] stripped — dev tool, per-frame hook
     // RegisterModule(new cg());                  // [r301] stripped — ADS angle corruption
     RegisterModule(new GSCClientFields());
-    // RegisterModule(new GSCClientMethods());   // [r313] stripped — BW doesn't call these
+    RegisterModule(new GSCClientMethods());      // [r314] RESTORED — was load-bearing for BW
     // RegisterModule(new GSCFunctions());       // [r313] stripped — only dev function
     RegisterModule(new GSCLoader());
     // RegisterModule(new ImageLoader());         // upstream default
