@@ -41,6 +41,40 @@
 // We do NOT modify the existing stock definition (its static_asserts would
 // break the build); we define a parallel byte-compatible view.
 //
+// ===========================================================================
+// r319 — STRUCT FIX (netchan layout + svs.clients base) — 2026-05-30
+// ===========================================================================
+// Two structural bugs were identified via Ghidra after r317 reached a stable
+// match-completion baseline:
+//
+// BUG 1: netchan_t layout (this file)
+//   The previous netchan_t had 0x1C bytes of padding between incomingSequence
+//   (+0x0C) and remoteAddress (+0x2C). That made remoteAddress.type land at
+//   cl + 0x3C. Verified WRONG via:
+//     a) FUN_8228AD80 (SV_BotFrame) decompile: `piVar3[8] == 0` is the bot
+//        check, where piVar3 is the cl pointer as int*. piVar3[8] is cl + 0x20.
+//        So the engine reads netchan.remoteAddress.type at cl + 0x20.
+//     b) SV_AddTestClient_Real (FUN_82285D28) calls NetCompareBaseAdr with
+//        `*(undefined8 *)(piVar6 + 8)` and `piVar6[10]` — passing the
+//        netadr_t at cl + 0x20 to the comparator.
+//   The 0x1C padding came from an IW3 client_t layout where netchan really
+//   does have intermediate fields. On T4 the netchan is denser: remoteAddress
+//   sits at netchan + 0x10 (cl + 0x20).
+//
+//   FIX: remove the 0x1C padding. remoteAddress lands at netchan + 0x10.
+//   This also re-anchors all the static_asserts for clientBW_t fields after
+//   the netchan; everything downstream was already correct because struct
+//   padding past userinfo (+0x06DC) is fixed by explicit _pad arrays.
+//
+// BUG 2: svs.clients base address (handled in sv_bots.cpp, not here)
+//   Previously BW_GetClient computed clientBW_t* as
+//     &svsHeader->clients[clientNum]
+//   where svsHeader was 0x84F85100 (from stock codxe symbols.h). Ghidra
+//   shows the engine's own functions (SV_BotFrame, SV_AddTestClient_Real,
+//   SV_GetUsercmd) all use DAT_830c0c90 as the svs.clients base. These two
+//   bases are NOT related; 0x84F85100 was always wrong for svs.clients.
+//   sv_bots.cpp now uses an explicit constant kSvsClientsBase = 0x830C0C90.
+// ===========================================================================
 
 #include "structs.h"
 
@@ -57,6 +91,13 @@ static const size_t kClientTSize     = 0xB762C;
 static const int    MAX_CLIENTS_BW   = 18;
 static const int    PACKET_BACKUP_BW = 32;
 static const int    T4_PROTOCOL      = 0x5C;
+
+// Real svs.clients base address on TU7 default_mp.xex. Used directly via
+// BW_GetClient in sv_bots.cpp. Verified via Ghidra:
+//   - SV_BotFrame (FUN_8228AD80) iterates DAT_830c0c90 with stride 0xb762c
+//   - SV_AddTestClient_Real (FUN_82285D28) writes to DAT_830c0c90 slots
+//   - SV_GetUsercmd (FUN_82286458) reads lastUsercmd from DAT_830c0c90
+static const unsigned int kSvsClientsBase = 0x830C0C90;
 
 // ---- Enums ---------------------------------------------------------------
 
@@ -96,21 +137,27 @@ struct __declspec(align(4)) netadr_t
 
 // ---- Netchan -------------------------------------------------------------
 // Embedded at clientHeader_t + 0x10 (i.e. client_t + 0x10).
+//
+// r319 FIX: remoteAddress sits immediately after incomingSequence with NO
+// padding between. Verified via Ghidra SV_BotFrame: cl[8] (= cl+0x20) is
+// remoteAddress.type. The previous layout's 0x1C-byte padding came from
+// an IW3 client_t structure and never matched T4.
 
 struct netchan_t
 {
-    int       outgoingSequence;  // +0x00
-    netsrc_t  sock;              // +0x04
-    int       dropped;           // +0x08
-    int       incomingSequence;  // +0x0C
-    char      _pad_10[0x2C - 0x10];
-    netadr_t  remoteAddress;     // +0x2C (.type lands at client_t + 0x3C)
-    // [opaque trailing buffers + profiling stream]
+    int       outgoingSequence;  // +0x00 (cl + 0x10)
+    netsrc_t  sock;              // +0x04 (cl + 0x14)
+    int       dropped;           // +0x08 (cl + 0x18)
+    int       incomingSequence;  // +0x0C (cl + 0x1C)
+    netadr_t  remoteAddress;     // +0x10 (cl + 0x20)  [FIX: was +0x2C]
+    // [opaque trailing buffers + profiling stream — total netchan size
+    //  is unknown but doesn't matter for BW; we only touch the fields
+    //  above and the rest is absorbed by clientBW_t._pad_after_header]
 };
 
 static_assert(offsetof(netchan_t, outgoingSequence) == 0x00, "");
 static_assert(offsetof(netchan_t, dropped)          == 0x08, "");
-static_assert(offsetof(netchan_t, remoteAddress)    == 0x2C, "");
+static_assert(offsetof(netchan_t, remoteAddress)    == 0x10, "");
 
 // ---- Extended client header ----------------------------------------------
 
@@ -202,7 +249,8 @@ static_assert(sizeof(clientBW_t)                                       == kClien
 static_assert(offsetof(clientBW_t, header.state)                       == 0x00000, "");
 static_assert(offsetof(clientBW_t, header.deltaMessage)                == 0x00008, "");
 static_assert(offsetof(clientBW_t, header.netchan.outgoingSequence)    == 0x00010, "");
-static_assert(offsetof(clientBW_t, header.netchan.remoteAddress)       == 0x0003C, "");
+// r319: remoteAddress is now at cl + 0x20 (header.netchan + 0x10)
+static_assert(offsetof(clientBW_t, header.netchan.remoteAddress)       == 0x00020, "");
 static_assert(offsetof(clientBW_t, userinfo)                           == 0x006DC, "");
 static_assert(offsetof(clientBW_t, lastUsercmd)                        == 0x20EF4, "");
 static_assert(offsetof(clientBW_t, gentity)                            == 0x21324, "");
