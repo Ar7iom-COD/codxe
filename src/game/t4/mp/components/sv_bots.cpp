@@ -145,8 +145,8 @@ static inline clientBW_t *BW_GetClient(int clientNum)
     // r319b: svs.clients base is stored at 0x830C0C90 as a POINTER VARIABLE
     // (verified: Ghidra decompile casts `(ulonglong)DAT_830c0c90` and uses
     //  it as `pointer + offset`, confirming it's a pointer variable, not
-    //  the literal base address). Dereference via BW_GetSvsClientsBase().
-    clientBW_t *base = BW_GetSvsClientsBase();
+    //  the literal base address). Dereference via BW_SVS_CLIENTS_BASE macro.
+    clientBW_t *base = BW_SVS_CLIENTS_BASE();
     return &base[clientNum];
 }
 
@@ -234,8 +234,8 @@ namespace
                         int *outConnecting)
     {
         int bots = 0, active = 0, zombies = 0, connecting = 0;
-        // r319b: svs.clients base via pointer-deref helper.
-        clientBW_t *base = BW_GetSvsClientsBase();
+        // r319b: svs.clients base via pointer-deref macro.
+        clientBW_t *base = BW_SVS_CLIENTS_BASE();
 
         for (int i = 0; i < MAX_CLIENTS_BW; ++i)
         {
@@ -316,7 +316,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 
     // r319b: clientNum derived from real svs.clients base (pointer-deref).
-    const clientBW_t *kBase = BW_GetSvsClientsBase();
+    const clientBW_t *kBase = BW_SVS_CLIENTS_BASE();
     const int clientNum = static_cast<int>(cl - kBase);
 
     // [r319b] UNCONDITIONAL one-shot entry log per client. Fires BEFORE any
@@ -333,7 +333,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         if (!s_entryLogged[logIdx])
         {
             s_entryLogged[logIdx] = 1;
-            DbgPrint("sv_bots: [ENTRY r319b] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
+            DbgPrint("sv_bots: [ENTRY r319c] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
                      reinterpret_cast<void *>(cl),
                      reinterpret_cast<const void *>(kBase),
                      clientNum,
@@ -999,7 +999,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r319b svsbase-deref entry-diag)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r319c macro-deref)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
