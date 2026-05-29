@@ -142,11 +142,11 @@ static const BotAction_t BotActions[] = {
 
 static inline clientBW_t *BW_GetClient(int clientNum)
 {
-    // r319: use the real svs.clients base directly. svsHeader->clients
-    // (via 0x84F85100) was a phantom path — engine code (SV_BotFrame,
-    // SV_AddTestClient_Real, SV_GetUsercmd) uses DAT_830c0c90 as the
-    // canonical svs.clients base. See structs_bw_ext.h r319 notes.
-    clientBW_t *base = reinterpret_cast<clientBW_t *>(kSvsClientsBase);
+    // r319b: svs.clients base is stored at 0x830C0C90 as a POINTER VARIABLE
+    // (verified: Ghidra decompile casts `(ulonglong)DAT_830c0c90` and uses
+    //  it as `pointer + offset`, confirming it's a pointer variable, not
+    //  the literal base address). Dereference via BW_GetSvsClientsBase().
+    clientBW_t *base = BW_GetSvsClientsBase();
     return &base[clientNum];
 }
 
@@ -234,8 +234,8 @@ namespace
                         int *outConnecting)
     {
         int bots = 0, active = 0, zombies = 0, connecting = 0;
-        // r319: real svs.clients base.
-        clientBW_t *base = reinterpret_cast<clientBW_t *>(kSvsClientsBase);
+        // r319b: svs.clients base via pointer-deref helper.
+        clientBW_t *base = BW_GetSvsClientsBase();
 
         for (int i = 0; i < MAX_CLIENTS_BW; ++i)
         {
@@ -315,9 +315,35 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         return;
     }
 
-    // r319: clientNum derived from real svs.clients base.
-    const clientBW_t *kBase = reinterpret_cast<const clientBW_t *>(kSvsClientsBase);
+    // r319b: clientNum derived from real svs.clients base (pointer-deref).
+    const clientBW_t *kBase = BW_GetSvsClientsBase();
     const int clientNum = static_cast<int>(cl - kBase);
+
+    // [r319b] UNCONDITIONAL one-shot entry log per client. Fires BEFORE any
+    // guards. If we see [ENTRY] but never [VERIFY], the guards are rejecting
+    // every bot — diagnoses whether r319's offset fix actually worked.
+    // If we see neither: our detour isn't being called at all.
+    {
+        static unsigned char s_entryLogged[MAX_CLIENTS_BW + 4] = {0};
+        // Use a sentinel slot for "clientNum out of range" so we still log
+        // exactly one anomaly even when the base is wrong.
+        const int logIdx = (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
+                           ? clientNum
+                           : MAX_CLIENTS_BW; // slot MAX_CLIENTS for OOR cases
+        if (!s_entryLogged[logIdx])
+        {
+            s_entryLogged[logIdx] = 1;
+            DbgPrint("sv_bots: [ENTRY r319b] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
+                     reinterpret_cast<void *>(cl),
+                     reinterpret_cast<const void *>(kBase),
+                     clientNum,
+                     static_cast<int>(cl->header.state),
+                     static_cast<int>(cl->header.netchan.remoteAddress.type),
+                     static_cast<int>(cl->isTestClient),
+                     reinterpret_cast<void *>(cl->gentity));
+        }
+    }
+
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -383,6 +409,10 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 #endif
 
+    // [r319b] Guards TEMPORARILY DISABLED for diagnostic. [ENTRY r319b] log
+    // above will tell us what remAdr/isTest actually read. Once we confirm
+    // the offsets are correct, guards get re-enabled in next rev.
+    //
     // [r319] Defense-in-depth guards RE-ENABLED.
     // With r319's netchan_t fix, remoteAddress.type is now at cl + 0x20
     // matching the engine's own bot check (SV_BotFrame's piVar3[8]==0).
@@ -391,6 +421,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     // The engine's outer loop (SV_BotFrame) only calls SV_BotUserMove for
     // slots where state != CS_FREE AND remoteAddress.type == NA_BOT, so
     // in theory we should never see a non-bot here. But cheap to check.
+#if 0
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -401,6 +432,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
+#endif
 
     // [r319] One-shot per-client struct verification log. Logs once per
     // client per match, AFTER guards pass. Confirms the r319 offset fix
@@ -967,7 +999,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r319 struct-fix netchan+svsbase)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r319b svsbase-deref entry-diag)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
