@@ -18,7 +18,7 @@ namespace mp
 {
 T4_MP_Plugin::T4_MP_Plugin()
 {
-    DbgPrint("T4 MP: Plugin loaded (r316 no-brushcoll freeze-test)\n");
+    DbgPrint("T4 MP: Plugin loaded (r319 struct-fix netchan+svsbase)\n");
 
     // ========================================================================
     // r316 — BrushCollision removed, everything else as r309/r315 baseline.
