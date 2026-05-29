@@ -92,12 +92,28 @@ static const int    MAX_CLIENTS_BW   = 18;
 static const int    PACKET_BACKUP_BW = 32;
 static const int    T4_PROTOCOL      = 0x5C;
 
-// Real svs.clients base address on TU7 default_mp.xex. Used directly via
-// BW_GetClient in sv_bots.cpp. Verified via Ghidra:
-//   - SV_BotFrame (FUN_8228AD80) iterates DAT_830c0c90 with stride 0xb762c
-//   - SV_AddTestClient_Real (FUN_82285D28) writes to DAT_830c0c90 slots
-//   - SV_GetUsercmd (FUN_82286458) reads lastUsercmd from DAT_830c0c90
-static const unsigned int kSvsClientsBase = 0x830C0C90;
+// Real svs.clients base address on TU7 default_mp.xex. Used via BW_GetClient
+// in sv_bots.cpp.
+//
+// CRITICAL: 0x830C0C90 is NOT the svs.clients base itself — it is the address
+// of a pointer variable that holds the real base. The engine code reads it
+// as `*(clientBW_t**)0x830C0C90` to get the actual base pointer. Verified
+// via Ghidra decompile of SV_GetUsercmd (FUN_82286458):
+//   `(ulonglong)param_1 * 0xb762c + (ulonglong)DAT_830c0c90 + 0x20ef4`
+// The `(ulonglong)DAT_830c0c90` cast confirms DAT_830c0c90 is a pointer
+// variable; if it were the literal base address Ghidra wouldn't cast it.
+// SV_BotFrame's `piVar3 = DAT_830c0c90` is also a pointer-variable read.
+//
+// sv_bots.cpp resolves the real base via inline pointer-deref at each call
+// site so the dereference happens at runtime — the pointer is set by
+// sv_initgame before our stubs ever fire. We use a macro instead of an
+// inline function because the helper would need to forward-reference the
+// clientBW_t type that hasn't been declared yet at this point in the file.
+static const unsigned int kSvsClientsBasePtr = 0x830C0C90;
+
+// Resolves to the real svs.clients[0] pointer at runtime. Cast to clientBW_t*
+// at call site (clientBW_t is declared further down in this header).
+#define BW_SVS_CLIENTS_BASE() (*reinterpret_cast<clientBW_t **>(kSvsClientsBasePtr))
 
 // ---- Enums ---------------------------------------------------------------
 
