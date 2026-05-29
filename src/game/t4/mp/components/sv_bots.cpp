@@ -257,42 +257,17 @@ namespace
     // --- Probe A ---
     void BW_Heartbeat(void)
     {
-        const unsigned int now = static_cast<unsigned int>(svsHeader->time);
-        const unsigned int dt  = (g_bw_hb_last_tick_ms == 0) ? 0u
-                                 : (now - g_bw_hb_last_tick_ms);
-
-        g_bw_hb_last_tick_ms = now;
-        ++g_bw_hb_tick_count;
-
-        bool alarm = false;
-        if (dt > BW_HB_ALARM_DT_MS && g_bw_hb_tick_count > 1)
-        {
-            ++g_bw_hb_alarm_count;
-            alarm = true;
-            DbgPrint("sv_bots: [HBSPK] dt=%ums ticks=%u alarms=%u\n",
-                     dt, g_bw_hb_tick_count, g_bw_hb_alarm_count);
-        }
-
-        const unsigned int sincePrint = now - g_bw_hb_last_print_ms;
-        if (!alarm && sincePrint < BW_HB_QUIET_MS) return;
-
-        int bots = 0, active = 0, zombies = 0, connecting = 0;
-        BW_WalkClients(&bots, &active, &zombies, &connecting);
-
-        const bool botDelta    = (g_bw_hb_last_bots   >= 0) && (bots   != g_bw_hb_last_bots);
-        const bool activeDelta = (g_bw_hb_last_active >= 0) && (active != g_bw_hb_last_active);
-
-        if (alarm || sincePrint >= BW_HB_QUIET_MS || botDelta || activeDelta)
-        {
-            DbgPrint("sv_bots: [HB] bots=%d active=%d zomb=%d conn=%d "
-                     "ticks=%u alarms=%u guards=%u svtime=%ums\n",
-                     bots, active, zombies, connecting,
-                     g_bw_hb_tick_count, g_bw_hb_alarm_count,
-                     g_bw_hb_guard_logs, now);
-            g_bw_hb_last_print_ms = now;
-            g_bw_hb_last_bots     = bots;
-            g_bw_hb_last_active   = active;
-        }
+        // [r317] DISABLED.
+        // Heartbeat log proved:
+        //   svsHeader->time reads 0 (wrong svs.time offset, OR svsHeader base wrong)
+        //   svtime spike to 0xFFFFFFFF once (uint underflow when "now" = 0 and
+        //     g_bw_hb_last_tick_ms != 0)
+        //   No HBSPK alarms even at freeze — freeze is not death spiral
+        // Walking svs.clients[] from a possibly-wrong base 17,000+ times per
+        // match while polluting logs with garbage values is harmful. Disabled.
+        // If freeze still happens with this off, target moves to cmd.serverTime
+        // and SV_ClientThink_BW path inside the stub.
+        return;
     }
 
     // --- Probe C ---
@@ -347,6 +322,11 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     // equivalent on T4) is iterating the host. The guards below should
     // still early-return for it (NA_BOT + isTest checks), but presence
     // alone is the signal we want.
+    //
+    // [r317] DISABLED — svsHeader->time reads 0; rate limit always passes
+    //                   so this floods the log. Also remAdr.type and
+    //                   isTestClient reads give garbage (struct offsets wrong).
+#if 0
     {
         static int s_lastEntryLogMs[MAX_CLIENTS_BW] = {0};
         const int now = svsHeader->time;
@@ -360,6 +340,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
                      static_cast<int>(cl->header.state));
         }
     }
+#endif
 
     // r307: state guard for zombie/free slots.
     // PROVEN BUG (r306b kick diagnostic, 2026-05-24):
@@ -378,7 +359,10 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 
     // r310 Probe C: first-fail logging for active-slot anomalies.
-    // Behavior unchanged — these are observation-only.
+    // [r317] DISABLED — struct offsets for remoteAddress.type and
+    //                   isTestClient confirmed wrong; logs garbage.
+    //                   Heartbeat log showed all bots reading remAdr=1.
+#if 0
     {
         if (cl->gentity == 0)
             BW_LogAnomaly(clientNum, cl, "ACTIVE_NO_GENTITY");
@@ -389,8 +373,22 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
             cl->header.netchan.remoteAddress.type == NA_BOT)
             BW_LogAnomaly(clientNum, cl, "NA_BOT_NOT_BOT");
     }
+#endif
 
-    // Defense in depth: only inject input for real bot clients.
+    // [r317] Defense-in-depth guards DISABLED.
+    // remoteAddress.type and isTestClient offsets in structs_bw_ext.h are
+    // wrong — heartbeat log proved every bot reads remAdr=1 (NA_BAD) instead
+    // of 0 (NA_BOT). With the guards active, every bot fell through to the
+    // vanilla SV_BotUserMove, so our cmd synthesis was being short-circuited.
+    //
+    // The engine's outer loop (SV_BotFrame or equivalent) only calls
+    // SV_BotUserMove for bot client slots — vanilla T4 doesn't call it on
+    // real human clients. So removing the guards is safe: only bots reach us.
+    //
+    // The host-pseudo-bot worry from r299 was diagnosed by the heartbeat
+    // entry log; if it manifests we re-add a state check using gentity ptr
+    // or another field that we can verify.
+#if 0
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -401,11 +399,18 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
+#endif
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
 
-    cmd.serverTime = svsHeader->time;
+    // [r317] svsHeader->time reads 0 (wrong offset or wrong base). Use a
+    // monotonic counter as serverTime so each cmd is unique. Engine validates
+    // cmd.serverTime is > previous cmd's serverTime; any increasing value
+    // works. ~50ms step matches a 20Hz bot update rate (matches IW3 BW).
+    static int s_botServerTime = 0;
+    s_botServerTime += 50;
+    cmd.serverTime = s_botServerTime;
 
     // r296: read the engine's authoritative current weapon directly from
     // the gentity's entityState. This is what GSC's getcurrentweapon()
@@ -419,6 +424,9 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
 
     // Rate-limited trace so the log isn't flooded: only when the value
     // changes per client, and at most once per 500 ms.
+    // [r317] DISABLED — svsHeader->time reads 0, rate limit doesn't gate.
+    //                   Log flood we already saw confirmed this.
+#if 0
     if (s_lastWeaponLogVal[clientNum] != gentityWeapon &&
         (svsHeader->time - s_lastWeaponLogMs[clientNum]) > 500)
     {
@@ -427,6 +435,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         s_lastWeaponLogVal[clientNum] = gentityWeapon;
         s_lastWeaponLogMs[clientNum]  = svsHeader->time;
     }
+#endif
 
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
 
@@ -935,7 +944,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r313 minimal-bw-only)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r317 heartbeat-off guard-off)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
