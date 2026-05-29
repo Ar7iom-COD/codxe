@@ -18,54 +18,66 @@ namespace mp
 {
 T4_MP_Plugin::T4_MP_Plugin()
 {
-    DbgPrint("T4 MP: Plugin loaded (r301 cg-module-disabled-for-ads-diag)\n");
+    DbgPrint("T4 MP: Plugin loaded (r313 minimal-bw-only)\n");
+
+    // ========================================================================
+    // r313 — STRIPPED MODULE SET for freeze diagnosis + BW-only operation
+    //
+    // Confirmed (2026-05-29): stock codxe T4 MP freezes ~3-6 min into any
+    // match on Xenia, even with 0 bots, just walking around. Vanilla WaW on
+    // the same Xenia finishes matches normally. Process Explorer stack at
+    // freeze shows 3 PPC JIT threads parked in:
+    //     ntdll!NtWaitForSingleObject
+    //     xenia!curl_formfree+0xXXX  (x3 threads)
+    //
+    // Guest code is blocked in a libcurl/kernel wait that never returns.
+    // codxe doesn't link libcurl directly — something it detours/hooks must
+    // be calling a guest function that fans out to Xenia's network or XAM
+    // emulation, which uses libcurl internally.
+    //
+    // STRATEGY: drop every non-essential module in one pass.
+    //   - If freeze disappears: the answer was in the stripped set, ship it.
+    //   - If freeze persists: narrowed to {Config, Branding, GSCClientFields,
+    //     GSCLoader, sv_bots, ui}, or codxe Plugin/RegisterModule machinery.
+    //
+    // KEPT MODULES (6):
+    //   Config          — reads codxe.json, selects active mod (required)
+    //   Branding        — "CoDxe rXXX" build banner (cosmetic, kept by user req)
+    //   GSCClientFields — self.god / self.noclip / self.ufo (kept by user req)
+    //   GSCLoader       — loads .gsc from mod folder (required for BW scripts)
+    //   sv_bots         — BW bot driver (the whole point of this port)
+    //   ui              — splitscreen + StartServer fixes (needed for testing)
+    //
+    // STRIPPED MODULES (5 plus 2 already-off):
+    //   BrushCollision  — noclip_brushes dvar; dev tool; CG_DrawActive per-frame
+    //   GSCClientMethods — SetVelocity, SetStance, ButtonPressed; BW doesn't use
+    //   GSCFunctions    — only registers getplayerclipbrushescontainingpoint
+    //   Map             — .ents override loader; BW doesn't use map ents
+    //   TestModule      — empty
+    //   cg              — already off since r301 (ADS bug)
+    //   ImageLoader     — already off upstream
+    //
+    // Inline weapon NOP patches also stripped (already off since r300).
+    // ========================================================================
+
     RegisterModule(new Config());
     RegisterModule(new Branding());
-    RegisterModule(new BrushCollision());
-
-    // [r301] cg module DISABLED for ADS-no-damage diagnostic.
-    // The cg module installs two detours on BG_CalculateWeaponPosition_IdleAngles
-    // and BG_CalculateView_IdleAngles. Both are "BG_" (BothGame) functions which
-    // run in both cgame (client) and game (server) contexts and affect view
-    // angle computation -- which is what bullet traces use as origin direction.
-    //
-    // Even though the hooks are designed to be pass-through when bg_bobIdle=true
-    // (default), codxe's Detour class relocates the function prologue. If the
-    // original prologue contains non-relocatable instructions (PC-relative or
-    // similar), the GetOriginal() trampoline executes a corrupted version of
-    // the function silently. Symptom would be: bullet trace fires in wrong
-    // direction, ADS misses (tight aim, no spread to compensate), hipfire ARs
-    // hit (large spread compensates), snipers miss even hipfire (no spread).
-    //
-    // This matches the bug profile exactly.
-    //
-    // If ADS works with this disabled: confirmed it's one of the BG_Calculate
-    // detours. We can re-enable cg with one detour at a time to bisect.
-    //
-    // RegisterModule(new cg());
-
-    // ORDER MATTERS: GSCClientMethods and GSCFunctions install detours on
-    // Player_GetMethod / Scr_GetFunction. sv_bots exposes its lookups via
-    // BW_LookupMethod / BW_LookupFunction which the existing dispatchers
-    // call before falling through. sv_bots must register AFTER them.
+    // RegisterModule(new BrushCollision());     // [r313] stripped — dev tool, per-frame hook
+    // RegisterModule(new cg());                  // [r301] stripped — ADS angle corruption
     RegisterModule(new GSCClientFields());
-    RegisterModule(new GSCClientMethods());
-    RegisterModule(new GSCFunctions());
+    // RegisterModule(new GSCClientMethods());   // [r313] stripped — BW doesn't call these
+    // RegisterModule(new GSCFunctions());       // [r313] stripped — only dev function
     RegisterModule(new GSCLoader());
-    // RegisterModule(new ImageLoader());
-    RegisterModule(new Map());
+    // RegisterModule(new ImageLoader());         // upstream default
+    // RegisterModule(new Map());                // [r313] stripped — BW doesn't use map ents
     RegisterModule(new sv_bots());
-    RegisterModule(new TestModule());
+    // RegisterModule(new TestModule());         // [r313] stripped — empty module
     RegisterModule(new ui());
-    // Patches  -- [r300] DISABLED for ADS-no-damage diagnostic.
-    // [r301] confirmed not the cause - bug persisted with these off.
-    // Keep disabled for now until BG_Calculate theory tested.
-    // sub_8220D2D0
-    // Patches NO_KNOCKBACK flag check, allows knockback regardless of flags
-    // *(volatile uint32_t *)0x8220D2E8 = 0x60000000; // NOP replaces bnelr
-    // Weapon_RocketLauncher_Fire
-    // *(volatile uint32_t *)0x8225F98C = 0x60000000;
-    // *(volatile uint32_t *)0x8225F990 = 0x60000000;
+
+    // Inline patches — already disabled since r300, kept off.
+    // *(volatile uint32_t *)0x8220D2E8 = 0x60000000; // NO_KNOCKBACK NOP
+    // *(volatile uint32_t *)0x8225F98C = 0x60000000; // Weapon_RocketLauncher_Fire NOP
+    // *(volatile uint32_t *)0x8225F990 = 0x60000000; // Weapon_RocketLauncher_Fire NOP
 }
 T4_MP_Plugin::~T4_MP_Plugin()
 {
