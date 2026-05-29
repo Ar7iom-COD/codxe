@@ -142,7 +142,12 @@ static const BotAction_t BotActions[] = {
 
 static inline clientBW_t *BW_GetClient(int clientNum)
 {
-    return &reinterpret_cast<clientBW_t *>(svsHeader->clients)[clientNum];
+    // r319: use the real svs.clients base directly. svsHeader->clients
+    // (via 0x84F85100) was a phantom path — engine code (SV_BotFrame,
+    // SV_AddTestClient_Real, SV_GetUsercmd) uses DAT_830c0c90 as the
+    // canonical svs.clients base. See structs_bw_ext.h r319 notes.
+    clientBW_t *base = reinterpret_cast<clientBW_t *>(kSvsClientsBase);
+    return &base[clientNum];
 }
 
 // Validate the entref points at a real player entity. T4 entref carries
@@ -229,7 +234,8 @@ namespace
                         int *outConnecting)
     {
         int bots = 0, active = 0, zombies = 0, connecting = 0;
-        clientBW_t *base = reinterpret_cast<clientBW_t *>(svsHeader->clients);
+        // r319: real svs.clients base.
+        clientBW_t *base = reinterpret_cast<clientBW_t *>(kSvsClientsBase);
 
         for (int i = 0; i < MAX_CLIENTS_BW; ++i)
         {
@@ -309,7 +315,9 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         return;
     }
 
-    const int clientNum = static_cast<int>(cl - reinterpret_cast<clientBW_t *>(svsHeader->clients));
+    // r319: clientNum derived from real svs.clients base.
+    const clientBW_t *kBase = reinterpret_cast<const clientBW_t *>(kSvsClientsBase);
+    const int clientNum = static_cast<int>(cl - kBase);
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -375,20 +383,14 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 #endif
 
-    // [r317] Defense-in-depth guards DISABLED.
-    // remoteAddress.type and isTestClient offsets in structs_bw_ext.h are
-    // wrong — heartbeat log proved every bot reads remAdr=1 (NA_BAD) instead
-    // of 0 (NA_BOT). With the guards active, every bot fell through to the
-    // vanilla SV_BotUserMove, so our cmd synthesis was being short-circuited.
+    // [r319] Defense-in-depth guards RE-ENABLED.
+    // With r319's netchan_t fix, remoteAddress.type is now at cl + 0x20
+    // matching the engine's own bot check (SV_BotFrame's piVar3[8]==0).
+    // We can now safely re-enable the NA_BOT + isTestClient guards.
     //
-    // The engine's outer loop (SV_BotFrame or equivalent) only calls
-    // SV_BotUserMove for bot client slots — vanilla T4 doesn't call it on
-    // real human clients. So removing the guards is safe: only bots reach us.
-    //
-    // The host-pseudo-bot worry from r299 was diagnosed by the heartbeat
-    // entry log; if it manifests we re-add a state check using gentity ptr
-    // or another field that we can verify.
-#if 0
+    // The engine's outer loop (SV_BotFrame) only calls SV_BotUserMove for
+    // slots where state != CS_FREE AND remoteAddress.type == NA_BOT, so
+    // in theory we should never see a non-bot here. But cheap to check.
     if (cl->header.netchan.remoteAddress.type != NA_BOT)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -399,18 +401,39 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
     }
-#endif
+
+    // [r319] One-shot per-client struct verification log. Logs once per
+    // client per match, AFTER guards pass. Confirms the r319 offset fix
+    // is working: if guards pass, remAdr=0 (NA_BOT) and isTest=1.
+    // Also dumps gentity ptr and lastUsercmd.serverTime — if these look
+    // sane, the entire struct path is correct.
+    {
+        static unsigned char s_verifiedLogged[MAX_CLIENTS_BW] = {0};
+        if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW &&
+            !s_verifiedLogged[clientNum])
+        {
+            s_verifiedLogged[clientNum] = 1;
+            DbgPrint("sv_bots: [VERIFY r319] cn=%d state=%d remAdr=%d isTest=%d gent=%p lastSt=%d outSeq=%d\n",
+                     clientNum,
+                     static_cast<int>(cl->header.state),
+                     static_cast<int>(cl->header.netchan.remoteAddress.type),
+                     static_cast<int>(cl->isTestClient),
+                     reinterpret_cast<void *>(cl->gentity),
+                     cl->lastUsercmd.serverTime,
+                     cl->header.netchan.outgoingSequence);
+        }
+    }
 
     usercmd_s cmd;
     std::memset(&cmd, 0, sizeof(cmd));
 
-    // [r317] svsHeader->time reads 0 (wrong offset or wrong base). Use a
-    // monotonic counter as serverTime so each cmd is unique. Engine validates
-    // cmd.serverTime is > previous cmd's serverTime; any increasing value
-    // works. ~50ms step matches a 20Hz bot update rate (matches IW3 BW).
-    static int s_botServerTime = 0;
-    s_botServerTime += 50;
-    cmd.serverTime = s_botServerTime;
+    // [r319] cmd.serverTime — read it back from cl->lastUsercmd and bump
+    // by 50ms. The engine memcpys our cmd into cl->lastUsercmd at the start
+    // of SV_ClientThink (verified via Ghidra at FUN_82284D58), so this
+    // closes the loop: each tick we send is +50ms ahead of the previous.
+    // First call per bot reads 0 (initial), then settles into 50, 100,
+    // 150, ... — a clean 20Hz monotonic progression.
+    cmd.serverTime = cl->lastUsercmd.serverTime + 50;
 
     // r296: read the engine's authoritative current weapon directly from
     // the gentity's entityState. This is what GSC's getcurrentweapon()
@@ -944,7 +967,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r317 heartbeat-off guard-off)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r319 struct-fix netchan+svsbase)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
