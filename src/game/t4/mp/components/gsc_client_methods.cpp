@@ -163,7 +163,9 @@ static struct
 } gsc_player_methods[] = {
     {"buttonpressed", PlayerCmd_ButtonPressed},
     {"sprintbuttonpressed", PlayerCmd_SprintButtonPressed},
-    {"jumpbuttonpressed", PlayerCmd_JumpButtonPressed},
+    // [r305] removed: stock impl calls Scr_* at wrong addresses (symbols.h is broken).
+    // BW_LookupMethod in sv_bots.cpp now provides the correct implementation.
+    // {"jumpbuttonpressed", PlayerCmd_JumpButtonPressed},
     {"setvelocity", PlayerCmd_SetVelocity},
     {"getforwardmove", PlayerCmd_GetForwardMove},
     {"getrightmove", PlayerCmd_GetRightMove},
