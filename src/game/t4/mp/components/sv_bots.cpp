@@ -333,7 +333,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         if (!s_entryLogged[logIdx])
         {
             s_entryLogged[logIdx] = 1;
-            DbgPrint("sv_bots: [ENTRY r320] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
+            DbgPrint("sv_bots: [ENTRY r321] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
                      reinterpret_cast<void *>(cl),
                      reinterpret_cast<const void *>(kBase),
                      clientNum,
@@ -578,21 +578,57 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 
     cl->header.deltaMessage = cl->header.netchan.outgoingSequence - 1;
-    // [r320] SV_ClientThink_BW call SKIPPED. r319c proved struct path works
-    // (bots moved), but game still freezes within seconds. Skip the call
-    // to isolate whether the freeze is in:
-    //   a) our SV_ClientThink path (engine processing of bot cmds)
-    //   b) something else (just running the stub at high rate causes it)
-    // If bots stand still and no freeze: cause is the SV_ClientThink path
-    // (cmd struct, timing, or downstream physics). Then we know where to fix.
-    // If bots still freeze: cause is upstream of cmd injection — maybe stub
-    // running too often, or something in cmd assembly itself.
+
+    // [r321] Rate-limited cmd injection. r319c proved structs are correct
+    // but injecting at full SV_BotFrame rate (every server tick × 11 bots
+    // = ~220 cmds/sec) caused the game to freeze within seconds.
     //
-    // The engine's outer SV_BotFrame still calls our stub; it doesn't
-    // require our stub to call SV_ClientThink. Vanilla path is bypassed.
-#if 0
+    // Hypothesis: the engine's per-tick bot cmd processing accumulates
+    // some resource (snapshot buffer, gentity event slot, JIT trace cache)
+    // that exhausts under sustained injection. IW3 BW historically only
+    // pushes bot cmds at 20Hz, while SV_BotFrame runs at 60Hz — a natural
+    // 3:1 ratio. We adopt the same: 1 inject per 3 stub calls per bot.
+    //
+    // The deltaMessage write above always happens — that's bookkeeping
+    // the engine expects regardless. We just gate the actual call.
+    {
+        static unsigned char s_botTickPhase[MAX_CLIENTS_BW] = {0};
+        const unsigned char phase = s_botTickPhase[clientNum];
+        s_botTickPhase[clientNum] = (phase + 1) % 3;
+
+        if (phase != 0)
+        {
+            // Skip injection for ticks 1 and 2 of each 3-tick window.
+            return;
+        }
+    }
+
     SV_ClientThink_BW(cl, &cmd);
-#endif
+
+    // [r321] Post-inject diagnostic: one-shot per-client, fires AFTER the
+    // engine has had a chance to process and write back lastUsercmd.
+    // Confirms or refutes the inject "took":
+    //   - If lastSt > 0 after inject: engine accepted cmd, wrote it back
+    //     to cl->lastUsercmd at +0x20EF4 via SV_ClientThink's memcpy.
+    //   - If lastSt == 0: engine rejected the cmd (validation failure,
+    //     wrong struct layout, or our SV_ClientThink address is wrong).
+    {
+        static unsigned char s_postInjectLogged[MAX_CLIENTS_BW] = {0};
+        if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW &&
+            !s_postInjectLogged[clientNum])
+        {
+            s_postInjectLogged[clientNum] = 1;
+            DbgPrint("sv_bots: [POST r321] cn=%d cmd.st=%d lastSt=%d cmd.wpn=%d "
+                     "cmd.btn=%d cmd.fwd=%d cmd.rt=%d\n",
+                     clientNum,
+                     cmd.serverTime,
+                     cl->lastUsercmd.serverTime,
+                     static_cast<int>(cmd.weapon),
+                     static_cast<int>(cmd.buttons),
+                     static_cast<int>(cmd.forwardmove),
+                     static_cast<int>(cmd.rightmove));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1049,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r320 skip-clientthink isolate-freeze)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r321 ratelimit-3to1 post-diag)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
