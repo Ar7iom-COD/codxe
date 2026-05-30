@@ -333,7 +333,7 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
         if (!s_entryLogged[logIdx])
         {
             s_entryLogged[logIdx] = 1;
-            DbgPrint("sv_bots: [ENTRY r319c] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
+            DbgPrint("sv_bots: [ENTRY r320] cl=%p kBase=%p cn=%d state=%d remAdr=%d isTest=%d gent=%p\n",
                      reinterpret_cast<void *>(cl),
                      reinterpret_cast<const void *>(kBase),
                      clientNum,
@@ -578,7 +578,21 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     }
 
     cl->header.deltaMessage = cl->header.netchan.outgoingSequence - 1;
+    // [r320] SV_ClientThink_BW call SKIPPED. r319c proved struct path works
+    // (bots moved), but game still freezes within seconds. Skip the call
+    // to isolate whether the freeze is in:
+    //   a) our SV_ClientThink path (engine processing of bot cmds)
+    //   b) something else (just running the stub at high rate causes it)
+    // If bots stand still and no freeze: cause is the SV_ClientThink path
+    // (cmd struct, timing, or downstream physics). Then we know where to fix.
+    // If bots still freeze: cause is upstream of cmd injection — maybe stub
+    // running too often, or something in cmd assembly itself.
+    //
+    // The engine's outer SV_BotFrame still calls our stub; it doesn't
+    // require our stub to call SV_ClientThink. Vanilla path is bypassed.
+#if 0
     SV_ClientThink_BW(cl, &cmd);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -999,7 +1013,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r319c macro-deref)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r320 skip-clientthink isolate-freeze)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
