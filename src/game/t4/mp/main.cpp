@@ -18,7 +18,7 @@ namespace mp
 {
 T4_MP_Plugin::T4_MP_Plugin()
 {
-    DbgPrint("T4 MP: Plugin loaded (r319c macro-deref)\n");
+    DbgPrint("T4 MP: Plugin loaded (r320 skip-clientthink isolate-freeze)\n");
 
     // ========================================================================
     // r316 — BrushCollision removed, everything else as r309/r315 baseline.
