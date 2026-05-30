@@ -41,6 +41,16 @@
 //   in practice (the NET_CompareBaseAdr fall-through is real in the
 //   disassembly but doesn't manifest as host corruption on Xenia).
 //
+// r299 — angle preservation + host-leak diagnostic:
+//
+//   BW_R299_FIX_BOT_ANGLES: copy cl->lastUsercmd.angles into the
+//   synthesized usercmd. Matches CoD4x SV_BotUserMove pattern. Without
+//   this, bots aim at world-origin (0,0,0) every tick because the cmd
+//   was memset-zeroed and never had angles assigned in the normal path.
+//
+//   BW_R299_DIAG_LOG_ENTRY: rate-limited log line on every stub entry
+//   to confirm/refute "host slips through guards" theory on Xenia.
+//
 
 #include "pch.h"
 #include "sv_bots.h"
@@ -75,6 +85,15 @@ struct BotMovementInfo_t
     int           mirror_client_num;
     float         moveTo[2];
     int           doMove;
+    // r297: raw forward/right components written by Scr_BotMovement.
+    // BW's PT4-style doBotMovement_loop computes dir[0]/dir[1] every 50ms
+    // and calls BotBuiltinBotMovement(forward, right). With doMove unset
+    // (BW never calls botMoveTo), SV_BotUserMove_Stub left forwardmove
+    // and rightmove at zero and bots stood still. These two fields let
+    // the stub honor BW's existing computation without changing GSC.
+    signed char   forwardMove;
+    signed char   rightMove;
+    int           hasRawMove;  // 1 if forward/right were set this tick
 };
 
 static BotMovementInfo_t g_botai[MAX_CLIENTS_BW];
@@ -95,20 +114,26 @@ struct BotAction_t
 };
 
 static const BotAction_t BotActions[] = {
-    {"gostand",    KEY_GOSTAND},
-    {"gocrouch",   KEY_CROUCH},
-    {"goprone",    KEY_PRONE},
-    {"fire",       KEY_FIRE},
-    {"melee",      KEY_MELEE},
-    {"frag",       KEY_FRAG},
-    {"smoke",      KEY_SMOKE},
-    {"reload",     KEY_RELOAD},
-    {"sprint",     KEY_SPRINT},
-    {"leanleft",   KEY_LEANLEFT},
-    {"leanright",  KEY_LEANRIGHT},
-    {"ads",        KEY_ADSMODE | KEY_ADS},
-    {"holdbreath", KEY_HOLDBREATH},
-    {"activate",   KEY_USE},
+    {"gostand",     KEY_GOSTAND},
+    {"gocrouch",    KEY_CROUCH},
+    {"crouch",      KEY_CROUCH},    // r297: PT4 BW alias for "gocrouch"
+    {"goprone",     KEY_PRONE},
+    {"prone",       KEY_PRONE},     // r297: PT4 BW alias for "goprone"
+    {"fire",        KEY_FIRE},
+    {"attack",      KEY_FIRE},      // r297: PT4 BW alias for "fire"
+                                    //       (IW3 BW used "fire", PT4 uses "attack")
+    {"melee",       KEY_MELEE},
+    {"frag",        KEY_FRAG},
+    {"smoke",       KEY_SMOKE},
+    {"reload",      KEY_RELOAD},
+    {"sprint",      KEY_SPRINT},
+    {"leanleft",    KEY_LEANLEFT},
+    {"leanright",   KEY_LEANRIGHT},
+    {"ads",         KEY_ADSMODE | KEY_ADS},
+    {"speed_throw", KEY_ADSMODE | KEY_ADS},  // r297: PT4 BW alias for "ads"
+                                             //       (used while throwing grenades)
+    {"holdbreath",  KEY_HOLDBREATH},
+    {"activate",    KEY_USE},
 };
 
 // ---------------------------------------------------------------------------
@@ -147,11 +172,144 @@ static Detour G_SelectWeaponIndex_Detour;
 
 static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 {
+    // r294: trace every weapon-select call so we can correlate engine activity
+    // with what GSC's getcurrentweapon() sees a moment later. We still write
+    // g_botai[].weapon as a fallback cache, but cmd.weapon now reads directly
+    // from the gentity (see SV_BotUserMove_Stub) — this hook is informational.
     if (clientNum >= 0 && clientNum < MAX_CLIENTS_BW)
-        g_botai[clientNum].weapon = static_cast<unsigned char>(iWeaponIndex);
+    {
+        const unsigned char prev = g_botai[clientNum].weapon;
+        const unsigned char next = static_cast<unsigned char>(iWeaponIndex);
+        g_botai[clientNum].weapon = next;
+        if (prev != next)
+        {
+            DbgPrint("sv_bots: G_SelectWeaponIndex clientNum=%d weaponIndex=%d (prev=%d)\n",
+                     clientNum, iWeaponIndex, static_cast<int>(prev));
+        }
+    }
 
     G_SelectWeaponIndex_Detour.GetOriginal<G_SelectWeaponIndex_t>()(clientNum, iWeaponIndex);
 }
+
+// ---------------------------------------------------------------------------
+// r310: instrumentation for hard-freeze hunt (bot-count-linear freeze)
+// ---------------------------------------------------------------------------
+//
+// Three probes, all driven from the existing SV_BotUserMove_Stub callsite —
+// no new detours, no new symbols, no header changes.
+//
+//   Probe A  BW_Heartbeat()     adaptive per-tick health snapshot
+//   Probe B  BW_WalkClients()   piggyback svs.clients[] scan on print
+//   Probe C  BW_LogAnomaly()    first-fail latched corruption logger
+//
+// Output: DbgPrint lines tagged [HB], [HBSPK], [GUARD]
+// Cadence: quiet baseline every 5s; alarm immediately on dt > 50ms or
+//          bot/active-count delta.
+
+namespace
+{
+    // --- tunables (must be `const`, not `constexpr` — VS2010) ---
+    const unsigned int BW_HB_QUIET_MS    = 5000;
+    const unsigned int BW_HB_ALARM_DT_MS = 50;
+
+    // --- heartbeat state ---
+    unsigned int g_bw_hb_last_print_ms = 0;
+    unsigned int g_bw_hb_last_tick_ms  = 0;
+    unsigned int g_bw_hb_tick_count    = 0;
+    unsigned int g_bw_hb_alarm_count   = 0;
+    int          g_bw_hb_last_bots     = -1;
+    int          g_bw_hb_last_active   = -1;
+    unsigned int g_bw_hb_guard_logs    = 0;
+
+    // --- Probe C: per-client first-fail latch ---
+    unsigned char g_bw_guard_logged[MAX_CLIENTS_BW] = {0};
+
+    // --- Probe B ---
+    void BW_WalkClients(int *outBots, int *outActive, int *outZombies,
+                        int *outConnecting)
+    {
+        int bots = 0, active = 0, zombies = 0, connecting = 0;
+        clientBW_t *base = reinterpret_cast<clientBW_t *>(svsHeader->clients);
+
+        for (int i = 0; i < MAX_CLIENTS_BW; ++i)
+        {
+            clientBW_t *cl = base + i;
+
+            switch (cl->header.state)
+            {
+                case CS_FREE:          break;
+                case CS_ZOMBIE:        ++zombies;    break;
+                case CS_CONNECTED:
+                case CS_CLIENTLOADING: ++connecting; break;
+                case CS_ACTIVE:        ++active;     break;
+                default:               break;
+            }
+
+            if (cl->isTestClient) ++bots;
+        }
+
+        if (outBots)       *outBots       = bots;
+        if (outActive)     *outActive     = active;
+        if (outZombies)    *outZombies    = zombies;
+        if (outConnecting) *outConnecting = connecting;
+    }
+
+    // --- Probe A ---
+    void BW_Heartbeat(void)
+    {
+        const unsigned int now = static_cast<unsigned int>(svsHeader->time);
+        const unsigned int dt  = (g_bw_hb_last_tick_ms == 0) ? 0u
+                                 : (now - g_bw_hb_last_tick_ms);
+
+        g_bw_hb_last_tick_ms = now;
+        ++g_bw_hb_tick_count;
+
+        bool alarm = false;
+        if (dt > BW_HB_ALARM_DT_MS && g_bw_hb_tick_count > 1)
+        {
+            ++g_bw_hb_alarm_count;
+            alarm = true;
+            DbgPrint("sv_bots: [HBSPK] dt=%ums ticks=%u alarms=%u\n",
+                     dt, g_bw_hb_tick_count, g_bw_hb_alarm_count);
+        }
+
+        const unsigned int sincePrint = now - g_bw_hb_last_print_ms;
+        if (!alarm && sincePrint < BW_HB_QUIET_MS) return;
+
+        int bots = 0, active = 0, zombies = 0, connecting = 0;
+        BW_WalkClients(&bots, &active, &zombies, &connecting);
+
+        const bool botDelta    = (g_bw_hb_last_bots   >= 0) && (bots   != g_bw_hb_last_bots);
+        const bool activeDelta = (g_bw_hb_last_active >= 0) && (active != g_bw_hb_last_active);
+
+        if (alarm || sincePrint >= BW_HB_QUIET_MS || botDelta || activeDelta)
+        {
+            DbgPrint("sv_bots: [HB] bots=%d active=%d zomb=%d conn=%d "
+                     "ticks=%u alarms=%u guards=%u svtime=%ums\n",
+                     bots, active, zombies, connecting,
+                     g_bw_hb_tick_count, g_bw_hb_alarm_count,
+                     g_bw_hb_guard_logs, now);
+            g_bw_hb_last_print_ms = now;
+            g_bw_hb_last_bots     = bots;
+            g_bw_hb_last_active   = active;
+        }
+    }
+
+    // --- Probe C ---
+    void BW_LogAnomaly(int clientNum, clientBW_t *cl, const char *tag)
+    {
+        if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW) return;
+        if (g_bw_guard_logged[clientNum]) return;
+        g_bw_guard_logged[clientNum] = 1;
+        ++g_bw_hb_guard_logs;
+        DbgPrint("sv_bots: [GUARD] cn=%d %s state=%d isTest=%d remAdr=%d gent=%p\n",
+                 clientNum, tag,
+                 static_cast<int>(cl->header.state),
+                 static_cast<int>(cl->isTestClient),
+                 static_cast<int>(cl->header.netchan.remoteAddress.type),
+                 reinterpret_cast<void *>(cl->gentity));
+    }
+} // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // SV_BotUserMove detour — core bot driver
@@ -159,8 +317,17 @@ static void G_SelectWeaponIndex_Hook(int clientNum, int iWeaponIndex)
 
 static Detour SV_BotUserMove_Detour;
 
+// r296: per-client rate-limit state for the gentity-weapon trace.
+// Initialised to "no log yet" sentinel (-1 weapon value, 0 ms).
+static int s_lastWeaponLogMs[MAX_CLIENTS_BW]  = {0};
+static int s_lastWeaponLogVal[MAX_CLIENTS_BW] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                                                  -1, -1, -1, -1, -1, -1, -1, -1,
+                                                  -1, -1};
+
 static void SV_BotUserMove_Stub(clientBW_t *cl)
 {
+    BW_Heartbeat();   // r310 Probe A — runs every tick regardless of guards
+
     if (!cl->gentity)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
@@ -172,6 +339,55 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     {
         SV_BotUserMove_Detour.GetOriginal<SV_BotUserMove_t>()(cl);
         return;
+    }
+
+    // [r299] DIAG: log every entry, rate-limited per client. Confirms or
+    // refutes "host slips through guards as NA_BOT" theory on Xenia. If
+    // we see cn=0 (host) here, the outer caller (SV_UpdateBots or
+    // equivalent on T4) is iterating the host. The guards below should
+    // still early-return for it (NA_BOT + isTest checks), but presence
+    // alone is the signal we want.
+    {
+        static int s_lastEntryLogMs[MAX_CLIENTS_BW] = {0};
+        const int now = svsHeader->time;
+        if ((now - s_lastEntryLogMs[clientNum]) > 2000)
+        {
+            s_lastEntryLogMs[clientNum] = now;
+            DbgPrint("sv_bots: BUM_Stub entry cn=%d remAdr.type=%d isTest=%d state=%d\n",
+                     clientNum,
+                     static_cast<int>(cl->header.netchan.remoteAddress.type),
+                     static_cast<int>(cl->isTestClient),
+                     static_cast<int>(cl->header.state));
+        }
+    }
+
+    // r307: state guard for zombie/free slots.
+    // PROVEN BUG (r306b kick diagnostic, 2026-05-24):
+    //   SV_DropClient correctly set cl->state = CS_ZOMBIE on kicked bot.
+    //   But our stub kept injecting input every frame because the guards
+    //   below only check NA_BOT and isTestClient — both still true on a
+    //   zombie. Engine sees inputs flowing → never transitions zombie to
+    //   CS_FREE. Bot stuck forever. Kick "doesn't work" symptom.
+    //
+    // Fix: skip the stub entirely if not CS_ACTIVE. We DON'T fall through
+    // to the engine path for non-active either — zombies should be left
+    // alone by the bot-input path so SV_CheckTimeouts can reap them.
+    if (cl->header.state != CS_ACTIVE)
+    {
+        return;  // no input for non-active clients; do not call the engine path
+    }
+
+    // r310 Probe C: first-fail logging for active-slot anomalies.
+    // Behavior unchanged — these are observation-only.
+    {
+        if (cl->gentity == 0)
+            BW_LogAnomaly(clientNum, cl, "ACTIVE_NO_GENTITY");
+        if (cl->isTestClient &&
+            cl->header.netchan.remoteAddress.type != NA_BOT)
+            BW_LogAnomaly(clientNum, cl, "BOT_NOT_NA_BOT");
+        if (!cl->isTestClient &&
+            cl->header.netchan.remoteAddress.type == NA_BOT)
+            BW_LogAnomaly(clientNum, cl, "NA_BOT_NOT_BOT");
     }
 
     // Defense in depth: only inject input for real bot clients.
@@ -190,9 +406,42 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
     std::memset(&cmd, 0, sizeof(cmd));
 
     cmd.serverTime = svsHeader->time;
-    cmd.weapon     = g_botai[clientNum].weapon;
+
+    // r296: read the engine's authoritative current weapon directly from
+    // the gentity's entityState. This is what GSC's getcurrentweapon()
+    // returns and what the player struct considers held. Caching via
+    // G_SelectWeaponIndex_Hook turned out to be wrong for "current
+    // weapon" because the engine only calls G_SelectWeaponIndex on
+    // initial spawn for an offhand slot — bots held grenades until they
+    // fired. Reading the gentity each tick fixes it.
+    const int gentityWeapon = cl->gentity->s.weapon;
+    cmd.weapon = static_cast<unsigned __int8>(gentityWeapon & 0xFF);
+
+    // Rate-limited trace so the log isn't flooded: only when the value
+    // changes per client, and at most once per 500 ms.
+    if (s_lastWeaponLogVal[clientNum] != gentityWeapon &&
+        (svsHeader->time - s_lastWeaponLogMs[clientNum]) > 500)
+    {
+        DbgPrint("sv_bots: bot weapon clientNum=%d gentity.s.weapon=%d (was %d)\n",
+                 clientNum, gentityWeapon, s_lastWeaponLogVal[clientNum]);
+        s_lastWeaponLogVal[clientNum] = gentityWeapon;
+        s_lastWeaponLogMs[clientNum]  = svsHeader->time;
+    }
 
     cmd.buttons = static_cast<button_mask>(g_botai[clientNum].buttons);
+
+    // [r299] Preserve the bot's current usercmd angles. Without this,
+    // memset()-zeroed angles get processed by SV_ClientThink, which
+    // writes them into ps.viewangles, snapping the bot's aim to
+    // (0, 0, 0) every tick — bullet traces fire toward world origin
+    // and miss everything. CoD4x's SV_BotUserMove does the equivalent
+    // via ent->client->sess.cmd.angles; clientBW_t.lastUsercmd
+    // (verified at +0x20EF4 in structs_bw_ext.h) is the same data
+    // from a different struct path. Format is packed-16-bit-in-int
+    // (CoD4x usercmd_s.angles is `int angles[3]`, PACKED_ANGLE).
+    cmd.angles[0] = cl->lastUsercmd.angles[0];
+    cmd.angles[1] = cl->lastUsercmd.angles[1];
+    cmd.angles[2] = cl->lastUsercmd.angles[2];
 
     if (g_botai[clientNum].doMove)
     {
@@ -238,6 +487,15 @@ static void SV_BotUserMove_Stub(clientBW_t *cl)
             static const auto scr_const_movedone = Scr_AllocString("movedone");
             Scr_Notify(ent, static_cast<unsigned __int16>(scr_const_movedone), 0);
         }
+    }
+    else if (g_botai[clientNum].hasRawMove)
+    {
+        // r297: PT4 BW's doBotMovement_loop computes forward/right in bot
+        // local frame every 50ms and pushes it through Scr_BotMovement.
+        // The values were already projected into bot space and clamped to
+        // [-127, 127] by GSC, so apply verbatim.
+        cmd.forwardmove = g_botai[clientNum].forwardMove;
+        cmd.rightmove   = g_botai[clientNum].rightMove;
     }
 
     // Mirror mode: 1:1 copy of another client's last usercmd.
@@ -304,6 +562,34 @@ static void Scr_BotMoveTo(scr_entref_t entref)
     g_botai[entref.entnum].doMove    = 1;
 }
 
+// r297: raw forward/right input from GSC. T4 BW's doBotMovement_loop in
+// _bot_internal.gsc computes a 2D direction every 50ms and calls
+// self botmovement(int(dir[0]), int(dir[1])). Without this method bound,
+// BW's adapter would no-op the call and bots would stand still.
+//
+// Inputs are signed bytes in [-127, 127]. Bot's local frame: +forward
+// moves the bot in the direction it's facing, +right strafes right.
+static void Scr_BotMovement(scr_entref_t entref)
+{
+    BW_RequirePlayerEntity(entref);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: <bot> botMovement(<forward>, <right>);", SCRIPTINSTANCE_SERVER);
+
+    int forward = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    int right   = Scr_GetInt_BW(1, SCRIPTINSTANCE_SERVER);
+
+    // Clamp to signed-byte range (engine usercmd uses signed char).
+    if (forward >  127) forward =  127;
+    if (forward < -127) forward = -127;
+    if (right   >  127) right   =  127;
+    if (right   < -127) right   = -127;
+
+    g_botai[entref.entnum].forwardMove = static_cast<signed char>(forward);
+    g_botai[entref.entnum].rightMove   = static_cast<signed char>(right);
+    g_botai[entref.entnum].hasRawMove  = 1;
+}
+
 static void Scr_BotAction(scr_entref_t entref)
 {
     BW_RequirePlayerEntity(entref);
@@ -348,6 +634,7 @@ static void Scr_BotStop(scr_entref_t entref)
     g_botai[entref.entnum].buttons             = 0;
     g_botai[entref.entnum].is_mirroring_client = false;
     g_botai[entref.entnum].doMove              = 0;
+    g_botai[entref.entnum].hasRawMove          = 0;
 }
 
 static void Scr_BotMirror(scr_entref_t entref)
@@ -432,23 +719,39 @@ static void GScr_AddTestClient()
 
 static void GScr_Kick()
 {
+    // GSC: kick(<clientNum>) or kick(<clientNum>, <reason>)
+    // Drops the client via SV_DropClient (Ghidra-verified TU7 address
+    // 0x82283BF0 in symbols_bw_ext.h). Used by BW _menu.gsc when the user
+    // selects "Kick a bot" — passes the bot's entity number and the
+    // localized reason string "EXE_PLAYERKICKED".
     const int nparam = Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER);
     if (nparam < 1 || nparam > 2)
+    {
         Scr_Error_BW("Usage: kick(<clientNum>) or kick(<clientNum>, <reason>)",
                      SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
     const int clientNum = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
     if (clientNum < 0 || clientNum >= MAX_CLIENTS_BW)
+    {
         Scr_ParamError_BW(0, va_BW("kick: clientNum %i out of range", clientNum),
                           SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
     const char *reason = "EXE_PLAYERKICKED";
     if (nparam == 2)
     {
         const char *r = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
         if (r && *r) reason = r;
     }
+
     clientBW_t *cl = BW_GetClient(clientNum);
-    if (cl && cl->header.state >= CS_CONNECTED)
-        SV_DropClient(cl, reason, true);
+    if (!cl || cl->header.state < CS_CONNECTED)
+        return;
+
+    SV_DropClient(cl, reason, true);
 }
 
 static void PlayerCmd_GetEntityNumber(scr_entref_t entref)
@@ -489,6 +792,66 @@ static void PlayerCmd_GetGuid(scr_entref_t entref)
     Scr_AddString(xuidStr, SCRIPTINSTANCE_SERVER);
 }
 
+// r304: register jumpbuttonpressed() as a player method.
+// T4 TU7 does NOT expose jumpbuttonpressed natively (absent from all 6
+// PLAYER_METHODS sub-tables — verified via namespace dump). BW's _menu.gsc
+// MenuSelect() waits on self jumpbuttonpressed() which silently no-ops
+// without this, so menu select never fires — kick (and every other menu
+// confirm) silently does nothing.
+//
+// Implementation mirrors codjumper-iw3's PlayerCmd_JumpButtonPressed:
+// read player's current + just-pressed buttons, AND with the jump bit.
+// On T4 there is no KEY_JUMP — jump maps to KEY_GOSTAND (0x400).
+static void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
+{
+    gentity_s *ent = BW_RequirePlayerEntity(entref);
+
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> jumpbuttonpressed()", SCRIPTINSTANCE_SERVER);
+
+    if (!ent->client)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    const int combined = ent->client->buttons | ent->client->buttonsSinceLastFrame;
+    Scr_AddInt_BW((combined & KEY_GOSTAND) != 0 ? 1 : 0, SCRIPTINSTANCE_SERVER);
+}
+
+// GSC method: <player> istestclient() -> int (0 or 1)
+//
+// Returns whether the client slot was spawned via SV_AddTestClient (i.e. a
+// bot). Reads svs.clients[N].isTestClient directly via BW_GetClient at
+// offset 0xB561C — set by SV_AddTestClient itself when the bot connects.
+//
+// We deliberately do NOT use the engine's SV_IsTestClient (0x8221F6D0).
+// On TU7 that function indexes gclient_s (game-side) at offset 0x39BC,
+// and the engine never copies the flag from svs.clients into gclient at
+// spawn time, so the gclient field stays zero. Verified with [ISTC]
+// diagnostic in r308c — direct read worked, SV_IsTestClient did not.
+//
+// Used by bw11's bots_adapter_pt4.gsc::do_isbot as the engine-side
+// fallback when pers["isBot"] wasn't stamped (which happens on T4
+// because PlayerConnect fires before userinfo is parsed, defeating the
+// "Larry" name-prefix check).
+static void PlayerCmd_IsTestClient(scr_entref_t entref)
+{
+    if (entref.classnum != 0)
+        Scr_ObjectError_BW("not a player entity", SCRIPTINSTANCE_SERVER);
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 0)
+        Scr_Error_BW("Usage: <player> istestclient()", SCRIPTINSTANCE_SERVER);
+    if (entref.entnum < 0 || entref.entnum >= MAX_CLIENTS_BW)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    clientBW_t *cl = BW_GetClient(static_cast<int>(entref.entnum));
+    const int result = (cl && cl->isTestClient != 0) ? 1 : 0;
+    Scr_AddInt_BW(result, SCRIPTINSTANCE_SERVER);
+}
+
 // ---------------------------------------------------------------------------
 // Exported lookup tables (called by patched gsc_functions / gsc_client_methods)
 // ---------------------------------------------------------------------------
@@ -498,7 +861,11 @@ static struct
     const char     *name;
     BuiltinFunction handler;
 } sv_bots_functions[] = {
-    {"addtestclient", reinterpret_cast<BuiltinFunction>(GScr_AddTestClient)},
+    // r294: "addtestclient" deliberately omitted — BW_LookupFunction
+    // routes it to a fall-through so the engine's stock GScr_AddTestClient
+    // handles bot spawn. Our GScr_AddTestClient is kept in this file
+    // (further up) only as reference; nothing dispatches to it. See
+    // BW_LookupFunction above for the routing.
     {"kick",          reinterpret_cast<BuiltinFunction>(GScr_Kick)},
     {nullptr, nullptr},
 };
@@ -508,12 +875,15 @@ static struct
     const char   *name;
     BuiltinMethod handler;
 } sv_bots_methods[] = {
-    {"botmoveto",         Scr_BotMoveTo},
-    {"botaction",         Scr_BotAction},
-    {"botmirror",         Scr_BotMirror},
-    {"botstop",           Scr_BotStop},
-    {"getentitynumber",   PlayerCmd_GetEntityNumber},
-    {"getguid",           PlayerCmd_GetGuid},
+    {"botmoveto",          Scr_BotMoveTo},
+    {"botmovement",        Scr_BotMovement},
+    {"botaction",          Scr_BotAction},
+    {"botmirror",          Scr_BotMirror},
+    {"botstop",            Scr_BotStop},
+    {"getentitynumber",    PlayerCmd_GetEntityNumber},
+    {"getguid",            PlayerCmd_GetGuid},
+    {"jumpbuttonpressed",  PlayerCmd_JumpButtonPressed},  // r304: needed for BW menu select
+    {"istestclient",       PlayerCmd_IsTestClient},        // r308: engine bot detection
     {nullptr, nullptr},
 };
 
@@ -521,10 +891,28 @@ extern "C" BuiltinFunction BW_LookupFunction(const char *name)
 {
     if (!name)
         return nullptr;
+
+    // r294: route "addtestclient" to engine native. Our GScr_AddTestClient
+    // doesn't drive ClientBegin, so test clients connected but never picked
+    // a class — they stayed in spectators while the engine's stock spawn
+    // path runs the full ClientBegin chain. Falling through here lets the
+    // stock GScr_AddTestClient handle the call. The wider effect: bots
+    // spawn with engine-assigned classes, ranks, and primaries.
+    if (_stricmp(name, "addtestclient") == 0)
+    {
+        DbgPrint("sv_bots: [HOOK] 'addtestclient' -> fall through to engine\n");
+        return nullptr;
+    }
+
     for (const auto *f = sv_bots_functions; f->name != nullptr; ++f)
     {
         if (_stricmp(name, f->name) == 0)
+        {
+            // Heartbeat trace: first GSC use of any BW function tells us
+            // the dispatch chain is alive. Cheap; one log line per name.
+            DbgPrint("sv_bots: [HOOK] '%s' -> BW port handler\n", name);
             return f->handler;
+        }
     }
     return nullptr;
 }
@@ -547,7 +935,7 @@ extern "C" BuiltinMethod BW_LookupMethod(const char *name)
 
 sv_bots::sv_bots()
 {
-    DbgPrint("sv_bots: installing T4 BW detours (r293 vanilla-spawn)\n");
+    DbgPrint("sv_bots: installing T4 BW detours (r309 kick-shipped)\n");
     DbgPrint("sv_bots: [DIAG] weapon=%d userinfo=%d botmove=%d\n",
              CODXE_DIAG_ENABLE_WEAPON_HOOK,
              CODXE_DIAG_ENABLE_USERINFO_HOOK,
