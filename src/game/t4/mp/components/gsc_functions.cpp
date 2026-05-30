@@ -1,13 +1,495 @@
 #include "pch.h"
 #include "gsc_functions.h"
 
+#include <cstdio>
+#include <cstring>
+
 namespace t4
 {
 namespace mp
 {
 
+using namespace t4::mp::bw;
+
 // Forward decl from sv_bots.cpp — registers BW-specific GSC builtins.
 extern "C" BuiltinFunction BW_LookupFunction(const char *name);
+
+// ---------------------------------------------------------------------------
+// fs_* file I/O for Bot Warfare waypoint loading.
+//
+// Why this matters:
+//   BW reads waypoint CSVs from <mod>/scriptdata/waypoints/mp_<map>_wp.csv
+//   at level init. The deployed bots_adapter_pt4.gsc historically stubbed
+//   the fs_* dispatch (false/-1/empty) because codxe T4 didn't expose them.
+//   With these handlers registered in gsc_functions[] below, the adapter
+//   wires through to real engine calls.
+//
+// Why bulk fs_readall_lines exists (CRITICAL):
+//   Xenia tracks "stackpoints" on every guest function call (PPC function
+//   prologue). With enable_host_guest_stack_synchronization = true the pool
+//   is 65536 entries. The IW3 BW CSV-read pattern is a tight GSC for-loop
+//   calling fs_readline 200+ times back-to-back, which on T4-via-Xenia
+//   accumulates stackpoints faster than they recycle and crashes the
+//   emulator with "Overflowed stackpoints!" mid-loop. Confirmed in two
+//   production logs on Cliffside and Asylum.
+//
+//   fs_readall_lines collapses N readline calls into 1 host call by
+//   slurping the whole file and pushing all lines as a GSC array. BW's
+//   readWpsFromFile is patched to call it. Crash mechanism eliminated.
+//
+// Why every Scr_* call uses the _BW suffix:
+//   Stock T4 symbols.h declares Scr_GetInt/GetVector with extra trailing
+//   __int64 dummy args (PPC ABI quirk). The _BW variants in
+//   symbols_bw_ext.h are typedef'd to the cleaner 2-arg signatures that
+//   match sv_bots.cpp's usage. `using namespace t4::mp::bw;` above pulls
+//   them in unqualified.
+// ---------------------------------------------------------------------------
+
+#define MAX_SCRIPT_FILEHANDLES 8
+#define MAX_LINE_LENGTH        8192
+
+struct ScriptFileHandle_t
+{
+    FILE *fh;
+    char  filename[256];
+};
+
+static ScriptFileHandle_t s_scriptFiles[MAX_SCRIPT_FILEHANDLES];
+
+static std::string BuildScriptFilePath(const char *filename)
+{
+    if (!filename)
+        return std::string();
+
+    // If already absolute or has the Xenia "game:\" prefix, pass through.
+    if ((filename[0] && filename[1] == ':') || std::strncmp(filename, "game:\\", 6) == 0)
+        return filename;
+
+    std::string base = Config::GetModBasePath();
+    if (base.empty())
+        return filename;
+
+    // Normalize forward slashes to backslashes for the Xbox 360 host FS.
+    std::string rel(filename);
+    for (size_t i = 0; i < rel.size(); ++i)
+        if (rel[i] == '/')
+            rel[i] = '\\';
+
+    return base + "\\" + rel;
+}
+
+static void CloseAllScriptFiles()
+{
+    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
+    {
+        if (s_scriptFiles[i].fh)
+        {
+            std::fclose(s_scriptFiles[i].fh);
+            std::memset(&s_scriptFiles[i], 0, sizeof(ScriptFileHandle_t));
+        }
+    }
+}
+
+static inline void StripTrailingNewline(char *buf, int len)
+{
+    if (len > 0 && buf[len - 1] == '\n') { buf[len - 1] = '\0'; --len; }
+    if (len > 0 && buf[len - 1] == '\r') { buf[len - 1] = '\0'; }
+}
+
+static void GScr_FS_TestFile()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_testfile(<filename>)", SCRIPTINSTANCE_SERVER);
+
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    std::string fullpath = BuildScriptFilePath(filename);
+
+    FILE *f = std::fopen(fullpath.c_str(), "r");
+    if (f)
+    {
+        std::fclose(f);
+        Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
+    }
+    else
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+    }
+}
+
+static void GScr_FS_FOpen()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: fs_fopen(<filename>, <mode>)", SCRIPTINSTANCE_SERVER);
+
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    const char *mode_str = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
+    const char *fmode;
+
+    if (_stricmp(mode_str, "read") == 0)
+        fmode = "rt";
+    else if (_stricmp(mode_str, "write") == 0)
+        fmode = "wt";
+    else if (_stricmp(mode_str, "append") == 0)
+        fmode = "at";
+    else
+    {
+        Scr_Error_BW("fs_fopen: invalid mode. Valid modes are: read, write, append",
+                     SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    std::string fullpath = BuildScriptFilePath(filename);
+
+    // Create parent directories for write/append modes.
+    if (fmode[0] == 'w' || fmode[0] == 'a')
+    {
+        char dirpath[256];
+        std::strncpy(dirpath, fullpath.c_str(), sizeof(dirpath) - 1);
+        dirpath[sizeof(dirpath) - 1] = '\0';
+        char *last_slash = std::strrchr(dirpath, '\\');
+        if (last_slash)
+        {
+            *last_slash = '\0';
+            filesystem::create_nested_dirs(dirpath);
+        }
+    }
+
+    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
+    {
+        if (!s_scriptFiles[i].fh)
+        {
+            s_scriptFiles[i].fh = std::fopen(fullpath.c_str(), fmode);
+            if (!s_scriptFiles[i].fh)
+            {
+                // Failed open: return 0 so GSC can detect it.
+                Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+                return;
+            }
+            std::strncpy(s_scriptFiles[i].filename, filename,
+                         sizeof(s_scriptFiles[i].filename) - 1);
+            Scr_AddInt_BW(i + 1, SCRIPTINSTANCE_SERVER);
+            return;
+        }
+    }
+
+    Scr_Error_BW("fs_fopen: exceeded maximum open file handles", SCRIPTINSTANCE_SERVER);
+}
+
+static void GScr_FS_FClose()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_fclose(<filehandle>)", SCRIPTINSTANCE_SERVER);
+
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
+        Scr_Error_BW("fs_fclose: invalid filehandle", SCRIPTINSTANCE_SERVER);
+
+    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
+    if (slot.fh)
+    {
+        std::fclose(slot.fh);
+        std::memset(&slot, 0, sizeof(ScriptFileHandle_t));
+    }
+}
+
+// Legacy single-line read. Still wired for any GSC that uses it, but BW's
+// readWpsFromFile patch should call fs_readall_lines instead to avoid the
+// Xenia stackpoints overflow described at the top of this section.
+static void GScr_FS_ReadLine()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_readline(<filehandle>)", SCRIPTINSTANCE_SERVER);
+
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
+        Scr_Error_BW("fs_readline: invalid filehandle", SCRIPTINSTANCE_SERVER);
+
+    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
+    if (!slot.fh)
+        Scr_Error_BW("fs_readline: filehandle is not open", SCRIPTINSTANCE_SERVER);
+
+    char buffer[MAX_LINE_LENGTH];
+    if (!std::fgets(buffer, sizeof(buffer), slot.fh))
+    {
+        Scr_AddUndefined_BW(SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    StripTrailingNewline(buffer, static_cast<int>(std::strlen(buffer)));
+    Scr_AddString(buffer, SCRIPTINSTANCE_SERVER);
+}
+
+// Bulk read: open file by path, slurp every line, return a GSC array of
+// strings. Returns `undefined` if the file cannot be opened. Closes the file
+// before returning — caller does NOT call fs_fclose afterward.
+//
+// Single GSC builtin invocation. One host-call boundary cross. Per-line cost
+// stays inside the call. This is the fix for Xenia's stackpoints overflow.
+//
+// Signature: fs_readall_lines(<filename>) -> array of string  | undefined
+static void GScr_FS_ReadAllLines()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_readall_lines(<filename>)", SCRIPTINSTANCE_SERVER);
+
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    std::string fullpath = BuildScriptFilePath(filename);
+
+    FILE *f = std::fopen(fullpath.c_str(), "rt");
+    if (!f)
+    {
+        Scr_AddUndefined_BW(SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    // Open a fresh array on the GSC stack. Each Scr_AddString followed by
+    // Scr_AddArray pushes one element. Pattern mirrors the existing
+    // getplayerclipbrushescontainingpoint helper in this file.
+    Scr_MakeArray(SCRIPTINSTANCE_SERVER);
+
+    char buffer[MAX_LINE_LENGTH];
+    int  lineCount = 0;
+    while (std::fgets(buffer, sizeof(buffer), f))
+    {
+        StripTrailingNewline(buffer, static_cast<int>(std::strlen(buffer)));
+        Scr_AddString(buffer, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray(SCRIPTINSTANCE_SERVER);
+        ++lineCount;
+    }
+
+    std::fclose(f);
+
+    DbgPrint("sv_bots: fs_readall_lines loaded %d lines from %s\n", lineCount, filename);
+}
+
+// ===========================================================================
+// fs_load_waypoints: parse Bot Warfare waypoint CSV entirely in C++.
+//
+// Why: even with fs_readall_lines collapsing the file-read loop to one host
+// call, BW's parseTokensIntoWaypoint runs strtok + float_old + int per line
+// — ~15-20 GSC builtin calls per waypoint × 200-300 waypoints = 3000-6000
+// cross-boundary calls. Xenia's stackpoints pool (65536 lifetime) cannot
+// keep up with tight GSC loops that call builtins each iteration.
+//
+// fs_load_waypoints reads + tokenizes + pushes the entire result as one
+// GSC array. Each element is itself a 5-slot array describing one waypoint.
+// GSC then unpacks with one spawnstruct per waypoint and pure array reads
+// (no host calls inside the read).
+//
+// Returns a GSC array of waypoint records. Each record is a 5-element array:
+//
+//   [0] origin     vec3   (always present)
+//   [1] children   array of ints (may be empty, never undefined)
+//   [2] type       string
+//   [3] angles     vec3   (zero-vector if not present in CSV)
+//   [4] has_angles int    (1 if angles were in the CSV, else 0)
+//
+// CSV row format expected (matches BW writeWpsToFile):
+//   "<x> <y> <z>,<c1> <c2> ...,<type>[,<pitch> <yaw> <roll>]"
+//   First line of file = waypoint count (advisory only; loop terminates on EOF).
+//
+// Returns `undefined` if the file cannot be opened.
+// ===========================================================================
+
+// Parse up to `limit` space-separated floats from src into out. Returns
+// the number of values actually parsed.
+static int ParseFloats(const char *src, float *out, int limit)
+{
+    int count = 0;
+    if (!src) return 0;
+
+    const char *p = src;
+    while (*p && count < limit)
+    {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+
+        char scratch[32];
+        int  len = static_cast<int>(p - start);
+        if (len <= 0 || len >= static_cast<int>(sizeof(scratch))) continue;
+        std::memcpy(scratch, start, len);
+        scratch[len] = '\0';
+        out[count++] = static_cast<float>(std::atof(scratch));
+    }
+    return count;
+}
+
+// Parse up to `limit` space-separated ints from src into out. Same shape.
+static int ParseInts(const char *src, int *out, int limit)
+{
+    int count = 0;
+    if (!src) return 0;
+
+    const char *p = src;
+    while (*p && count < limit)
+    {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t') ++p;
+
+        char scratch[16];
+        int  len = static_cast<int>(p - start);
+        if (len <= 0 || len >= static_cast<int>(sizeof(scratch))) continue;
+        std::memcpy(scratch, start, len);
+        scratch[len] = '\0';
+        out[count++] = std::atoi(scratch);
+    }
+    return count;
+}
+
+// Split a comma-delimited line into up to `limit` field pointers in `out`.
+// MUTATES line in place (writes nulls over the commas). Returns field count.
+static int SplitOnComma(char *line, char **out, int limit)
+{
+    int  count = 0;
+    char *p    = line;
+    if (!*p) return 0;
+
+    out[count++] = p;
+    while (*p && count < limit)
+    {
+        if (*p == ',')
+        {
+            *p = '\0';
+            ++p;
+            if (count < limit)
+                out[count++] = p;
+        }
+        else
+        {
+            ++p;
+        }
+    }
+    return count;
+}
+
+static void GScr_FS_LoadWaypoints()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 1)
+        Scr_Error_BW("Usage: fs_load_waypoints(<filename>)", SCRIPTINSTANCE_SERVER);
+
+    const char *filename = Scr_GetString_BW(0, SCRIPTINSTANCE_SERVER);
+    std::string fullpath = BuildScriptFilePath(filename);
+
+    FILE *f = std::fopen(fullpath.c_str(), "rt");
+    if (!f)
+    {
+        Scr_AddUndefined_BW(SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    // First line: waypoint count. Advisory only — we terminate on EOF so a
+    // wrong header doesn't truncate the data.
+    char headerBuf[64];
+    int  declaredCount = 0;
+    if (std::fgets(headerBuf, sizeof(headerBuf), f))
+        declaredCount = std::atoi(headerBuf);
+
+    // Open outer GSC array.
+    Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+
+    char buffer[MAX_LINE_LENGTH];
+    int  builtCount = 0;
+    while (std::fgets(buffer, sizeof(buffer), f))
+    {
+        // Strip trailing newline so the last field doesn't carry it.
+        int len = static_cast<int>(std::strlen(buffer));
+        if (len > 0 && buffer[len - 1] == '\n') { buffer[--len] = '\0'; }
+        if (len > 0 && buffer[len - 1] == '\r') { buffer[--len] = '\0'; }
+        if (len == 0) continue;
+
+        // Split into up to 4 comma fields: origin, children, type, angles.
+        char *fields[4] = {0};
+        int   fieldCount = SplitOnComma(buffer, fields, 4);
+        if (fieldCount < 3) continue; // need at least origin + children + type
+
+        // [0] origin vec3.
+        float origin[3] = {0, 0, 0};
+        ParseFloats(fields[0], origin, 3);
+
+        // [1] children — space-separated ints, capped at 32. BW waypoints
+        // typically have 2-8 children but be generous.
+        int childIds[32];
+        int childCount = ParseInts(fields[1], childIds, 32);
+
+        // [2] type string.
+        const char *type = fields[2];
+
+        // [3] angles (optional).
+        float angles[3] = {0, 0, 0};
+        int   hasAngles = 0;
+        if (fieldCount >= 4 && fields[3] && fields[3][0])
+        {
+            if (ParseFloats(fields[3], angles, 3) >= 3)
+                hasAngles = 1;
+        }
+
+        // Open inner array for this waypoint record.
+        Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [0] origin vec3.
+        Scr_AddVector_BW(origin, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [1] children — nested array of ints.
+        Scr_MakeArray_BW(SCRIPTINSTANCE_SERVER);
+        for (int c = 0; c < childCount; ++c)
+        {
+            Scr_AddInt_BW(childIds[c], SCRIPTINSTANCE_SERVER);
+            Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+        }
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER); // append children array to wp record
+
+        // [2] type string.
+        Scr_AddString(type ? type : "crouch", SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [3] angles vec3 (zero if absent).
+        Scr_AddVector_BW(angles, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // [4] has_angles flag.
+        Scr_AddInt_BW(hasAngles, SCRIPTINSTANCE_SERVER);
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+
+        // Append this inner array to the outer result.
+        Scr_AddArray_BW(SCRIPTINSTANCE_SERVER);
+        ++builtCount;
+    }
+
+    std::fclose(f);
+
+    DbgPrint("sv_bots: fs_load_waypoints built %d waypoints (declared %d) from %s\n",
+             builtCount, declaredCount, filename);
+}
+
+static void GScr_FS_WriteLine()
+{
+    if (Scr_GetNumParam_BW(SCRIPTINSTANCE_SERVER) != 2)
+        Scr_Error_BW("Usage: fs_writeline(<filehandle>, <data>)", SCRIPTINSTANCE_SERVER);
+
+    int fh = Scr_GetInt_BW(0, SCRIPTINSTANCE_SERVER);
+    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
+        Scr_Error_BW("fs_writeline: invalid filehandle", SCRIPTINSTANCE_SERVER);
+
+    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
+    if (!slot.fh)
+        Scr_Error_BW("fs_writeline: filehandle is not open", SCRIPTINSTANCE_SERVER);
+
+    const char *data = Scr_GetString_BW(1, SCRIPTINSTANCE_SERVER);
+    if (std::fprintf(slot.fh, "%s\n", data) < 0)
+    {
+        Scr_AddInt_BW(0, SCRIPTINSTANCE_SERVER);
+        return;
+    }
+
+    Scr_AddInt_BW(1, SCRIPTINSTANCE_SERVER);
+}
 
 /**
  * Checks if a 3D point is contained within an axis-aligned bounding box
@@ -44,7 +526,15 @@ static struct
     const char *name;
     BuiltinFunction handler;
 } gsc_functions[] = {
-    {"getplayerclipbrushescontainingpoint", GSCrGetPlayerclipBrushesContainingPoint}, {nullptr, nullptr} // Terminator
+    {"getplayerclipbrushescontainingpoint", GSCrGetPlayerclipBrushesContainingPoint},
+    {"fs_testfile",                         GScr_FS_TestFile},
+    {"fs_fopen",                            GScr_FS_FOpen},
+    {"fs_fclose",                           GScr_FS_FClose},
+    {"fs_readline",                         GScr_FS_ReadLine},
+    {"fs_readall_lines",                    GScr_FS_ReadAllLines},
+    {"fs_load_waypoints",                   GScr_FS_LoadWaypoints},
+    {"fs_writeline",                        GScr_FS_WriteLine},
+    {nullptr, nullptr} // Terminator
 };
 
 Detour Scr_GetFunction_Detour;
@@ -63,19 +553,32 @@ BuiltinFunction Scr_GetFunction_Hook(const char **pName, int *type)
         // BW dispatch — checked after gsc_functions own table, before
         // falling through to the engine. Returns nullptr if not a BW name.
         if (BuiltinFunction bw = BW_LookupFunction(*pName))
+        {
+            DbgPrint("sv_bots: [HOOK] '%s' -> BW port handler\n", *pName);
             return bw;
+        }
+
+        // r321: log only the addtestclient lookup so the fall-through to the
+        // native engine builtin is provable, without spamming every lookup.
+        if (_stricmp(*pName, "addtestclient") == 0)
+            DbgPrint("sv_bots: [HOOK] 'addtestclient' -> fall through to engine\n");
     }
     return Scr_GetFunction_Detour.GetOriginal<decltype(&Scr_GetFunction_Hook)>()(pName, type);
 }
 
 GSCFunctions::GSCFunctions()
 {
+    // Reset filehandle slots on module bring-up.
+    std::memset(s_scriptFiles, 0, sizeof(s_scriptFiles));
+
     Scr_GetFunction_Detour = Detour(Scr_GetFunction, Scr_GetFunction_Hook);
     Scr_GetFunction_Detour.Install();
 }
 
 GSCFunctions::~GSCFunctions()
 {
+    // Close any still-open files so handles aren't leaked on shutdown.
+    CloseAllScriptFiles();
     Scr_GetFunction_Detour.Remove();
 }
 } // namespace mp
