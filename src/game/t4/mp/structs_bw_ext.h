@@ -10,6 +10,24 @@
 //
 // All offsets verified against TU7 default_mp.xex via Ghidra MCP.
 //
+// ===========================================================================
+// LAYERING RULE — do not violate.
+// ===========================================================================
+// This file is the BOTTOM of the BW include stack. It includes ONLY structs.h.
+// The dependency direction is strictly one-way:
+//
+//     sv_bots.cpp -> sv_bots.h -> symbols_bw_ext.h -> structs_bw_ext.h -> structs.h
+//
+// structs_bw_ext.h must NEVER #include sv_bots.h, symbols_bw_ext.h, pch.h, or
+// any component header. Doing so creates a circular include
+// (sv_bots.h -> symbols_bw_ext.h -> structs_bw_ext.h -> sv_bots.h) which fails
+// to compile under pch.cpp with C1083 'sv_bots.h' not found, because at that
+// point the only include dir on the compiler line is .../src and sv_bots.h
+// lives under .../src/game/t4/mp/components/. A previous revision pasted the
+// whole sv_bots.cpp body into this file — that is what caused the r314 build
+// failure. Keep this file struct-definitions ONLY.
+// ===========================================================================
+//
 // NOTE on the stock codxe T4 `client_t`: its static_assert claims
 //   offsetof(client_t, gentity) == 0x213F4
 // which is INCORRECT. Verified via SV_DirectConnect decompile, the gentity
