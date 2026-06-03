@@ -85,9 +85,13 @@ static bool s_bulletApplied = false;
 
 static void PatchCodeDword(unsigned int address, unsigned int value)
 {
-    // Xenia detects writes to code pages and re-translates, so a plain store is
-    // sufficient here (same mechanism the Detour class relies on).
     *reinterpret_cast<volatile unsigned int *>(address) = value;
+
+    // Xenia caches translated guest code, so a runtime write to .text is not
+    // seen until the instruction cache for that range is invalidated, which
+    // forces Xenia to re-translate the patched bytes. Load-time detours don't
+    // need this because they patch before the function is ever translated.
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), sizeof(value));
 }
 
 static void ApplyWeaponFxPatches()
