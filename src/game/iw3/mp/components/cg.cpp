@@ -17,6 +17,7 @@ dvar_s *cg_scoreboardLabel_Deaths = nullptr;
 dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
+dvar_s *cg_no_bulletfx = nullptr;
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
@@ -63,10 +64,6 @@ void R_DrawAllDynEnt_Hook(const GfxViewInfo *viewInfo)
 // because fx_enable stays at 1 every other effect - tracers, impacts, smoke,
 // car explosions - is unaffected. Save/restore keeps the weapon def pristine,
 // so this is a safe, fully reversible in-match toggle.
-//
-// WEAPONDEF_VIEWFLASHEFFECT is read both by the original and by us as an FX
-// handle, so zeroing it can never corrupt the def - worst case it skips the
-// effect the engine itself treats as the flash.
 
 #define WEAPONDEF_VIEWFLASHEFFECT 0x164
 
@@ -94,6 +91,28 @@ void CG_AddViewModelWeapon_Hook(unsigned int a1, unsigned int ent, unsigned int 
     }
 
     CG_AddViewModelWeapon_Detour.GetOriginal<decltype(CG_AddViewModelWeapon)>()(a1, ent, a3, a4, a5);
+}
+
+// --- Bullet impact FX suppression ------------------------------------------
+//
+// CG_PlayBulletImpactFX (0x82312C08) is the client's per-shot bullet-effect
+// dispatch: a large switch over the surface material that plays the matching
+// impact effect (sparks/dust/debris on brick, metal, wood, dirt, ...). Both of
+// its callers are cg-side effect playback - one for remote players' shots, one
+// for the local viewmodel (cg + 0x476ac). Neither path applies damage or
+// penetration; that is handled server-side elsewhere. Returning early here
+// therefore removes the visible wall-impact effects without affecting hit
+// registration, muzzle flash (a separate function), explosions, or smoke.
+
+Detour CG_PlayBulletImpactFX_Detour;
+
+void CG_PlayBulletImpactFX_Hook(unsigned int a1, unsigned int a2, unsigned int a3, unsigned int a4, unsigned int a5,
+                                unsigned int a6, unsigned int a7, unsigned int a8)
+{
+    if (cg_no_bulletfx && cg_no_bulletfx->current.enabled)
+        return; // skip all per-bullet surface-impact FX; damage is unaffected
+
+    CG_PlayBulletImpactFX_Detour.GetOriginal<decltype(CG_PlayBulletImpactFX)>()(a1, a2, a3, a4, a5, a6, a7, a8);
 }
 
 void DrawBranding()
@@ -227,6 +246,13 @@ cg::cg()
     CG_AddViewModelWeapon_Detour = Detour(CG_AddViewModelWeapon, CG_AddViewModelWeapon_Hook);
     CG_AddViewModelWeapon_Detour.Install();
 
+    // Suppress per-bullet surface-impact FX (wall sparks/dust/debris). Damage,
+    // explosions, and smoke are unaffected; fx_enable stays at 1.
+    cg_no_bulletfx = Dvar_RegisterBool("cg_no_bulletfx", false, 0, "Disable bullet impact effects");
+
+    CG_PlayBulletImpactFX_Detour = Detour(CG_PlayBulletImpactFX, CG_PlayBulletImpactFX_Hook);
+    CG_PlayBulletImpactFX_Detour.Install();
+
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
 
@@ -263,6 +289,7 @@ cg::~cg()
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
     CG_AddViewModelWeapon_Detour.Remove();
+    CG_PlayBulletImpactFX_Detour.Remove();
 }
 } // namespace mp
 } // namespace iw3
