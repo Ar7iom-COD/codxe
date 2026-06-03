@@ -241,6 +241,13 @@ static CG_AddViewModelWeapon_t CG_AddViewModelWeapon = reinterpret_cast<CG_AddVi
 static auto bg_weaponDefs = reinterpret_cast<unsigned int *>(0x823B9F60);
 static auto bg_numWeapons = reinterpret_cast<int *>(0x85027498);
 
+// Per-shot bullet effect dispatch (surface-typed impact FX: sparks/dust/debris).
+// Both callers are client-side cg effect playback; server damage is handled
+// elsewhere, so skipping this only suppresses the visible bullet impact.
+typedef void (*CG_PlayBulletImpactFX_t)(unsigned int a1, unsigned int a2, unsigned int a3, unsigned int a4,
+                                        unsigned int a5, unsigned int a6, unsigned int a7, unsigned int a8);
+static CG_PlayBulletImpactFX_t CG_PlayBulletImpactFX = reinterpret_cast<CG_PlayBulletImpactFX_t>(0x82312C08);
+
 static auto CL_CreateNewCommands = reinterpret_cast<void (*)(int localClientNum)>(0x822DCAE8);
 static auto CL_FinishMove = reinterpret_cast<void (*)(int localClientNum, usercmd_s *cmd)>(0x822DA220);
 static auto CL_GetPredictedOriginForServerTime =
