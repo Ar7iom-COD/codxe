@@ -17,7 +17,6 @@ dvar_s *cg_scoreboardLabel_Deaths = nullptr;
 dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
-dvar_s *cg_no_bulletfx = nullptr;
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
@@ -48,82 +47,84 @@ void R_DrawAllDynEnt_Hook(const GfxViewInfo *viewInfo)
         R_DrawAllDynEnt_Detour.GetOriginal<decltype(R_DrawAllDynEnt)>()(viewInfo);
 }
 
-// --- Weapon FX suppression via in-place instruction patches ----------------
+// --- Muzzle flash suppression via weapon-def field nulling ------------------
 //
-// Both the view muzzle flash and the bullet surface-impact FX live in
-// functions whose prologue is `mfspr r12,LR; bl __savegprlr; ...`. codxe's
-// Detour copies the first 16 bytes to a trampoline and the relocated
-// `bl __savegprlr` lands in garbage, so detouring those two functions freezes
-// the game. Instead we patch single instructions in place (no trampoline,
-// no relocation), exactly the kind of `.text` write the working detours
-// already perform. Patches are applied/reverted from the per-frame
-// OnCG_DrawActive event so both behave as live toggles.
+// CG_AddViewModelWeapon (0x82317880) plays the first-person muzzle flash by
+// reading weaponDef->viewFlashEffect (weaponDef + 0x164) every frame and only
+// playing it when the handle is non-zero:
 //
-// Muzzle flash: CG_AddViewModelWeapon (0x82317880) plays weaponDef->viewFlash
-//   (weaponDef + 0x164) guarded by:
-//       0x82317910  cmplwi cr6, r6, 0       ; r6 = viewFlashEffect
-//       0x82317914  beq    cr6, 0x82317928  ; skip the flash play if zero
-//       0x82317918..0x82317924              ; play the flash effect
-//       0x82317928  ...                     ; add the weapon model (kept)
-//   Patching 0x82317914 to an unconditional `b 0x82317928` always skips the
-//   flash play while leaving the model add and everything else intact.
+//     iVar1 = (&bg_weaponDefs)[ent->weaponIndex];   // 0x823B9F60[idx]
+//     if (*(uint *)(iVar1 + 0x164) != 0)
+//         CG_PlayEffect(..., *(uint *)(iVar1 + 0x164));
 //
-// Bullet impact: CG_PlayBulletImpactFX (0x82312C08) is pure client FX (both
-//   callers ignore its return value). Patching its first instruction to `blr`
-//   makes it return immediately, so no surface-impact effects play. Damage,
-//   explosions, smoke, and muzzle flash are untouched.
+// So zeroing that field for every loaded weapon suppresses the flash with no
+// code patching. This is a DATA write (the field is read fresh each frame), so
+// Xenia's translated-code cache is irrelevant - unlike a runtime .text patch,
+// it takes effect immediately. The generic effect-play function (0x8230A110)
+// also no-ops on a null handle, confirming this is safe.
+//
+// Detouring CG_AddViewModelWeapon directly is NOT an option: its prologue is
+// `mfspr r12,LR; bl __savegprlr; ...`, and codxe's Detour mis-relocates that
+// `bl` into the trampoline, which freezes the game.
 
-#define CG_VIEWWEAPON_FLASH_BRANCH 0x82317914u // beq cr6, 0x82317928 (flash guard)
-#define CG_VIEWWEAPON_FLASH_SKIP 0x48000014u   // b 0x82317928 (always skip flash)
-#define CG_BULLETIMPACT_ENTRY 0x82312C08u      // CG_PlayBulletImpactFX entry
-#define PPC_BLR 0x4E800020u                    // blr
+#define BG_WEAPONDEFS_ARRAY 0x823B9F60u // array of weaponDef* indexed by weapon index
+#define BG_NUMWEAPONS_ADDR 0x85027498u  // highest valid weapon index (weapon count)
+#define WEAPONDEF_VIEWFLASH 0x164u      // viewFlashEffect handle offset within a weaponDef
 
-static unsigned int s_origFlashBranch = 0;
-static unsigned int s_origImpactEntry = 0;
+static const unsigned int MAX_TRACKED_WEAPONS = 2048;
+static unsigned int s_savedViewFlash[MAX_TRACKED_WEAPONS];
+static bool s_savedViewFlashValid[MAX_TRACKED_WEAPONS];
 static bool s_muzzleApplied = false;
-static bool s_bulletApplied = false;
 
-static void PatchCodeDword(unsigned int address, unsigned int value)
+static void ApplyMuzzleFlashState()
 {
-    *reinterpret_cast<volatile unsigned int *>(address) = value;
+    const bool want = (cg_no_muzzleflash != nullptr) && cg_no_muzzleflash->current.enabled;
 
-    // Xenia caches translated guest code, so a runtime write to .text is not
-    // seen until the instruction cache for that range is invalidated, which
-    // forces Xenia to re-translate the patched bytes. Load-time detours don't
-    // need this because they patch before the function is ever translated.
-    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), sizeof(value));
-}
+    unsigned int count = *reinterpret_cast<volatile unsigned int *>(BG_NUMWEAPONS_ADDR);
+    if (count > MAX_TRACKED_WEAPONS - 1)
+        count = MAX_TRACKED_WEAPONS - 1;
 
-static void ApplyWeaponFxPatches()
-{
-    const bool wantMuzzle = (cg_no_muzzleflash != nullptr) && cg_no_muzzleflash->current.enabled;
-    if (wantMuzzle != s_muzzleApplied)
+    unsigned int *const defs = reinterpret_cast<unsigned int *>(BG_WEAPONDEFS_ARRAY);
+
+    if (want)
     {
-        if (wantMuzzle)
+        // Index 0 is the "none" weapon; valid weapons are 1..count.
+        for (unsigned int i = 1; i <= count; ++i)
         {
-            s_origFlashBranch = *reinterpret_cast<volatile unsigned int *>(CG_VIEWWEAPON_FLASH_BRANCH);
-            PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, CG_VIEWWEAPON_FLASH_SKIP);
+            const unsigned int wd = defs[i];
+            if (wd == 0)
+                continue;
+
+            volatile unsigned int *flash = reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH);
+            if (*flash != 0)
+            {
+                // Save the original the first time we see a non-zero handle for
+                // this slot (also re-catches freshly precached defs after a map
+                // change); steady state is read-only.
+                if (!s_savedViewFlashValid[i])
+                {
+                    s_savedViewFlash[i] = *flash;
+                    s_savedViewFlashValid[i] = true;
+                }
+                *flash = 0;
+            }
         }
-        else
-        {
-            PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, s_origFlashBranch);
-        }
-        s_muzzleApplied = wantMuzzle;
+        s_muzzleApplied = true;
     }
-
-    const bool wantBullet = (cg_no_bulletfx != nullptr) && cg_no_bulletfx->current.enabled;
-    if (wantBullet != s_bulletApplied)
+    else if (s_muzzleApplied)
     {
-        if (wantBullet)
+        for (unsigned int i = 1; i <= count; ++i)
         {
-            s_origImpactEntry = *reinterpret_cast<volatile unsigned int *>(CG_BULLETIMPACT_ENTRY);
-            PatchCodeDword(CG_BULLETIMPACT_ENTRY, PPC_BLR);
+            if (!s_savedViewFlashValid[i])
+                continue;
+
+            const unsigned int wd = defs[i];
+            if (wd != 0)
+                *reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH) = s_savedViewFlash[i];
+
+            s_savedViewFlashValid[i] = false;
         }
-        else
-        {
-            PatchCodeDword(CG_BULLETIMPACT_ENTRY, s_origImpactEntry);
-        }
-        s_bulletApplied = wantBullet;
+        s_muzzleApplied = false;
     }
 }
 
@@ -251,11 +252,9 @@ cg::cg()
 
     Dvar_RegisterBool("r_drawDynEnts", true, 0, "Draw dynamic entities");
 
-    // Weapon FX toggles. These are applied as in-place instruction patches from
-    // the OnCG_DrawActive event (NOT detours), so they are safe on the
-    // __savegprlr-prologue functions that would otherwise freeze the game.
+    // Muzzle flash toggle. Applied by nulling weaponDef->viewFlashEffect as data
+    // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
-    cg_no_bulletfx = Dvar_RegisterBool("cg_no_bulletfx", false, 0, "Disable bullet impact effects");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -278,7 +277,7 @@ cg::cg()
     Events::OnCG_DrawActive(
         []()
         {
-            ApplyWeaponFxPatches();
+            ApplyMuzzleFlashState();
 
             if (cg_draw_player_info->current.enabled)
             {
@@ -295,11 +294,24 @@ cg::~cg()
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
 
-    // Revert any in-place weapon-FX patches so the function bodies are clean.
+    // Restore any view-flash handles we zeroed so the weapon defs are clean.
     if (s_muzzleApplied)
-        PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, s_origFlashBranch);
-    if (s_bulletApplied)
-        PatchCodeDword(CG_BULLETIMPACT_ENTRY, s_origImpactEntry);
+    {
+        unsigned int count = *reinterpret_cast<volatile unsigned int *>(BG_NUMWEAPONS_ADDR);
+        if (count > MAX_TRACKED_WEAPONS - 1)
+            count = MAX_TRACKED_WEAPONS - 1;
+
+        unsigned int *const defs = reinterpret_cast<unsigned int *>(BG_WEAPONDEFS_ARRAY);
+        for (unsigned int i = 1; i <= count; ++i)
+        {
+            if (!s_savedViewFlashValid[i])
+                continue;
+
+            const unsigned int wd = defs[i];
+            if (wd != 0)
+                *reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH) = s_savedViewFlash[i];
+        }
+    }
 }
 } // namespace mp
 } // namespace iw3
