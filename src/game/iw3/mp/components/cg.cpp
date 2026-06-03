@@ -48,71 +48,79 @@ void R_DrawAllDynEnt_Hook(const GfxViewInfo *viewInfo)
         R_DrawAllDynEnt_Detour.GetOriginal<decltype(R_DrawAllDynEnt)>()(viewInfo);
 }
 
-// --- View muzzle flash suppression -----------------------------------------
+// --- Weapon FX suppression via in-place instruction patches ----------------
 //
-// CG_AddViewModelWeapon (0x82317880) adds the local first-person weapon each
-// frame. Early on it does:
+// Both the view muzzle flash and the bullet surface-impact FX live in
+// functions whose prologue is `mfspr r12,LR; bl __savegprlr; ...`. codxe's
+// Detour copies the first 16 bytes to a trampoline and the relocated
+// `bl __savegprlr` lands in garbage, so detouring those two functions freezes
+// the game. Instead we patch single instructions in place (no trampoline,
+// no relocation), exactly the kind of `.text` write the working detours
+// already perform. Patches are applied/reverted from the per-frame
+// OnCG_DrawActive event so both behave as live toggles.
 //
-//     weaponDef = bg_weaponDefs[ ent->weaponIndex ];          // 0x823b9f60[idx]
-//     if ( weaponDef->viewFlashEffect != 0 )                  // weaponDef + 0x164
-//         CG_PlayOrientedEffect( ..., ent->origin, weaponDef->viewFlashEffect );
-//     ... then it adds the weapon model (weaponDef + 0x584) ...
+// Muzzle flash: CG_AddViewModelWeapon (0x82317880) plays weaponDef->viewFlash
+//   (weaponDef + 0x164) guarded by:
+//       0x82317910  cmplwi cr6, r6, 0       ; r6 = viewFlashEffect
+//       0x82317914  beq    cr6, 0x82317928  ; skip the flash play if zero
+//       0x82317918..0x82317924              ; play the flash effect
+//       0x82317928  ...                     ; add the weapon model (kept)
+//   Patching 0x82317914 to an unconditional `b 0x82317928` always skips the
+//   flash play while leaving the model add and everything else intact.
 //
-// The engine already guards the flash on a non-null handle, so to suppress the
-// flash we simply zero weaponDef->viewFlashEffect around the original call and
-// restore it afterwards. The model add (and everything else) is untouched, and
-// because fx_enable stays at 1 every other effect - tracers, impacts, smoke,
-// car explosions - is unaffected. Save/restore keeps the weapon def pristine,
-// so this is a safe, fully reversible in-match toggle.
+// Bullet impact: CG_PlayBulletImpactFX (0x82312C08) is pure client FX (both
+//   callers ignore its return value). Patching its first instruction to `blr`
+//   makes it return immediately, so no surface-impact effects play. Damage,
+//   explosions, smoke, and muzzle flash are untouched.
 
-#define WEAPONDEF_VIEWFLASHEFFECT 0x164
+#define CG_VIEWWEAPON_FLASH_BRANCH 0x82317914u // beq cr6, 0x82317928 (flash guard)
+#define CG_VIEWWEAPON_FLASH_SKIP 0x48000014u   // b 0x82317928 (always skip flash)
+#define CG_BULLETIMPACT_ENTRY 0x82312C08u      // CG_PlayBulletImpactFX entry
+#define PPC_BLR 0x4E800020u                    // blr
 
-Detour CG_AddViewModelWeapon_Detour;
+static unsigned int s_origFlashBranch = 0;
+static unsigned int s_origImpactEntry = 0;
+static bool s_muzzleApplied = false;
+static bool s_bulletApplied = false;
 
-void CG_AddViewModelWeapon_Hook(unsigned int a1, unsigned int ent, unsigned int a3, unsigned int a4, unsigned int a5)
+static void PatchCodeDword(unsigned int address, unsigned int value)
 {
-    if (ent && cg_no_muzzleflash && cg_no_muzzleflash->current.enabled)
-    {
-        const int idx = *reinterpret_cast<int *>(ent + 0x184); // weaponIndex
-        if (idx > 0 && idx <= *bg_numWeapons)
-        {
-            const unsigned int weaponDef = bg_weaponDefs[idx]; // WeaponCompleteDef*
-            if (weaponDef)
-            {
-                unsigned int *const viewFlash =
-                    reinterpret_cast<unsigned int *>(weaponDef + WEAPONDEF_VIEWFLASHEFFECT);
-                const unsigned int saved = *viewFlash;
-                *viewFlash = 0; // engine's `if (flash != 0)` guard now fails -> no flash
-                CG_AddViewModelWeapon_Detour.GetOriginal<decltype(CG_AddViewModelWeapon)>()(a1, ent, a3, a4, a5);
-                *viewFlash = saved; // leave the def exactly as we found it
-                return;
-            }
-        }
-    }
-
-    CG_AddViewModelWeapon_Detour.GetOriginal<decltype(CG_AddViewModelWeapon)>()(a1, ent, a3, a4, a5);
+    // Xenia detects writes to code pages and re-translates, so a plain store is
+    // sufficient here (same mechanism the Detour class relies on).
+    *reinterpret_cast<volatile unsigned int *>(address) = value;
 }
 
-// --- Bullet impact FX suppression ------------------------------------------
-//
-// CG_PlayBulletImpactFX (0x82312C08) is the client's per-shot bullet-effect
-// dispatch: a large switch over the surface material that plays the matching
-// impact effect (sparks/dust/debris on brick, metal, wood, dirt, ...). Both of
-// its callers are cg-side effect playback - one for remote players' shots, one
-// for the local viewmodel (cg + 0x476ac). Neither path applies damage or
-// penetration; that is handled server-side elsewhere. Returning early here
-// therefore removes the visible wall-impact effects without affecting hit
-// registration, muzzle flash (a separate function), explosions, or smoke.
-
-Detour CG_PlayBulletImpactFX_Detour;
-
-void CG_PlayBulletImpactFX_Hook(unsigned int a1, unsigned int a2, unsigned int a3, unsigned int a4, unsigned int a5,
-                                unsigned int a6, unsigned int a7, unsigned int a8)
+static void ApplyWeaponFxPatches()
 {
-    if (cg_no_bulletfx && cg_no_bulletfx->current.enabled)
-        return; // skip all per-bullet surface-impact FX; damage is unaffected
+    const bool wantMuzzle = (cg_no_muzzleflash != nullptr) && cg_no_muzzleflash->current.enabled;
+    if (wantMuzzle != s_muzzleApplied)
+    {
+        if (wantMuzzle)
+        {
+            s_origFlashBranch = *reinterpret_cast<volatile unsigned int *>(CG_VIEWWEAPON_FLASH_BRANCH);
+            PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, CG_VIEWWEAPON_FLASH_SKIP);
+        }
+        else
+        {
+            PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, s_origFlashBranch);
+        }
+        s_muzzleApplied = wantMuzzle;
+    }
 
-    CG_PlayBulletImpactFX_Detour.GetOriginal<decltype(CG_PlayBulletImpactFX)>()(a1, a2, a3, a4, a5, a6, a7, a8);
+    const bool wantBullet = (cg_no_bulletfx != nullptr) && cg_no_bulletfx->current.enabled;
+    if (wantBullet != s_bulletApplied)
+    {
+        if (wantBullet)
+        {
+            s_origImpactEntry = *reinterpret_cast<volatile unsigned int *>(CG_BULLETIMPACT_ENTRY);
+            PatchCodeDword(CG_BULLETIMPACT_ENTRY, PPC_BLR);
+        }
+        else
+        {
+            PatchCodeDword(CG_BULLETIMPACT_ENTRY, s_origImpactEntry);
+        }
+        s_bulletApplied = wantBullet;
+    }
 }
 
 void DrawBranding()
@@ -239,19 +247,11 @@ cg::cg()
 
     Dvar_RegisterBool("r_drawDynEnts", true, 0, "Draw dynamic entities");
 
-    // Suppress the first-person muzzle flash without touching fx_enable, so all
-    // other effects (tracers, impacts, smoke, car explosions) stay intact.
+    // Weapon FX toggles. These are applied as in-place instruction patches from
+    // the OnCG_DrawActive event (NOT detours), so they are safe on the
+    // __savegprlr-prologue functions that would otherwise freeze the game.
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
-
-    CG_AddViewModelWeapon_Detour = Detour(CG_AddViewModelWeapon, CG_AddViewModelWeapon_Hook);
-    CG_AddViewModelWeapon_Detour.Install();
-
-    // Suppress per-bullet surface-impact FX (wall sparks/dust/debris). Damage,
-    // explosions, and smoke are unaffected; fx_enable stays at 1.
     cg_no_bulletfx = Dvar_RegisterBool("cg_no_bulletfx", false, 0, "Disable bullet impact effects");
-
-    CG_PlayBulletImpactFX_Detour = Detour(CG_PlayBulletImpactFX, CG_PlayBulletImpactFX_Hook);
-    CG_PlayBulletImpactFX_Detour.Install();
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -274,6 +274,8 @@ cg::cg()
     Events::OnCG_DrawActive(
         []()
         {
+            ApplyWeaponFxPatches();
+
             if (cg_draw_player_info->current.enabled)
             {
                 CG_DrawPlayerInfo();
@@ -288,8 +290,12 @@ cg::~cg()
     UI_SafeTranslateString_Detour.Remove();
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
-    CG_AddViewModelWeapon_Detour.Remove();
-    CG_PlayBulletImpactFX_Detour.Remove();
+
+    // Revert any in-place weapon-FX patches so the function bodies are clean.
+    if (s_muzzleApplied)
+        PatchCodeDword(CG_VIEWWEAPON_FLASH_BRANCH, s_origFlashBranch);
+    if (s_bulletApplied)
+        PatchCodeDword(CG_BULLETIMPACT_ENTRY, s_origImpactEntry);
 }
 } // namespace mp
 } // namespace iw3
