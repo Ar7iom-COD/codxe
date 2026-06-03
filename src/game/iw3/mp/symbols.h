@@ -230,6 +230,17 @@ static auto Scr_GetGenericField = reinterpret_cast<void (*)(unsigned __int8 *b, 
 
 static auto BG_FindWeaponIndexForName = reinterpret_cast<unsigned int (*)(const char *name)>(0x8232DC38);
 
+// --- Muzzle-flash suppression (used by cg.cpp cg_no_muzzleflash) ------------
+// CG_AddViewModelWeapon (0x82317880): adds the first-person weapon each frame.
+// It plays weaponDef->viewFlashEffect (weaponDef + 0x164) if non-null, then
+// adds the weapon model. bg_weaponDefs is the WeaponCompleteDef* array indexed
+// by weapon index; bg_numWeapons is the weapon count.
+typedef void (*CG_AddViewModelWeapon_t)(unsigned int a1, unsigned int ent, unsigned int a3, unsigned int a4,
+                                        unsigned int a5);
+static CG_AddViewModelWeapon_t CG_AddViewModelWeapon = reinterpret_cast<CG_AddViewModelWeapon_t>(0x82317880);
+static auto bg_weaponDefs = reinterpret_cast<unsigned int *>(0x823B9F60);
+static auto bg_numWeapons = reinterpret_cast<int *>(0x85027498);
+
 static auto CL_CreateNewCommands = reinterpret_cast<void (*)(int localClientNum)>(0x822DCAE8);
 static auto CL_FinishMove = reinterpret_cast<void (*)(int localClientNum, usercmd_s *cmd)>(0x822DA220);
 static auto CL_GetPredictedOriginForServerTime =
