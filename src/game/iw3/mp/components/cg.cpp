@@ -16,6 +16,8 @@ dvar_s *cg_scoreboardLabel_Deaths = nullptr;
 
 dvar_s *cg_draw_player_info = nullptr;
 
+dvar_s *cg_no_muzzleflash = nullptr;
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -43,6 +45,55 @@ void R_DrawAllDynEnt_Hook(const GfxViewInfo *viewInfo)
 {
     if (Dvar_GetBool("r_drawDynEnts"))
         R_DrawAllDynEnt_Detour.GetOriginal<decltype(R_DrawAllDynEnt)>()(viewInfo);
+}
+
+// --- View muzzle flash suppression -----------------------------------------
+//
+// CG_AddViewModelWeapon (0x82317880) adds the local first-person weapon each
+// frame. Early on it does:
+//
+//     weaponDef = bg_weaponDefs[ ent->weaponIndex ];          // 0x823b9f60[idx]
+//     if ( weaponDef->viewFlashEffect != 0 )                  // weaponDef + 0x164
+//         CG_PlayOrientedEffect( ..., ent->origin, weaponDef->viewFlashEffect );
+//     ... then it adds the weapon model (weaponDef + 0x584) ...
+//
+// The engine already guards the flash on a non-null handle, so to suppress the
+// flash we simply zero weaponDef->viewFlashEffect around the original call and
+// restore it afterwards. The model add (and everything else) is untouched, and
+// because fx_enable stays at 1 every other effect - tracers, impacts, smoke,
+// car explosions - is unaffected. Save/restore keeps the weapon def pristine,
+// so this is a safe, fully reversible in-match toggle.
+//
+// WEAPONDEF_VIEWFLASHEFFECT is read both by the original and by us as an FX
+// handle, so zeroing it can never corrupt the def - worst case it skips the
+// effect the engine itself treats as the flash.
+
+#define WEAPONDEF_VIEWFLASHEFFECT 0x164
+
+Detour CG_AddViewModelWeapon_Detour;
+
+void CG_AddViewModelWeapon_Hook(unsigned int a1, unsigned int ent, unsigned int a3, unsigned int a4, unsigned int a5)
+{
+    if (ent && cg_no_muzzleflash && cg_no_muzzleflash->current.enabled)
+    {
+        const int idx = *reinterpret_cast<int *>(ent + 0x184); // weaponIndex
+        if (idx > 0 && idx <= *bg_numWeapons)
+        {
+            const unsigned int weaponDef = bg_weaponDefs[idx]; // WeaponCompleteDef*
+            if (weaponDef)
+            {
+                unsigned int *const viewFlash =
+                    reinterpret_cast<unsigned int *>(weaponDef + WEAPONDEF_VIEWFLASHEFFECT);
+                const unsigned int saved = *viewFlash;
+                *viewFlash = 0; // engine's `if (flash != 0)` guard now fails -> no flash
+                CG_AddViewModelWeapon_Detour.GetOriginal<decltype(CG_AddViewModelWeapon)>()(a1, ent, a3, a4, a5);
+                *viewFlash = saved; // leave the def exactly as we found it
+                return;
+            }
+        }
+    }
+
+    CG_AddViewModelWeapon_Detour.GetOriginal<decltype(CG_AddViewModelWeapon)>()(a1, ent, a3, a4, a5);
 }
 
 void DrawBranding()
@@ -169,6 +220,13 @@ cg::cg()
 
     Dvar_RegisterBool("r_drawDynEnts", true, 0, "Draw dynamic entities");
 
+    // Suppress the first-person muzzle flash without touching fx_enable, so all
+    // other effects (tracers, impacts, smoke, car explosions) stay intact.
+    cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
+
+    CG_AddViewModelWeapon_Detour = Detour(CG_AddViewModelWeapon, CG_AddViewModelWeapon_Hook);
+    CG_AddViewModelWeapon_Detour.Install();
+
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
 
@@ -204,6 +262,7 @@ cg::~cg()
     UI_SafeTranslateString_Detour.Remove();
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
+    CG_AddViewModelWeapon_Detour.Remove();
 }
 } // namespace mp
 } // namespace iw3
