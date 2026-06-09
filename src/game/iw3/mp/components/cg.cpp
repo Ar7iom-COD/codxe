@@ -338,6 +338,33 @@ void CG_DrawPlayerInfo()
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
 
+// v9 READ-ONLY COMPASS GATE DIFF. No forcing -- observe which per-client
+// compass-state values differ between free-spec (compass shows) and follow
+// (compass hidden). Flip between the two on hardware; whatever value below
+// changes between the screenshots IS the gate. Drawn top-left under the HUD.
+static void ReadCompassDiff()
+{
+    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(CG_BASE_PTR_ADDR);
+    if (cg_base == 0)
+        return;
+
+    int dc      = *reinterpret_cast<volatile int *>(cg_base + 0x4e2d0u);   // cg_drawCompass cached
+    int gateA   = *reinterpret_cast<volatile int *>(cg_base + 0x4e508u);   // dispatcher gate field
+    int menuTs  = *reinterpret_cast<volatile int *>(cg_base + 0x4e490u);   // Compass_mp menu-open timestamp
+    uint8_t cB  = *reinterpret_cast<volatile uint8_t *>(0x82435a12u);      // caller-gate byte [client0]
+    uint8_t cC  = *reinterpret_cast<volatile uint8_t *>(0x82435a18u);      // FUN_822cf188 array byte [client0] (bit 0x10)
+    int stateD  = *reinterpret_cast<volatile int *>(0x849F4288u);          // per-client state (==2 gate)
+
+    char buff[256];
+    sprintf_s(buff, "CDIFF dc=%d A=%d B=%d C=0x%02x D=%d menu=%d",
+              dc, gateA, (int)cB, (int)cC, stateD, menuTs);
+
+    static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
+    float col[4] = {1.0f, 1.0f, 0.2f, 1.0f};
+    const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
+    R_AddCmdDrawText(buff, 256, diagFont, x, 150.f, 1.0f, 1.0f, 0.0f, col, 0);
+}
+
 cg::cg()
 {
     Menus_OpenByName_Detour = Detour(Menus_OpenByName, Menus_OpenByName_Hook);
@@ -371,7 +398,7 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 8, 0, 100, 0, "Codxe compass hook build marker (v8 -- multi-slot writes + diagnostics)");
+    Dvar_RegisterInt("compass_hook_v", 9, 0, 100, 0, "Codxe compass hook build marker (v9 -- read-only compass gate diff)");
 
     compass_diag_gate =
         Dvar_RegisterInt("compass_diag_gate", -1, -1, 0xff, 0, "Read-back of byte at 0x82435a12 after v8 write (1 = stuck, 0 = clobbered)");
@@ -387,8 +414,10 @@ cg::cg()
     // (CG_Compass_IsVisible) wholesale: returns 1 iff cg_drawCompass != 0,
     // ignoring the spec-follow gate that hid the compass when locked onto
     // another player.
+    // v9: forcing DISABLED for the read-only diff -- observe vanilla compass
+    // behavior (shows in free-spec, hidden in follow). Re-enable to force.
     CG_Compass_IsVisible_Detour = Detour(CG_Compass_IsVisible, CG_Compass_IsVisible_Hook);
-    CG_Compass_IsVisible_Detour.Install();
+    // CG_Compass_IsVisible_Detour.Install();
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -412,7 +441,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
-            TickForceCompassMpForSpec();
+            ReadCompassDiff(); // v9: read-only gate diff (forcing disabled)
 
             if (cg_draw_player_info->current.enabled)
             {
@@ -423,7 +452,7 @@ cg::cg()
 
 cg::~cg()
 {
-    CG_Compass_IsVisible_Detour.Remove();
+    // CG_Compass_IsVisible_Detour.Remove(); // v9: not installed (diff build)
     Menus_OpenByName_Detour.Remove();
     UI_DrawBuildNumber_Detour.Remove();
     UI_SafeTranslateString_Detour.Remove();
