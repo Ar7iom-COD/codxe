@@ -291,6 +291,13 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
+    // Build marker -- proves cg.cpp constructor ran. User can verify
+    // via `\compass_hook_v` in console. If the dvar reads back as 4,
+    // this exact cg.cpp was compiled into the codxe DLL the user is
+    // running. If undefined/missing, the build didn't pick up our
+    // changes.
+    Dvar_RegisterInt("compass_hook_v", 4, 0, 100, "Codxe compass hook build marker (v4)");
+
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
     // Detour path (which the rest of cg.cpp already relies on for
