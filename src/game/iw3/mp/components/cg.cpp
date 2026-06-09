@@ -18,6 +18,41 @@ dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
 
+// CG_Compass_IsVisible (engine-internal, no symbol exported by codxe).
+// Inline prologue at 0x82304290 -- detour-safe per the codxe constraint.
+typedef int (*CG_Compass_IsVisible_t)(int clientNum);
+static CG_Compass_IsVisible_t const CG_Compass_IsVisible =
+    reinterpret_cast<CG_Compass_IsVisible_t>(0x82304290u);
+Detour CG_Compass_IsVisible_Detour;
+
+// Original returns:
+//   1 iff (cg_drawCompass != 0) && (FUN_822cf188(clientNum) != 0)
+//   0 otherwise.
+// FUN_822cf188 returns 0 specifically for spec-follow clients (bit 0x10
+// in per-client array DAT_82435a18), which is why the compass disappears
+// the moment a shoutcaster locks onto a player. We replicate the dvar
+// check and skip the spec-gate entirely.
+//
+// cg_drawCompass is cached per-client in the cg_t struct:
+//   cg_t base ptr at DAT_823f28a0 = 0x823f28a0
+//   sizeof(cg_t) = 0xf0a68
+//   drawCompass field at offset 0x4e2d0
+//
+// Side effect: dead players in killcam now also see the compass
+// (FUN_822cf188 would have returned 0 for them too). Desirable for a
+// shoutcaster build; gate behind a dvar if you ship for ranked.
+int CG_Compass_IsVisible_Hook(int clientNum)
+{
+    const unsigned int cgBase = *reinterpret_cast<volatile unsigned int *>(0x823f28a0u);
+    if (cgBase == 0)
+        return 0; // cg_t not yet initialized
+
+    const unsigned int slotAddr =
+        static_cast<unsigned int>(clientNum) * 0xf0a68u + cgBase + 0x4e2d0u;
+    const int drawCompass = *reinterpret_cast<volatile int *>(slotAddr);
+    return (drawCompass != 0) ? 1 : 0;
+}
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -256,31 +291,15 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
-    // --- Compass spec-gate bypass ---------------------------------------
-    //
-    // CoD4's compass-visibility check at 0x82304290 returns 0 (compass
-    // hidden) when EITHER cg_drawCompass=0 OR its inner bl to FUN_822cf188
-    // at 0x823042C8 returns 0. That inner call returns 0 specifically for
-    // spec-follow clients -- free-roam spec passes the check fine, but
-    // 1st/3rd-person follow hides the compass. Shoutcasters need the
-    // compass visible while following players.
-    //
-    // Patch the `bl FUN_822cf188` instruction to `li r3, 1` so the inner
-    // return value is hardcoded to 1. The dvar check before it is
-    // preserved (cg_drawCompass=0 still hides the compass correctly);
-    // only the spec-mode hide path is bypassed.
-    //
-    // Load-time .text write -- safe under Xenia because JIT translates
-    // the function after we write here, matching the same constraint
-    // documented for codxe's existing Detour installs. No icache flush
-    // is needed (and FlushInstructionCache isn't exposed by the 360 SDK
-    // headers anyway).
-    //
-    // Side effect: dead players in their kill-cam follow now also see the
-    // compass, since FUN_822cf188 would have returned 0 for them too. For
-    // a shoutcaster build this is desirable; if you ever run this build
-    // for ranked matches, gate the write behind a dvar.
-    *reinterpret_cast<volatile unsigned int *>(0x823042C8) = 0x38600001u; // li r3, 1
+    // Compass spec-gate bypass via full-function detour. The raw .text
+    // write attempt at 0x823042C8 did not take effect under Xenia; the
+    // Detour path (which the rest of cg.cpp already relies on for
+    // load-time code modification) does. Hook replaces Function_82304290
+    // (CG_Compass_IsVisible) wholesale: returns 1 iff cg_drawCompass != 0,
+    // ignoring the spec-follow gate that hid the compass when locked onto
+    // another player.
+    CG_Compass_IsVisible_Detour = Detour(CG_Compass_IsVisible, CG_Compass_IsVisible_Hook);
+    CG_Compass_IsVisible_Detour.Install();
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -314,6 +333,7 @@ cg::cg()
 
 cg::~cg()
 {
+    CG_Compass_IsVisible_Detour.Remove();
     Menus_OpenByName_Detour.Remove();
     UI_DrawBuildNumber_Detour.Remove();
     UI_SafeTranslateString_Detour.Remove();
