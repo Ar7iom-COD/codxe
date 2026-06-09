@@ -43,14 +43,14 @@ Detour CG_Compass_IsVisible_Detour;
 // shoutcaster build; gate behind a dvar if you ship for ranked.
 int CG_Compass_IsVisible_Hook(int clientNum)
 {
-    const unsigned int cgBase = *reinterpret_cast<volatile unsigned int *>(0x823f28a0u);
-    if (cgBase == 0)
-        return 0; // cg_t not yet initialized
-
-    const unsigned int slotAddr =
-        static_cast<unsigned int>(clientNum) * 0xf0a68u + cgBase + 0x4e2d0u;
-    const int drawCompass = *reinterpret_cast<volatile int *>(slotAddr);
-    return (drawCompass != 0) ? 1 : 0;
+    // Unconditional return 1: compass always visible for any client,
+    // any spec mode, any round state. Sacrifices the cg_drawCompass
+    // dvar gate -- shoutcaster build wants the compass on at all
+    // times anyway. Avoids reading the per-client cg_t cache which
+    // appears to be reset to 0 by the engine when entering spec-
+    // follow, breaking the v2 hook that respected the dvar.
+    (void)clientNum;
+    return 1;
 }
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
