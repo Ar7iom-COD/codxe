@@ -229,6 +229,40 @@ void CG_DrawPlayerInfo()
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
 
+// Diagnostic readback to settle the follow-spec compass path. For local client 0:
+//   patch = word at 0x8231E0A0 -- proves the .text write landed
+//           (0x4800003C = landed, 0x409A003C = original/did not stick)
+//   mode  = UI field Function_8231E480 branches on (5 = the Function_8231E070
+//           path we patched; 4 = loadout; else = main HUD path gated by vis)
+//   vis   = CG_Compass_IsVisible(0)
+//   field = per-client state at 0x849f4288 (expect 6 in follow)
+// One follow + one alive screenshot resolves which branch draws the compass.
+typedef int (*CG_Compass_IsVisible_fn_t)(int);
+static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
+    reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
+
+static void ReadCompassDiag()
+{
+    uint32_t patchWord = *reinterpret_cast<volatile uint32_t *>(0x8231E0A0u);
+    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(0x823F28A0u);
+    int mode = -1;
+    if (cg_base != 0)
+    {
+        uint32_t uiptr = *reinterpret_cast<volatile uint32_t *>(cg_base + 0x24u);
+        if (uiptr != 0)
+            mode = *reinterpret_cast<volatile int *>(uiptr + 0x10u);
+    }
+    int vis = CG_Compass_IsVisible_fn(0);
+    int field = *reinterpret_cast<volatile int *>(0x849F4288u);
+
+    char buff[256];
+    sprintf_s(buff, "PDIAG patch=0x%08x mode=%d vis=%d field=%d", patchWord, mode, vis, field);
+    static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
+    float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
+    const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
+    R_AddCmdDrawText(buff, 256, diagFont, x, 150.f, 1.0f, 1.0f, 0.0f, col, 0);
+}
+
 cg::cg()
 {
     Menus_OpenByName_Detour = Detour(Menus_OpenByName, Menus_OpenByName_Hook);
@@ -259,7 +293,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console (11 = this build).
-    Dvar_RegisterInt("compass_hook_v", 11, 0, 100, 0, "Codxe compass hook build marker (v11 -- follow-spec compass .text patch, diag removed)");
+    Dvar_RegisterInt("compass_hook_v", 12, 0, 100, 0, "Codxe compass hook build marker (v12 -- follow-spec path diagnostic)");
 
     // ---- Follow-spec compass restore (load-time .text patch) ---------------
     // Function_8231E070 @ 0x8231E070 decides whether to (re)apply the in-game
@@ -302,6 +336,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
+            ReadCompassDiag();
 
             if (cg_draw_player_info->current.enabled)
             {
