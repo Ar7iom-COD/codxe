@@ -332,7 +332,26 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 9, 0, 100, 0, "Codxe compass hook build marker (v9 -- read-only compass gate diff)");
+    Dvar_RegisterInt("compass_hook_v", 10, 0, 100, 0, "Codxe compass hook build marker (v10 -- follow-spec compass .text patch)");
+
+    // ---- Follow-spec compass restore (load-time .text patch) ---------------
+    // Function_8231E070 @ 0x8231E070 decides whether to (re)apply the in-game
+    // HUD menu group, which the compass belongs to. For a follow-spectator the
+    // per-client UI state field (0x849f4288 + client*0x14a0) == 6, so at
+    // 0x8231E0A0 it runs `bne cr6, 0x8231E0DC` (take the HUD-apply path only
+    // when field != 6); field == 6 instead falls into a validity check that
+    // early-returns and skips Function_821EF880(client, 0, ...) -- the call
+    // that wires the compass into the active HUD set. Free-spectate (field !=
+    // 6) does not early-return, which is why its compass shows.
+    //
+    // Make that branch UNCONDITIONAL so every path applies the HUD group, just
+    // like free-spectate. The skipped block only computed the early-return
+    // condition (no state writes), so bypassing it is clean.
+    //   0x8231E0A0:  40 9A 00 3C  (bne cr6, 0x8231E0DC)
+    //            ->  48 00 00 3C  (b        0x8231E0DC)
+    // Load-time .text write (constructor runs before Xenia translates the
+    // function), same mechanism as the other codxe .text patches.
+    *reinterpret_cast<volatile uint32_t *>(0x8231E0A0u) = 0x4800003Cu;
 
     compass_diag_gate =
         Dvar_RegisterInt("compass_diag_gate", -1, -1, 0xff, 0, "Read-back of byte at 0x82435a12 after v8 write (1 = stuck, 0 = clobbered)");
