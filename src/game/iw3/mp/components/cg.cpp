@@ -256,6 +256,32 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
+    // --- Compass spec-gate bypass ---------------------------------------
+    //
+    // CoD4's compass-visibility check at 0x82304290 returns 0 (compass
+    // hidden) when EITHER cg_drawCompass=0 OR its inner bl to FUN_822cf188
+    // at 0x823042C8 returns 0. That inner call returns 0 specifically for
+    // spec-follow clients -- free-roam spec passes the check fine, but
+    // 1st/3rd-person follow hides the compass. Shoutcasters need the
+    // compass visible while following players.
+    //
+    // Patch the `bl FUN_822cf188` instruction to `li r3, 1` so the inner
+    // return value is hardcoded to 1. The dvar check before it is
+    // preserved (cg_drawCompass=0 still hides the compass correctly);
+    // only the spec-mode hide path is bypassed.
+    //
+    // Load-time .text write -- safe under Xenia because JIT translates
+    // the function after we write here, matching the same constraint
+    // documented for codxe's existing Detour installs. No icache flush
+    // is needed (and FlushInstructionCache isn't exposed by the 360 SDK
+    // headers anyway).
+    //
+    // Side effect: dead players in their kill-cam follow now also see the
+    // compass, since FUN_822cf188 would have returned 0 for them too. For
+    // a shoutcaster build this is desirable; if you ever run this build
+    // for ranked matches, gate the write behind a dvar.
+    *reinterpret_cast<volatile unsigned int *>(0x823042C8) = 0x38600001u; // li r3, 1
+
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
 
