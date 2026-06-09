@@ -278,6 +278,17 @@ static void TickForceCompassMpForSpec()
         return;
     int cg_time = *reinterpret_cast<int *>(cg_base + CG_TIME_OFFSET);
 
+    // v6: clobber cg+0x4e508 every tick (not debounced) -- this is the
+    // second compass spec-gate found in Function_82307B28 (ownerdraw
+    // dispatcher) at 0x82308568. The dispatcher gates compass owner-draws
+    // on (cg+0x4e508 == 0) || (per-client_menu_state == 2). For alive
+    // host this field is naturally 0; for spec it becomes non-zero AND
+    // the menu-state goes to 6 (spectator), so both gate conditions fail
+    // and every compass ownerdraw is silently no-op'd by the dispatcher.
+    // The menu IS open (v5 verified) -- this gate is what was blocking
+    // the actual map/icon rendering.
+    *reinterpret_cast<int *>(cg_base + 0x4e508u) = 0;
+
     if (cg_time - s_lastCompassReopen < 500)
         return;
     s_lastCompassReopen = cg_time;
@@ -343,7 +354,7 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 5, 0, 100, 0, "Codxe compass hook build marker (v5 -- Compass_mp force-open)");
+    Dvar_RegisterInt("compass_hook_v", 6, 0, 100, 0, "Codxe compass hook build marker (v6 -- ownerdraw dispatcher gate clobber)");
 
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
