@@ -278,15 +278,22 @@ static void TickForceCompassMpForSpec()
         return;
     int cg_time = *reinterpret_cast<int *>(cg_base + CG_TIME_OFFSET);
 
-    // v6: clobber cg+0x4e508 every tick (not debounced) -- this is the
-    // second compass spec-gate found in Function_82307B28 (ownerdraw
-    // dispatcher) at 0x82308568. The dispatcher gates compass owner-draws
-    // on (cg+0x4e508 == 0) || (per-client_menu_state == 2). For alive
-    // host this field is naturally 0; for spec it becomes non-zero AND
-    // the menu-state goes to 6 (spectator), so both gate conditions fail
-    // and every compass ownerdraw is silently no-op'd by the dispatcher.
-    // The menu IS open (v5 verified) -- this gate is what was blocking
-    // the actual map/icon rendering.
+    // v7: force-set THREE compass spec-gates each frame.
+    //
+    // (a) DAT_82435a12 + clientNum*0x24 -- third gate, at the CALLER of
+    //     the ownerdraw dispatcher (Function_821F0E90 at 0x821F0E90):
+    //         if ((&DAT_82435a12)[client*0x24] != 0)
+    //             Function_82307B28(...);
+    //     For spec, Function_822D2468 at 0x822D2468 clears this byte
+    //     for every client in a loop on state transition, so the
+    //     dispatcher is NEVER CALLED. This is why v6 had no effect --
+    //     the gates inside Function_82307B28 never ran. Per-client
+    //     struct stride 0x24, so host (client 0) lives at 0x82435a12.
+    //
+    // (b) cg+0x4e508 -- second gate (v6), inside Function_82307B28 at
+    //     0x82308568. Kept as belt-and-suspenders in case it does come
+    //     into play once the dispatcher actually runs.
+    *reinterpret_cast<volatile uint8_t *>(0x82435a12u) = 1;
     *reinterpret_cast<int *>(cg_base + 0x4e508u) = 0;
 
     if (cg_time - s_lastCompassReopen < 500)
@@ -354,7 +361,7 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 6, 0, 100, 0, "Codxe compass hook build marker (v6 -- ownerdraw dispatcher gate clobber)");
+    Dvar_RegisterInt("compass_hook_v", 7, 0, 100, 0, "Codxe compass hook build marker (v7 -- dispatcher-caller gate force-set)");
 
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
