@@ -239,6 +239,53 @@ void Menus_OpenByName_Hook(UiContext *dc, const char *menuName)
     }
 }
 
+// v5: Force-open Compass_mp HUD menu for host during shoutcaster mode.
+//
+// Function_8231E168 is the engine function that opens Compass_mp when a
+// player's state changes. It has an outer gate (per-client snap count > 1)
+// that fails for spec-follow clients, leaving the Compass_mp menu closed
+// for the host. All compass ownerdraws (map texture, icons, pings) belong
+// to that menu and silently skip rendering when the menu isn't open.
+//
+// GSC openMenuNoMouse("Compass_mp") was tried first (v44) but doesn't
+// open HUD menus -- script-side only opens script menus. So we call
+// Menus_OpenByName directly via the existing detour's GetOriginal
+// accessor (bypasses our own hook to avoid recursion through the
+// splitscreen-redirect logic above).
+//
+// Host UiContext address derived from Function_8231E168 call site:
+//   Function_821DEB60(clientNum * 0x1478 - 0x7dc12a58, "Compass_mp")
+// Client 0 (host) = 0x823ED5A8 (-0x7dc12a58 sign-extended).
+//
+// cg.time read at cg_base + 0x44730 (cg_base = DAT_823f28a0 dereferenced).
+//
+// Calling Menus_OpenByName for an already-open menu is a no-op in IW3's
+// menu system, so the periodic re-open is safe.
+#define UICONTEXT_CLIENT0_PTR 0x823ED5A8u
+#define CG_BASE_PTR_ADDR 0x823F28A0u
+#define CG_TIME_OFFSET 0x44730u
+
+static int s_lastCompassReopen = 0;
+
+static void TickForceCompassMpForSpec()
+{
+    int my_shoutcaster = Dvar_GetInt("my_shoutcaster");
+    if (my_shoutcaster == 0)
+        return;
+
+    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(CG_BASE_PTR_ADDR);
+    if (cg_base == 0)
+        return;
+    int cg_time = *reinterpret_cast<int *>(cg_base + CG_TIME_OFFSET);
+
+    if (cg_time - s_lastCompassReopen < 500)
+        return;
+    s_lastCompassReopen = cg_time;
+
+    Menus_OpenByName_Detour.GetOriginal<decltype(Menus_OpenByName)>()
+        (reinterpret_cast<UiContext *>(UICONTEXT_CLIENT0_PTR), "Compass_mp");
+}
+
 static const float colorWhiteRGBA[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 void CG_DrawPlayerInfo()
@@ -296,7 +343,7 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 4, 0, 100, 0, "Codxe compass hook build marker (v4)");
+    Dvar_RegisterInt("compass_hook_v", 5, 0, 100, 0, "Codxe compass hook build marker (v5 -- Compass_mp force-open)");
 
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
@@ -330,6 +377,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
+            TickForceCompassMpForSpec();
 
             if (cg_draw_player_info->current.enabled)
             {
