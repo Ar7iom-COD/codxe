@@ -245,74 +245,6 @@ void Menus_OpenByName_Hook(UiContext *dc, const char *menuName)
     }
 }
 
-// v5: Force-open Compass_mp HUD menu for host during shoutcaster mode.
-//
-// Function_8231E168 is the engine function that opens Compass_mp when a
-// player's state changes. It has an outer gate (per-client snap count > 1)
-// that fails for spec-follow clients, leaving the Compass_mp menu closed
-// for the host. All compass ownerdraws (map texture, icons, pings) belong
-// to that menu and silently skip rendering when the menu isn't open.
-//
-// GSC openMenuNoMouse("Compass_mp") was tried first (v44) but doesn't
-// open HUD menus -- script-side only opens script menus. So we call
-// Menus_OpenByName directly via the existing detour's GetOriginal
-// accessor (bypasses our own hook to avoid recursion through the
-// splitscreen-redirect logic above).
-//
-// Host UiContext address derived from Function_8231E168 call site:
-//   Function_821DEB60(clientNum * 0x1478 - 0x7dc12a58, "Compass_mp")
-// Client 0 (host) = 0x823ED5A8 (-0x7dc12a58 sign-extended).
-//
-// cg.time read at cg_base + 0x44730 (cg_base = DAT_823f28a0 dereferenced).
-//
-// Calling Menus_OpenByName for an already-open menu is a no-op in IW3's
-// menu system, so the periodic re-open is safe.
-#define UICONTEXT_CLIENT0_PTR 0x823ED5A8u
-#define CG_BASE_PTR_ADDR 0x823F28A0u
-#define CG_TIME_OFFSET 0x44730u
-
-static int s_lastCompassReopen = 0;
-static int s_compassTicks = 0;
-
-static void TickForceCompassMpForSpec()
-{
-    int my_shoutcaster = Dvar_GetInt("my_shoutcaster");
-    if (my_shoutcaster == 0)
-        return;
-
-    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(CG_BASE_PTR_ADDR);
-    if (cg_base == 0)
-        return;
-    int cg_time = *reinterpret_cast<int *>(cg_base + CG_TIME_OFFSET);
-
-    // v8: write the gate byte for ALL 18 potential client slots. v7 only
-    // wrote slot 0 (assuming host = client 0); if the dispatcher is called
-    // with a different clientNum during spec-follow, slot 0 alone wasn't
-    // covering it. Per-client struct stride 0x24.
-    for (int slot = 0; slot < 18; ++slot) {
-        *reinterpret_cast<volatile uint8_t *>(0x82435a12u + slot * 0x24u) = 1;
-    }
-
-    // v6 inner gate, kept.
-    *reinterpret_cast<int *>(cg_base + 0x4e508u) = 0;
-
-    // v8 diagnostic: read back the values AFTER our writes. If the engine
-    // clobbers them immediately, the readback will show the clobbered
-    // value rather than 1/0. Exposed via dvars so GSC can iprintln them.
-    if (compass_diag_gate)
-        compass_diag_gate->current.integer = *reinterpret_cast<volatile uint8_t *>(0x82435a12u);
-    if (compass_diag_field)
-        compass_diag_field->current.integer = *reinterpret_cast<int *>(cg_base + 0x4e508u);
-    if (compass_diag_ticks)
-        compass_diag_ticks->current.integer = ++s_compassTicks;
-
-    if (cg_time - s_lastCompassReopen < 500)
-        return;
-    s_lastCompassReopen = cg_time;
-
-    Menus_OpenByName_Detour.GetOriginal<decltype(Menus_OpenByName)>()
-        (reinterpret_cast<UiContext *>(UICONTEXT_CLIENT0_PTR), "Compass_mp");
-}
 
 static const float colorWhiteRGBA[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
@@ -337,6 +269,8 @@ void CG_DrawPlayerInfo()
 
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
+
+#define CG_BASE_PTR_ADDR 0x823F28A0u
 
 // v9 READ-ONLY COMPASS GATE DIFF. No forcing -- observe which per-client
 // compass-state values differ between free-spec (compass shows) and follow
