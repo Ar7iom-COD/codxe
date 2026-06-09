@@ -18,6 +18,12 @@ dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
 
+// v8 compass-spec diagnostics. Set by TickForceCompassMpForSpec each frame.
+// Readable from GSC via getdvarint("compass_diag_*") to verify writes.
+dvar_s *compass_diag_gate = nullptr;   // byte at 0x82435a12 after write
+dvar_s *compass_diag_field = nullptr;  // int at cg+0x4e508 after write
+dvar_s *compass_diag_ticks = nullptr;  // increments each tick
+
 // CG_Compass_IsVisible (engine-internal, no symbol exported by codxe).
 // Inline prologue at 0x82304290 -- detour-safe per the codxe constraint.
 typedef int (*CG_Compass_IsVisible_t)(int clientNum);
@@ -266,6 +272,7 @@ void Menus_OpenByName_Hook(UiContext *dc, const char *menuName)
 #define CG_TIME_OFFSET 0x44730u
 
 static int s_lastCompassReopen = 0;
+static int s_compassTicks = 0;
 
 static void TickForceCompassMpForSpec()
 {
@@ -278,23 +285,26 @@ static void TickForceCompassMpForSpec()
         return;
     int cg_time = *reinterpret_cast<int *>(cg_base + CG_TIME_OFFSET);
 
-    // v7: force-set THREE compass spec-gates each frame.
-    //
-    // (a) DAT_82435a12 + clientNum*0x24 -- third gate, at the CALLER of
-    //     the ownerdraw dispatcher (Function_821F0E90 at 0x821F0E90):
-    //         if ((&DAT_82435a12)[client*0x24] != 0)
-    //             Function_82307B28(...);
-    //     For spec, Function_822D2468 at 0x822D2468 clears this byte
-    //     for every client in a loop on state transition, so the
-    //     dispatcher is NEVER CALLED. This is why v6 had no effect --
-    //     the gates inside Function_82307B28 never ran. Per-client
-    //     struct stride 0x24, so host (client 0) lives at 0x82435a12.
-    //
-    // (b) cg+0x4e508 -- second gate (v6), inside Function_82307B28 at
-    //     0x82308568. Kept as belt-and-suspenders in case it does come
-    //     into play once the dispatcher actually runs.
-    *reinterpret_cast<volatile uint8_t *>(0x82435a12u) = 1;
+    // v8: write the gate byte for ALL 18 potential client slots. v7 only
+    // wrote slot 0 (assuming host = client 0); if the dispatcher is called
+    // with a different clientNum during spec-follow, slot 0 alone wasn't
+    // covering it. Per-client struct stride 0x24.
+    for (int slot = 0; slot < 18; ++slot) {
+        *reinterpret_cast<volatile uint8_t *>(0x82435a12u + slot * 0x24u) = 1;
+    }
+
+    // v6 inner gate, kept.
     *reinterpret_cast<int *>(cg_base + 0x4e508u) = 0;
+
+    // v8 diagnostic: read back the values AFTER our writes. If the engine
+    // clobbers them immediately, the readback will show the clobbered
+    // value rather than 1/0. Exposed via dvars so GSC can iprintln them.
+    if (compass_diag_gate)
+        compass_diag_gate->current.integer = *reinterpret_cast<volatile uint8_t *>(0x82435a12u);
+    if (compass_diag_field)
+        compass_diag_field->current.integer = *reinterpret_cast<int *>(cg_base + 0x4e508u);
+    if (compass_diag_ticks)
+        compass_diag_ticks->current.integer = ++s_compassTicks;
 
     if (cg_time - s_lastCompassReopen < 500)
         return;
@@ -361,7 +371,14 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 7, 0, 100, 0, "Codxe compass hook build marker (v7 -- dispatcher-caller gate force-set)");
+    Dvar_RegisterInt("compass_hook_v", 8, 0, 100, 0, "Codxe compass hook build marker (v8 -- multi-slot writes + diagnostics)");
+
+    compass_diag_gate =
+        Dvar_RegisterInt("compass_diag_gate", -1, -1, 0xff, 0, "Read-back of byte at 0x82435a12 after v8 write (1 = stuck, 0 = clobbered)");
+    compass_diag_field =
+        Dvar_RegisterInt("compass_diag_field", -1, INT32_MIN, INT32_MAX, 0, "Read-back of int at cg+0x4e508 after v8 write");
+    compass_diag_ticks =
+        Dvar_RegisterInt("compass_diag_ticks", 0, 0, INT32_MAX, 0, "Tick count of TickForceCompassMpForSpec, proves OnCG_DrawActive fires");
 
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
