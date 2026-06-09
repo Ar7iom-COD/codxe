@@ -296,7 +296,7 @@ cg::cg()
     // this exact cg.cpp was compiled into the codxe DLL the user is
     // running. If undefined/missing, the build didn't pick up our
     // changes.
-    Dvar_RegisterInt("compass_hook_v", 4, 0, 100, "Codxe compass hook build marker (v4)");
+    Dvar_RegisterInt("compass_hook_v", 4, 0, 100, 0, "Codxe compass hook build marker (v4)");
 
     // Compass spec-gate bypass via full-function detour. The raw .text
     // write attempt at 0x823042C8 did not take effect under Xenia; the
