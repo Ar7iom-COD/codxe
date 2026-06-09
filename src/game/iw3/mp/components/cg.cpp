@@ -18,47 +18,6 @@ dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
 
-// v8 compass-spec diagnostics. Set by TickForceCompassMpForSpec each frame.
-// Readable from GSC via getdvarint("compass_diag_*") to verify writes.
-dvar_s *compass_diag_gate = nullptr;   // byte at 0x82435a12 after write
-dvar_s *compass_diag_field = nullptr;  // int at cg+0x4e508 after write
-dvar_s *compass_diag_ticks = nullptr;  // increments each tick
-
-// CG_Compass_IsVisible (engine-internal, no symbol exported by codxe).
-// Inline prologue at 0x82304290 -- detour-safe per the codxe constraint.
-typedef int (*CG_Compass_IsVisible_t)(int clientNum);
-static CG_Compass_IsVisible_t const CG_Compass_IsVisible =
-    reinterpret_cast<CG_Compass_IsVisible_t>(0x82304290u);
-Detour CG_Compass_IsVisible_Detour;
-
-// Original returns:
-//   1 iff (cg_drawCompass != 0) && (FUN_822cf188(clientNum) != 0)
-//   0 otherwise.
-// FUN_822cf188 returns 0 specifically for spec-follow clients (bit 0x10
-// in per-client array DAT_82435a18), which is why the compass disappears
-// the moment a shoutcaster locks onto a player. We replicate the dvar
-// check and skip the spec-gate entirely.
-//
-// cg_drawCompass is cached per-client in the cg_t struct:
-//   cg_t base ptr at DAT_823f28a0 = 0x823f28a0
-//   sizeof(cg_t) = 0xf0a68
-//   drawCompass field at offset 0x4e2d0
-//
-// Side effect: dead players in killcam now also see the compass
-// (FUN_822cf188 would have returned 0 for them too). Desirable for a
-// shoutcaster build; gate behind a dvar if you ship for ranked.
-int CG_Compass_IsVisible_Hook(int clientNum)
-{
-    // Unconditional return 1: compass always visible for any client,
-    // any spec mode, any round state. Sacrifices the cg_drawCompass
-    // dvar gate -- shoutcaster build wants the compass on at all
-    // times anyway. Avoids reading the per-client cg_t cache which
-    // appears to be reset to 0 by the engine when entering spec-
-    // follow, breaking the v2 hook that respected the dvar.
-    (void)clientNum;
-    return 1;
-}
-
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -270,35 +229,6 @@ void CG_DrawPlayerInfo()
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
 
-#define CG_BASE_PTR_ADDR 0x823F28A0u
-
-// v9 READ-ONLY COMPASS GATE DIFF. No forcing -- observe which per-client
-// compass-state values differ between free-spec (compass shows) and follow
-// (compass hidden). Flip between the two on hardware; whatever value below
-// changes between the screenshots IS the gate. Drawn top-left under the HUD.
-static void ReadCompassDiff()
-{
-    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(CG_BASE_PTR_ADDR);
-    if (cg_base == 0)
-        return;
-
-    int dc      = *reinterpret_cast<volatile int *>(cg_base + 0x4e2d0u);   // cg_drawCompass cached
-    int gateA   = *reinterpret_cast<volatile int *>(cg_base + 0x4e508u);   // dispatcher gate field
-    int menuTs  = *reinterpret_cast<volatile int *>(cg_base + 0x4e490u);   // Compass_mp menu-open timestamp
-    uint8_t cB  = *reinterpret_cast<volatile uint8_t *>(0x82435a12u);      // caller-gate byte [client0]
-    uint8_t cC  = *reinterpret_cast<volatile uint8_t *>(0x82435a18u);      // FUN_822cf188 array byte [client0] (bit 0x10)
-    int stateD  = *reinterpret_cast<volatile int *>(0x849F4288u);          // per-client state (==2 gate)
-
-    char buff[256];
-    sprintf_s(buff, "CDIFF dc=%d A=%d B=%d C=0x%02x D=%d menu=%d",
-              dc, gateA, (int)cB, (int)cC, stateD, menuTs);
-
-    static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
-    float col[4] = {1.0f, 1.0f, 0.2f, 1.0f};
-    const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
-    R_AddCmdDrawText(buff, 256, diagFont, x, 150.f, 1.0f, 1.0f, 0.0f, col, 0);
-}
-
 cg::cg()
 {
     Menus_OpenByName_Detour = Detour(Menus_OpenByName, Menus_OpenByName_Hook);
@@ -327,12 +257,9 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
-    // Build marker -- proves cg.cpp constructor ran. User can verify
-    // via `\compass_hook_v` in console. If the dvar reads back as 4,
-    // this exact cg.cpp was compiled into the codxe DLL the user is
-    // running. If undefined/missing, the build didn't pick up our
-    // changes.
-    Dvar_RegisterInt("compass_hook_v", 10, 0, 100, 0, "Codxe compass hook build marker (v10 -- follow-spec compass .text patch)");
+    // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
+    // Read back via `\compass_hook_v` in console (11 = this build).
+    Dvar_RegisterInt("compass_hook_v", 11, 0, 100, 0, "Codxe compass hook build marker (v11 -- follow-spec compass .text patch, diag removed)");
 
     // ---- Follow-spec compass restore (load-time .text patch) ---------------
     // Function_8231E070 @ 0x8231E070 decides whether to (re)apply the in-game
@@ -352,25 +279,6 @@ cg::cg()
     // Load-time .text write (constructor runs before Xenia translates the
     // function), same mechanism as the other codxe .text patches.
     *reinterpret_cast<volatile uint32_t *>(0x8231E0A0u) = 0x4800003Cu;
-
-    compass_diag_gate =
-        Dvar_RegisterInt("compass_diag_gate", -1, -1, 0xff, 0, "Read-back of byte at 0x82435a12 after v8 write (1 = stuck, 0 = clobbered)");
-    compass_diag_field =
-        Dvar_RegisterInt("compass_diag_field", -1, INT32_MIN, INT32_MAX, 0, "Read-back of int at cg+0x4e508 after v8 write");
-    compass_diag_ticks =
-        Dvar_RegisterInt("compass_diag_ticks", 0, 0, INT32_MAX, 0, "Tick count of TickForceCompassMpForSpec, proves OnCG_DrawActive fires");
-
-    // Compass spec-gate bypass via full-function detour. The raw .text
-    // write attempt at 0x823042C8 did not take effect under Xenia; the
-    // Detour path (which the rest of cg.cpp already relies on for
-    // load-time code modification) does. Hook replaces Function_82304290
-    // (CG_Compass_IsVisible) wholesale: returns 1 iff cg_drawCompass != 0,
-    // ignoring the spec-follow gate that hid the compass when locked onto
-    // another player.
-    // v9: forcing DISABLED for the read-only diff -- observe vanilla compass
-    // behavior (shows in free-spec, hidden in follow). Re-enable to force.
-    CG_Compass_IsVisible_Detour = Detour(CG_Compass_IsVisible, CG_Compass_IsVisible_Hook);
-    // CG_Compass_IsVisible_Detour.Install();
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -394,7 +302,6 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
-            ReadCompassDiff(); // v9: read-only gate diff (forcing disabled)
 
             if (cg_draw_player_info->current.enabled)
             {
@@ -405,7 +312,6 @@ cg::cg()
 
 cg::~cg()
 {
-    // CG_Compass_IsVisible_Detour.Remove(); // v9: not installed (diff build)
     Menus_OpenByName_Detour.Remove();
     UI_DrawBuildNumber_Detour.Remove();
     UI_SafeTranslateString_Detour.Remove();
