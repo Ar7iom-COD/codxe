@@ -30,6 +30,17 @@ dvar_s *cg_no_muzzleflash = nullptr;
 // just the compass, and group-6 consumers (follow cam / input) may misbehave.
 dvar_s *compass_group0 = nullptr;
 
+// v17 native follow-spec compass: draw the engine's own compass actor blips
+// (both teams: friendly arrows + enemy dots) by calling Function_82322868
+// directly each frame, no .ff edit and no menu. Placement is dvar-tunable so
+// it can be dialed in on Xenia without rebuilding.
+dvar_s *compass_native = nullptr;
+dvar_s *compass_native_mode = nullptr;
+dvar_s *compass_native_x = nullptr;
+dvar_s *compass_native_y = nullptr;
+dvar_s *compass_native_size = nullptr;
+dvar_s *compass_native_align = nullptr;
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -241,65 +252,96 @@ void CG_DrawPlayerInfo()
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
 
-typedef int (*CG_Compass_IsVisible_fn_t)(int);
-static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
-    reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
-
-static void ForceFollowHudGroup()
+// Engine's own "valid followed player" test, lifted from Function_8231E070's
+// early-out: followedSlot (0x849f3664) must be in [1..count(0x849f3620)] and
+// the player-slot pointer it indexes via 0x849f2df0 + (slot+0x20c)*4 must be
+// live. Group 6 is the GENERIC spectate/intermission UI state -- it is also
+// active at the CHOOSE TEAM screen (v15 broke team select by forcing there).
+// This check is what distinguishes "locked onto a player" from "sitting in
+// spec UI", so the group rewrite only fires mid-follow. Local client 0 only.
+static bool ValidFollowedPlayer()
 {
-    if (compass_group0 == nullptr || !compass_group0->current.enabled)
-        return;
-    volatile int *group = reinterpret_cast<volatile int *>(0x849F4288u);
-    if (*group == 6)
-        *group = 0;
+    int followedSlot = *reinterpret_cast<volatile int *>(0x849F3664u);
+    int idx = followedSlot - 1;
+    int count = *reinterpret_cast<volatile int *>(0x849F3620u);
+    if (idx < 0 || idx >= count)
+        return false;
+    uint32_t slot = *reinterpret_cast<volatile uint32_t *>(
+        0x849F2DF0u + (((uint32_t)followedSlot + 0x20Cu) << 2));
+    if (slot == 0)
+        return false;
+    return *reinterpret_cast<volatile uint32_t *>(slot) != 0;
 }
 
-static void ReadCompassDiag()
+// Native compass actor-blip drawer. Function_82322868 loops the compass-actor
+// array (24 slots, engine-filled every frame from the snapshot) and draws BOTH
+// teams -- friendly directional arrows + enemy dots -- through the per-client
+// compass transform at 0x8246f308. Verified in Ghidra: every wrapper around it
+// is a NOP or __savefpr/__restfpr register thunk, so it has NO menu-paint
+// context dependency, and the full-map path is NOT behind the follow-spec gate
+// that hides the rotating compass. So we can call it straight from the per-
+// frame draw with a hand-built rectDef, no menu open and no .ff edit.
+//   p1 = local client (0)
+//   p2 = mode: 0 = full-map projection, 1 = rotating compass
+//   p3 = scratch rect ptr (only read in rotating mode -- we pass a zeroed rect)
+//   p4 = rectDef { float x,y,w,h; int horzAlign, vertAlign } -- the screen box
+//   p5 = base color RGBA floats (p5[3] alpha is written/clamped by the fn)
+typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
+static CompassDrawActors_fn_t const CompassDrawActors_fn =
+    reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
+
+struct compassRectDef_s
 {
-    // Compass draw gate. Function_82348BD0 (default HUD-map draw, used when the
-    // hud-map-mode dvar at 0x823f56e8 reads 0) skips the ENTIRE compass when the
-    // per-client byte at 0x823a7408 + client*0xe34 is 0.
-    //   g0   = that byte for local client 0 (0 in follow + 1 alive => this is the gate)
-    //   gAny = first client index 0..17 whose byte is set, else -1
-    //   map  = hud-map-mode dvar value (0 => 82348BD0 draws; nonzero => 82320308
-    //          draws instead and the g0 byte is irrelevant)
-    const uint32_t COMPASS_BYTE = 0x823a7408u;
-    const uint32_t COMPASS_STRIDE = 0xe34u;
+    float x;
+    float y;
+    float w;
+    float h;
+    int horzAlign;
+    int vertAlign;
+};
 
-    int g0 = *reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE);
-    int gAny = -1;
-    for (int c = 0; c < 18; ++c)
-    {
-        if (*reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE + (uint32_t)c * COMPASS_STRIDE) != 0)
-        {
-            gAny = c;
-            break;
-        }
-    }
+// The actor projection runs through the per-client compass transform matrix at
+// 0x8246f308 (stride 0x44). If that matrix is stale/zero in follow (no menu
+// open) the projected coords would be garbage, so bail rather than risk a bad
+// draw -- a stale matrix then shows NOTHING instead of crashing, which itself
+// tells us the matrix needs explicit setup.
+static bool CompassMatrixReady()
+{
+    const volatile float *m = reinterpret_cast<volatile float *>(0x8246F308u);
+    float a = m[0];
+    float b = m[1];
+    if (a != a || b != b) // NaN
+        return false;
+    if (a == 0.0f && b == 0.0f)
+        return false;
+    return true;
+}
 
-    int map = -1;
-    uint32_t mapDvar = *reinterpret_cast<volatile uint32_t *>(0x823F56E8u);
-    if (mapDvar != 0)
-        map = *reinterpret_cast<volatile int *>(mapDvar + 0xCu);
+static void DrawNativeSpecCompass()
+{
+    if (compass_native == nullptr || !compass_native->current.enabled)
+        return;
+    // Only mid-follow (locked onto a player). Skips CHOOSE TEAM / spec UI.
+    if (!ValidFollowedPlayer())
+        return;
+    if (!CompassMatrixReady())
+        return;
 
-    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(0x823F28A0u);
-    int mode = -1;
-    if (cg_base != 0)
-    {
-        uint32_t uiptr = *reinterpret_cast<volatile uint32_t *>(cg_base + 0x24u);
-        if (uiptr != 0)
-            mode = *reinterpret_cast<volatile int *>(uiptr + 0x10u);
-    }
-    int vis = CG_Compass_IsVisible_fn(0);
-    int field = *reinterpret_cast<volatile int *>(0x849F4288u);
+    compassRectDef_s rect;
+    rect.x = static_cast<float>(compass_native_x->current.integer);
+    rect.y = static_cast<float>(compass_native_y->current.integer);
+    rect.w = static_cast<float>(compass_native_size->current.integer);
+    rect.h = static_cast<float>(compass_native_size->current.integer);
+    rect.horzAlign = compass_native_align->current.integer;
+    rect.vertAlign = compass_native_align->current.integer;
 
-    char buff[256];
-    sprintf_s(buff, "PDIAG4 g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
-              g0, gAny, map, mode, vis, field);
-    static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
-    float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
-    const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
-    R_AddCmdDrawText(buff, 256, diagFont, x, 150.f, 1.0f, 1.0f, 0.0f, col, 0);
+    // p5 alpha is written by the draw fn, so refresh every frame.
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    // p3 scratch (unused in full-map mode; zeroed for the rotating path).
+    compassRectDef_s scratch = {0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
+
+    CompassDrawActors_fn(0, compass_native_mode->current.integer, &scratch, &rect, color);
 }
 
 cg::cg()
@@ -330,11 +372,29 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
-    compass_group0 = Dvar_RegisterBool("compass_group0", true, 0, "Follow-spec: rewrite HUD group 6 to 0 so the in-game HUD (compass) draws");
+    // compass_group0 is now inert (the field 6->0 force was retired -- it was
+    // built on the disproven "82348BD0 is the map" theory). Left registered so
+    // existing configs referencing it don't error; it no longer does anything.
+    compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op in v17)");
+
+    // Native follow-spec compass (v17). Toggle + dvar-tunable placement so the
+    // map box can be dialed in on Xenia with no rebuild.
+    compass_native = Dvar_RegisterBool("compass_native", true, 0,
+        "Follow-spec: draw native engine compass blips (both teams) via fn 82322868");
+    compass_native_mode = Dvar_RegisterInt("compass_native_mode", 0, 0, 1, 0,
+        "Native spec compass projection: 0=full map, 1=rotating");
+    compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
+        "Native spec compass rect X");
+    compass_native_y = Dvar_RegisterInt("compass_native_y", 16, -2000, 2000, 0,
+        "Native spec compass rect Y");
+    compass_native_size = Dvar_RegisterInt("compass_native_size", 112, 8, 1024, 0,
+        "Native spec compass rect size (square, w=h)");
+    compass_native_align = Dvar_RegisterInt("compass_native_align", 0, 0, 7, 0,
+        "Native spec compass rect horz/vert align enum (0-7)");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
-    // Read back via `\compass_hook_v` in console (11 = this build).
-    Dvar_RegisterInt("compass_hook_v", 15, 0, 100, 0, "Codxe compass hook build marker (v15 -- HUD group 6->0 force, compass_group0 dvar)");
+    // Read back via `\compass_hook_v` in console.
+    Dvar_RegisterInt("compass_hook_v", 17, 0, 100, 0, "Codxe compass hook build marker (v17 -- native spec compass blips via fn 82322868)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -358,8 +418,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
-            ReadCompassDiag();
-            ForceFollowHudGroup();
+            DrawNativeSpecCompass();
 
             if (cg_draw_player_info->current.enabled)
             {
