@@ -229,21 +229,38 @@ void CG_DrawPlayerInfo()
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
 }
 
-// Diagnostic readback to settle the follow-spec compass path. For local client 0:
-//   patch = word at 0x8231E0A0 -- proves the .text write landed
-//           (0x4800003C = landed, 0x409A003C = original/did not stick)
-//   mode  = UI field Function_8231E480 branches on (5 = the Function_8231E070
-//           path we patched; 4 = loadout; else = main HUD path gated by vis)
-//   vis   = CG_Compass_IsVisible(0)
-//   field = per-client state at 0x849f4288 (expect 6 in follow)
-// One follow + one alive screenshot resolves which branch draws the compass.
 typedef int (*CG_Compass_IsVisible_fn_t)(int);
 static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
     reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
 
 static void ReadCompassDiag()
 {
-    uint32_t patchWord = *reinterpret_cast<volatile uint32_t *>(0x8231E0A0u);
+    // Compass draw gate. Function_82348BD0 (default HUD-map draw, used when the
+    // hud-map-mode dvar at 0x823f56e8 reads 0) skips the ENTIRE compass when the
+    // per-client byte at 0x823a7408 + client*0xe34 is 0.
+    //   g0   = that byte for local client 0 (0 in follow + 1 alive => this is the gate)
+    //   gAny = first client index 0..17 whose byte is set, else -1
+    //   map  = hud-map-mode dvar value (0 => 82348BD0 draws; nonzero => 82320308
+    //          draws instead and the g0 byte is irrelevant)
+    const uint32_t COMPASS_BYTE = 0x823a7408u;
+    const uint32_t COMPASS_STRIDE = 0xe34u;
+
+    int g0 = *reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE);
+    int gAny = -1;
+    for (int c = 0; c < 18; ++c)
+    {
+        if (*reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE + (uint32_t)c * COMPASS_STRIDE) != 0)
+        {
+            gAny = c;
+            break;
+        }
+    }
+
+    int map = -1;
+    uint32_t mapDvar = *reinterpret_cast<volatile uint32_t *>(0x823F56E8u);
+    if (mapDvar != 0)
+        map = *reinterpret_cast<volatile int *>(mapDvar + 0xCu);
+
     uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(0x823F28A0u);
     int mode = -1;
     if (cg_base != 0)
@@ -256,7 +273,8 @@ static void ReadCompassDiag()
     int field = *reinterpret_cast<volatile int *>(0x849F4288u);
 
     char buff[256];
-    sprintf_s(buff, "PDIAG patch=0x%08x mode=%d vis=%d field=%d", patchWord, mode, vis, field);
+    sprintf_s(buff, "PDIAG2 g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
+              g0, gAny, map, mode, vis, field);
     static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
     float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
     const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
@@ -293,26 +311,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console (11 = this build).
-    Dvar_RegisterInt("compass_hook_v", 12, 0, 100, 0, "Codxe compass hook build marker (v12 -- follow-spec path diagnostic)");
-
-    // ---- Follow-spec compass restore (load-time .text patch) ---------------
-    // Function_8231E070 @ 0x8231E070 decides whether to (re)apply the in-game
-    // HUD menu group, which the compass belongs to. For a follow-spectator the
-    // per-client UI state field (0x849f4288 + client*0x14a0) == 6, so at
-    // 0x8231E0A0 it runs `bne cr6, 0x8231E0DC` (take the HUD-apply path only
-    // when field != 6); field == 6 instead falls into a validity check that
-    // early-returns and skips Function_821EF880(client, 0, ...) -- the call
-    // that wires the compass into the active HUD set. Free-spectate (field !=
-    // 6) does not early-return, which is why its compass shows.
-    //
-    // Make that branch UNCONDITIONAL so every path applies the HUD group, just
-    // like free-spectate. The skipped block only computed the early-return
-    // condition (no state writes), so bypassing it is clean.
-    //   0x8231E0A0:  40 9A 00 3C  (bne cr6, 0x8231E0DC)
-    //            ->  48 00 00 3C  (b        0x8231E0DC)
-    // Load-time .text write (constructor runs before Xenia translates the
-    // function), same mechanism as the other codxe .text patches.
-    *reinterpret_cast<volatile uint32_t *>(0x8231E0A0u) = 0x4800003Cu;
+    Dvar_RegisterInt("compass_hook_v", 13, 0, 100, 0, "Codxe compass hook build marker (v13 -- compass draw-gate probe)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
