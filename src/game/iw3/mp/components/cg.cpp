@@ -291,17 +291,35 @@ typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
 static CompassDrawActors_fn_t const CompassDrawActors_fn =
     reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
 
-// Native compass MAP BACKGROUND drawer (Compass_mp image). Drawn with the SAME
-// rect + projection as the actor blips above, so the map and the blips share
-// one coordinate system and line up -- this is what the menu full-map does, and
-// the reason our GSC scMap image can't align with the native arrows (different
-// projection). p6 is the ownerdraw item; its +0xc float receives the fade
-// alpha, so we pass a small writable buffer. p5 is unused by the full-map path.
-//   p1=client, p2=mode (0 full map / 1 rotating), p3=scratch, p4=rectDef,
-//   p5=unused, p6=item (>=4 floats; +0xc receives fade)
-typedef void (*CompassDrawMap_fn_t)(int, int, void *, void *, void *, void *);
-static CompassDrawMap_fn_t const CompassDrawMap_fn =
-    reinterpret_cast<CompassDrawMap_fn_t>(0x82325E78u);
+// Native compass MAP BACKGROUND -- self-drawn so WE own the material. We do NOT
+// call 82325E78: that fn paints whatever 2D material the menu bound via stack
+// pass-through, which we can't reproduce out of context (that unbound material
+// was the v18 hang, not unsafety). Instead we replicate its body and pass the
+// material explicitly, so map + blips share the exact same projection + matrix
+// and line up by construction. Verified call chain in Ghidra (82310BE8 shows
+// the same recipe: register material, then draw through the compass matrix).
+//
+// R_RegisterMaterial(type, name) -> handle. type 4 = 2D/UI material.
+typedef int (*R_RegisterMaterial_fn_t)(int, const char *);
+static R_RegisterMaterial_fn_t const R_RegisterMaterial_fn =
+    reinterpret_cast<R_RegisterMaterial_fn_t>(0x822A0298u);
+// Compass projection (82323E28): fills oA,oB,oC,oD = x,y,w,h (rect * compass
+// scale in full-map mode). Identical call the blip drawer makes internally.
+//   (mode, cgBase, scratch, rectDef, &oA, &oB, &oC, &oD)
+typedef void (*CompassProject_fn_t)(int, int, void *, void *, float *, float *, float *, float *);
+static CompassProject_fn_t const CompassProject_fn =
+    reinterpret_cast<CompassProject_fn_t>(0x82323E28u);
+// Per-client compass matrix transform (822b36e8) -- the alignment glue shared
+// with the blips. (matrix, &a, &b, &c, &d, horzAlign, vertAlign)
+typedef void (*CompassMatrixXform_fn_t)(float *, float *, float *, float *, float *, int, int);
+static CompassMatrixXform_fn_t const CompassMatrixXform_fn =
+    reinterpret_cast<CompassMatrixXform_fn_t>(0x822B36E8u);
+// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material). color +
+// material are the 9th/10th args; declaring them explicitly puts the material
+// in the slot the fn reads -- which the menu pass-through chain denied v18.
+typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
+static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
+    reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
 
 struct compassRectDef_s
 {
@@ -330,6 +348,60 @@ static bool CompassMatrixReady()
     return true;
 }
 
+// Register compass_map_<mapname> and cache the handle (re-register only when the
+// map name changes). Returns 0 if unavailable -> caller skips the map draw.
+static int RegisterCompassMapMaterial()
+{
+    const char *mn = Dvar_GetString("mapname");
+    if (mn == nullptr || mn[0] == '\0')
+        return 0;
+
+    char name[160];
+    const char prefix[] = "compass_map_";
+    int i = 0;
+    for (; prefix[i] != '\0'; ++i)
+        name[i] = prefix[i];
+    int j = 0;
+    for (; mn[j] != '\0' && i < 159; ++j, ++i)
+        name[i] = mn[j];
+    name[i] = '\0';
+
+    static char lastName[160] = {0};
+    static int cachedHandle = 0;
+    bool same = (cachedHandle != 0);
+    for (int k = 0; same && k <= i; ++k)
+        if (lastName[k] != name[k])
+            same = false;
+    if (same)
+        return cachedHandle;
+
+    cachedHandle = R_RegisterMaterial_fn(4, name);
+    for (int k = 0; k <= i; ++k)
+        lastName[k] = name[k];
+    return cachedHandle;
+}
+
+// Draw the real map texture through the SAME projection + matrix the blips use.
+// rect is the compassRectDef_s; horz/vertAlign come from it.
+static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+{
+    int handle = RegisterCompassMapMaterial();
+    if (handle == 0)
+        return;
+
+    // client 0 (the host spectator). cgBase only used by the rotating branch;
+    // full-map ignores it. matrix is the per-client compass transform.
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+    float *matrix = reinterpret_cast<float *>(0x8246F308u);
+
+    float a = 0.0f, b = 0.0f, c = 0.0f, d = 0.0f;
+    CompassProject_fn(mode, cgBase, scratch, rect, &a, &b, &c, &d);
+    CompassMatrixXform_fn(matrix, &a, &b, &c, &d, horzAlign, vertAlign);
+
+    static const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    R_DrawStretchPic_fn(a, b, c, d, 0.0f, 0.0f, 1.0f, 1.0f, white, handle);
+}
+
 static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
@@ -353,14 +425,10 @@ static void DrawNativeSpecCompass()
 
     int mode = compass_native_mode->current.integer;
 
-    // Native map background first so the blips draw on top of it. Same rect +
-    // projection => map and blips align. Toggle so we can A/B it against the
-    // GSC map. bgItem[3] (+0xc) receives the fade alpha written by the fn.
+    // Real native map background first, so blips draw on top. Self-drawn with
+    // our own material handle through the same projection -> aligned with blips.
     if (compass_native_bg != nullptr && compass_native_bg->current.enabled)
-    {
-        float bgItem[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        CompassDrawMap_fn(0, mode, &scratch, &rect, bgItem, bgItem);
-    }
+        DrawNativeSpecMap(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
     // p5 alpha is written by the draw fn, so refresh every frame.
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -405,8 +473,10 @@ cg::cg()
     // map box can be dialed in on Xenia with no rebuild.
     compass_native = Dvar_RegisterBool("compass_native", true, 0,
         "Follow-spec: draw native engine compass blips (both teams) via fn 82322868");
+    // Native map background (v20): self-drawn compass_map_<mapname> through the
+    // same projection+matrix as the blips. Safe -- we own the material handle.
     compass_native_bg = Dvar_RegisterBool("compass_native_bg", true, 0,
-        "Follow-spec: also draw the native compass map background (fn 82325E78) so blips align");
+        "Follow-spec: draw the native compass map texture under the blips");
     compass_native_mode = Dvar_RegisterInt("compass_native_mode", 0, 0, 1, 0,
         "Native spec compass projection: 0=full map, 1=rotating");
     compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
@@ -420,7 +490,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console.
-    Dvar_RegisterInt("compass_hook_v", 18, 0, 100, 0, "Codxe compass hook build marker (v18 -- native spec compass blips + map background)");
+    Dvar_RegisterInt("compass_hook_v", 20, 0, 100, 0, "Codxe compass hook build marker (v20 -- native blips + self-drawn native map background, aligned)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
