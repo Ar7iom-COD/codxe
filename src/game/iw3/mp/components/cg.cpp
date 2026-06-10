@@ -47,6 +47,10 @@ dvar_s *compass_native_align = nullptr;
 dvar_s *caster_dots = nullptr;
 dvar_s *caster_dot_size = nullptr;
 
+// Forward declaration: v22 draws the spec compass/dots from the 2D UI hook
+// (UI_DrawBuildNumber_Hook), which is defined above the draw fn itself.
+static void DrawNativeSpecCompass();
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -172,6 +176,13 @@ Detour UI_DrawBuildNumber_Detour;
 void UI_DrawBuildNumber_Hook(const int localClientNum)
 {
     DrawBranding();
+
+    // v22: draw the spec compass/dots from the 2D UI pass (NOT OnCG_DrawActive,
+    // which is the 3D scene pass) so the stretchpics flush every frame -- incl.
+    // plain follow-spectate with no scoreboard open. Self-gated to valid
+    // follow-spectate inside, so this is inert in menus / live play.
+    DrawNativeSpecCompass();
+
     // Omit the original build number drawing
     // UI_DrawBuildNumber_Detour.GetOriginal<decltype(UI_DrawBuildNumber)>()
 }
@@ -495,6 +506,15 @@ static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
         return;
+
+    // v22 true follow-spectate gate. 0x849f4288 (per-client +0x14a0) is the HUD
+    // menu-group/state: ==6 ONLY in valid follow-spectate (per 8231E070); live
+    // play is 0 (in-game HUD) or 7 (scoreboard), never 6. This stops the dots
+    // leaking over gameplay when stats are opened mid-match. Side effect: the
+    // dots correctly HIDE when the spectator opens the scoreboard (6 -> 7),
+    // which is fine for casting -- the scoreboard covers the map area anyway.
+    if (*reinterpret_cast<volatile int *>(0x849F4288u) != 6)
+        return;
     // Only mid-follow (locked onto a player). Skips CHOOSE TEAM / spec UI.
     if (!ValidFollowedPlayer())
         return;
@@ -591,7 +611,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console.
-    Dvar_RegisterInt("compass_hook_v", 21, 0, 100, 0, "Codxe compass hook build marker (v21 -- caster radar: all-player red dots + yellow followed marker over native map)");
+    Dvar_RegisterInt("compass_hook_v", 22, 0, 100, 0, "Codxe compass hook build marker (v22 -- spec compass drawn from 2D UI pass (shows without scoreboard) + follow-spec gate (no live-play leak))");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -615,7 +635,11 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
-            DrawNativeSpecCompass();
+
+            // v22: DrawNativeSpecCompass() moved to UI_DrawBuildNumber_Hook (the
+            // 2D UI pass) so it flushes every frame incl. plain spectate. Drawing
+            // it from this 3D pass made it paint only when a 2D HUD pass was
+            // forced (scoreboard open) -- the "needs stats open" bug.
 
             if (cg_draw_player_info->current.enabled)
             {
