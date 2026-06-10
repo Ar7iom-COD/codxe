@@ -42,6 +42,11 @@ dvar_s *compass_native_y = nullptr;
 dvar_s *compass_native_size = nullptr;
 dvar_s *compass_native_align = nullptr;
 
+// v21 caster radar dvars: replace native team-arrow blips with uniform red dots
+// for ALL players + a yellow followed-player marker.
+dvar_s *caster_dots = nullptr;
+dvar_s *caster_dot_size = nullptr;
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -402,6 +407,90 @@ static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign
     R_DrawStretchPic_fn(a, b, c, d, 0.0f, 0.0f, 1.0f, 1.0f, white, handle);
 }
 
+// v21 caster radar. The native compass actor array is team-filtered to the
+// followed player's view (teammates + UAV enemies), so it can't show everyone.
+// Instead we take ALL players' world x/y from GSC via the "caster_blips" dvar
+// (an "x y x y ..." string the spectator publishes every frame) and draw each
+// as a uniform red dot, plus the followed player (cg+0x478e0/4) as a larger
+// yellow marker. Each dot is projected with the mode-1 (static full-map) math
+// reversed from FUN_82323740's else-branch:
+//   u = (north.x*dx - north.y*dy) / worldW
+//   v = -(north.y*dx + north.x*dy) / worldH        (dx,dy = pos - worldOrigin)
+//   screen = projRect(ox,oy,ow,oh) -> (ox + u*ow, oy + v*oh)
+// then pushed through the SAME CompassProject + CompassMatrixXform as the map,
+// so dots land exactly on the map by construction (matches the native mode-1
+// blip placement that was confirmed aligned). cg reads at client 0.
+static int s_whiteMat = 0;
+
+static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+{
+    if (s_whiteMat == 0)
+        s_whiteMat = R_RegisterMaterial_fn(4, "white");
+    if (s_whiteMat == 0)
+        return;
+
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+    float *matrix = reinterpret_cast<float *>(0x8246F308u);
+
+    // Same projected rect the map uses (pre-matrix): ox,oy,ow,oh.
+    float ox = 0.0f, oy = 0.0f, ow = 0.0f, oh = 0.0f;
+    CompassProject_fn(mode, cgBase, scratch, rect, &ox, &oy, &ow, &oh);
+
+    // Compass world basis: north vector, world origin, world size.
+    float nX = *reinterpret_cast<volatile float *>(cgBase + 0x4e478);
+    float nY = *reinterpret_cast<volatile float *>(cgBase + 0x4e474);
+    float wOx = *reinterpret_cast<volatile float *>(cgBase + 0x4e480);
+    float wOy = *reinterpret_cast<volatile float *>(cgBase + 0x4e484);
+    float wW = *reinterpret_cast<volatile float *>(cgBase + 0x4e488);
+    float wH = *reinterpret_cast<volatile float *>(cgBase + 0x4e48c);
+    if (wW == 0.0f || wH == 0.0f)
+        return;
+
+    float ds = static_cast<float>(caster_dot_size->current.integer);
+    float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+
+    const char *b = Dvar_GetString("caster_blips");
+    while (b != nullptr && *b != '\0')
+    {
+        float px = static_cast<float>(atof(b));
+        while (*b != '\0' && *b != ' ')
+            ++b;
+        while (*b == ' ')
+            ++b;
+        if (*b == '\0')
+            break;
+        float py = static_cast<float>(atof(b));
+        while (*b != '\0' && *b != ' ')
+            ++b;
+        while (*b == ' ')
+            ++b;
+
+        float dx = px - wOx, dy = py - wOy;
+        float u = (nX * dx - nY * dy) / wW;
+        float v = -(nY * dx + nX * dy) / wH;
+        if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
+            continue;
+
+        float qx = ox + u * ow - ds * 0.5f, qy = oy + v * oh - ds * 0.5f, qw = ds, qh = ds;
+        CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
+        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, red, s_whiteMat);
+    }
+
+    // Followed player (cg+0x478e0/4) -> yellow, larger, drawn on top.
+    float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
+    float fdy = *reinterpret_cast<volatile float *>(cgBase + 0x478e4) - wOy;
+    float fu = (nX * fdx - nY * fdy) / wW;
+    float fv = -(nY * fdx + nX * fdy) / wH;
+    if (fu >= 0.0f && fu <= 1.0f && fv >= 0.0f && fv <= 1.0f)
+    {
+        float fs = ds * 1.6f;
+        float fqx = ox + fu * ow - fs * 0.5f, fqy = oy + fv * oh - fs * 0.5f, fqw = fs, fqh = fs;
+        float yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
+        CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
+        R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+    }
+}
+
 static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
@@ -425,15 +514,20 @@ static void DrawNativeSpecCompass()
 
     int mode = compass_native_mode->current.integer;
 
-    // Real native map background first, so blips draw on top. Self-drawn with
-    // our own material handle through the same projection -> aligned with blips.
+    // Real native map background first, so blips/dots draw on top. Self-drawn
+    // with our own material handle through the same projection -> aligned.
     if (compass_native_bg != nullptr && compass_native_bg->current.enabled)
         DrawNativeSpecMap(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
     // p5 alpha is written by the draw fn, so refresh every frame.
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    CompassDrawActors_fn(0, mode, &scratch, &rect, color);
+    // Caster radar: all players as red dots + yellow followed marker. Falls
+    // back to the native team blips when caster_dots is off.
+    if (caster_dots != nullptr && caster_dots->current.enabled)
+        DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
+    else
+        CompassDrawActors_fn(0, mode, &scratch, &rect, color);
 }
 
 cg::cg()
@@ -488,9 +582,16 @@ cg::cg()
     compass_native_align = Dvar_RegisterInt("compass_native_align", 0, 0, 7, 0,
         "Native spec compass rect horz/vert align enum (0-7)");
 
+    // v21 caster radar: all players as red dots + yellow followed marker.
+    // Player x/y are published by GSC into the "caster_blips" dvar each frame.
+    caster_dots = Dvar_RegisterBool("caster_dots", true, 0,
+        "Follow-spec: draw all players as red dots (caster radar) instead of native team blips");
+    caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
+        "Caster radar dot size (projected units)");
+
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console.
-    Dvar_RegisterInt("compass_hook_v", 20, 0, 100, 0, "Codxe compass hook build marker (v20 -- native blips + self-drawn native map background, aligned)");
+    Dvar_RegisterInt("compass_hook_v", 21, 0, 100, 0, "Codxe compass hook build marker (v21 -- caster radar: all-player red dots + yellow followed marker over native map)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
