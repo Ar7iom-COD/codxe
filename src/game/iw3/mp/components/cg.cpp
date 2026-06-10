@@ -35,6 +35,7 @@ dvar_s *compass_group0 = nullptr;
 // directly each frame, no .ff edit and no menu. Placement is dvar-tunable so
 // it can be dialed in on Xenia without rebuilding.
 dvar_s *compass_native = nullptr;
+dvar_s *compass_native_bg = nullptr;
 dvar_s *compass_native_mode = nullptr;
 dvar_s *compass_native_x = nullptr;
 dvar_s *compass_native_y = nullptr;
@@ -290,6 +291,18 @@ typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
 static CompassDrawActors_fn_t const CompassDrawActors_fn =
     reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
 
+// Native compass MAP BACKGROUND drawer (Compass_mp image). Drawn with the SAME
+// rect + projection as the actor blips above, so the map and the blips share
+// one coordinate system and line up -- this is what the menu full-map does, and
+// the reason our GSC scMap image can't align with the native arrows (different
+// projection). p6 is the ownerdraw item; its +0xc float receives the fade
+// alpha, so we pass a small writable buffer. p5 is unused by the full-map path.
+//   p1=client, p2=mode (0 full map / 1 rotating), p3=scratch, p4=rectDef,
+//   p5=unused, p6=item (>=4 floats; +0xc receives fade)
+typedef void (*CompassDrawMap_fn_t)(int, int, void *, void *, void *, void *);
+static CompassDrawMap_fn_t const CompassDrawMap_fn =
+    reinterpret_cast<CompassDrawMap_fn_t>(0x82325E78u);
+
 struct compassRectDef_s
 {
     float x;
@@ -335,13 +348,24 @@ static void DrawNativeSpecCompass()
     rect.horzAlign = compass_native_align->current.integer;
     rect.vertAlign = compass_native_align->current.integer;
 
-    // p5 alpha is written by the draw fn, so refresh every frame.
-    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-
     // p3 scratch (unused in full-map mode; zeroed for the rotating path).
     compassRectDef_s scratch = {0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
 
-    CompassDrawActors_fn(0, compass_native_mode->current.integer, &scratch, &rect, color);
+    int mode = compass_native_mode->current.integer;
+
+    // Native map background first so the blips draw on top of it. Same rect +
+    // projection => map and blips align. Toggle so we can A/B it against the
+    // GSC map. bgItem[3] (+0xc) receives the fade alpha written by the fn.
+    if (compass_native_bg != nullptr && compass_native_bg->current.enabled)
+    {
+        float bgItem[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        CompassDrawMap_fn(0, mode, &scratch, &rect, bgItem, bgItem);
+    }
+
+    // p5 alpha is written by the draw fn, so refresh every frame.
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    CompassDrawActors_fn(0, mode, &scratch, &rect, color);
 }
 
 cg::cg()
@@ -381,6 +405,8 @@ cg::cg()
     // map box can be dialed in on Xenia with no rebuild.
     compass_native = Dvar_RegisterBool("compass_native", true, 0,
         "Follow-spec: draw native engine compass blips (both teams) via fn 82322868");
+    compass_native_bg = Dvar_RegisterBool("compass_native_bg", true, 0,
+        "Follow-spec: also draw the native compass map background (fn 82325E78) so blips align");
     compass_native_mode = Dvar_RegisterInt("compass_native_mode", 0, 0, 1, 0,
         "Native spec compass projection: 0=full map, 1=rotating");
     compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
@@ -394,7 +420,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console.
-    Dvar_RegisterInt("compass_hook_v", 17, 0, 100, 0, "Codxe compass hook build marker (v17 -- native spec compass blips via fn 82322868)");
+    Dvar_RegisterInt("compass_hook_v", 18, 0, 100, 0, "Codxe compass hook build marker (v18 -- native spec compass blips + map background)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
