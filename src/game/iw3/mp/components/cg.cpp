@@ -18,6 +18,18 @@ dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
 
+// v15 follow-spec compass test. 0x849f4288 (per-client, stride 0x14a0) is the
+// ACTIVE HUD MENU GROUP id, written by Function_821EF880 (puVar2[0x526]=group).
+// Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
+// 5 = quickmessage. Follow-spectate sets group 6 (via 821EF648), and group 6
+// does not contain the compass item, so it is never iterated/drawn.
+// Test: while the local client sits in group 6, rewrite it to 0 so the HUD
+// draws the in-game group. ONLY rewrites 6 -> 0, so scoreboard (7), quick-
+// message (5) and every other group are untouched. Data write, dvar-gated,
+// fully reversible. Known risks: may pull in more of the in-game HUD than
+// just the compass, and group-6 consumers (follow cam / input) may misbehave.
+dvar_s *compass_group0 = nullptr;
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -233,6 +245,15 @@ typedef int (*CG_Compass_IsVisible_fn_t)(int);
 static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
     reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
 
+static void ForceFollowHudGroup()
+{
+    if (compass_group0 == nullptr || !compass_group0->current.enabled)
+        return;
+    volatile int *group = reinterpret_cast<volatile int *>(0x849F4288u);
+    if (*group == 6)
+        *group = 0;
+}
+
 static void ReadCompassDiag()
 {
     // Compass draw gate. Function_82348BD0 (default HUD-map draw, used when the
@@ -273,7 +294,7 @@ static void ReadCompassDiag()
     int field = *reinterpret_cast<volatile int *>(0x849F4288u);
 
     char buff[256];
-    sprintf_s(buff, "PDIAG2 g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
+    sprintf_s(buff, "PDIAG4 g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
               g0, gAny, map, mode, vis, field);
     static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
     float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
@@ -309,9 +330,11 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
+    compass_group0 = Dvar_RegisterBool("compass_group0", true, 0, "Follow-spec: rewrite HUD group 6 to 0 so the in-game HUD (compass) draws");
+
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console (11 = this build).
-    Dvar_RegisterInt("compass_hook_v", 13, 0, 100, 0, "Codxe compass hook build marker (v13 -- compass draw-gate probe)");
+    Dvar_RegisterInt("compass_hook_v", 15, 0, 100, 0, "Codxe compass hook build marker (v15 -- HUD group 6->0 force, compass_group0 dvar)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -336,6 +359,7 @@ cg::cg()
         {
             ApplyMuzzleFlashState();
             ReadCompassDiag();
+            ForceFollowHudGroup();
 
             if (cg_draw_player_info->current.enabled)
             {
