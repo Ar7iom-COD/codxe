@@ -16,6 +16,20 @@ dvar_s *cg_scoreboardLabel_Deaths = nullptr;
 
 dvar_s *cg_draw_player_info = nullptr;
 
+dvar_s *cg_no_muzzleflash = nullptr;
+
+// v15 follow-spec compass test. 0x849f4288 (per-client, stride 0x14a0) is the
+// ACTIVE HUD MENU GROUP id, written by Function_821EF880 (puVar2[0x526]=group).
+// Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
+// 5 = quickmessage. Follow-spectate sets group 6 (via 821EF648), and group 6
+// does not contain the compass item, so it is never iterated/drawn.
+// Test: while the local client sits in group 6, rewrite it to 0 so the HUD
+// draws the in-game group. ONLY rewrites 6 -> 0, so scoreboard (7), quick-
+// message (5) and every other group are untouched. Data write, dvar-gated,
+// fully reversible. Known risks: may pull in more of the in-game HUD than
+// just the compass, and group-6 consumers (follow cam / input) may misbehave.
+dvar_s *compass_group0 = nullptr;
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -43,6 +57,87 @@ void R_DrawAllDynEnt_Hook(const GfxViewInfo *viewInfo)
 {
     if (Dvar_GetBool("r_drawDynEnts"))
         R_DrawAllDynEnt_Detour.GetOriginal<decltype(R_DrawAllDynEnt)>()(viewInfo);
+}
+
+// --- Muzzle flash suppression via weapon-def field nulling ------------------
+//
+// CG_AddViewModelWeapon (0x82317880) plays the first-person muzzle flash by
+// reading weaponDef->viewFlashEffect (weaponDef + 0x164) every frame and only
+// playing it when the handle is non-zero:
+//
+//     iVar1 = (&bg_weaponDefs)[ent->weaponIndex];   // 0x823B9F60[idx]
+//     if (*(uint *)(iVar1 + 0x164) != 0)
+//         CG_PlayEffect(..., *(uint *)(iVar1 + 0x164));
+//
+// So zeroing that field for every loaded weapon suppresses the flash with no
+// code patching. This is a DATA write (the field is read fresh each frame), so
+// Xenia's translated-code cache is irrelevant - unlike a runtime .text patch,
+// it takes effect immediately. The generic effect-play function (0x8230A110)
+// also no-ops on a null handle, confirming this is safe.
+//
+// Detouring CG_AddViewModelWeapon directly is NOT an option: its prologue is
+// `mfspr r12,LR; bl __savegprlr; ...`, and codxe's Detour mis-relocates that
+// `bl` into the trampoline, which freezes the game.
+
+#define BG_WEAPONDEFS_ARRAY 0x823B9F60u // array of weaponDef* indexed by weapon index
+#define BG_NUMWEAPONS_ADDR 0x85027498u  // highest valid weapon index (weapon count)
+#define WEAPONDEF_VIEWFLASH 0x164u      // viewFlashEffect handle offset within a weaponDef
+
+static const unsigned int MAX_TRACKED_WEAPONS = 2048;
+static unsigned int s_savedViewFlash[MAX_TRACKED_WEAPONS];
+static bool s_savedViewFlashValid[MAX_TRACKED_WEAPONS];
+static bool s_muzzleApplied = false;
+
+static void ApplyMuzzleFlashState()
+{
+    const bool want = (cg_no_muzzleflash != nullptr) && cg_no_muzzleflash->current.enabled;
+
+    unsigned int count = *reinterpret_cast<volatile unsigned int *>(BG_NUMWEAPONS_ADDR);
+    if (count > MAX_TRACKED_WEAPONS - 1)
+        count = MAX_TRACKED_WEAPONS - 1;
+
+    unsigned int *const defs = reinterpret_cast<unsigned int *>(BG_WEAPONDEFS_ARRAY);
+
+    if (want)
+    {
+        // Index 0 is the "none" weapon; valid weapons are 1..count.
+        for (unsigned int i = 1; i <= count; ++i)
+        {
+            const unsigned int wd = defs[i];
+            if (wd == 0)
+                continue;
+
+            volatile unsigned int *flash = reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH);
+            if (*flash != 0)
+            {
+                // Save the original the first time we see a non-zero handle for
+                // this slot (also re-catches freshly precached defs after a map
+                // change); steady state is read-only.
+                if (!s_savedViewFlashValid[i])
+                {
+                    s_savedViewFlash[i] = *flash;
+                    s_savedViewFlashValid[i] = true;
+                }
+                *flash = 0;
+            }
+        }
+        s_muzzleApplied = true;
+    }
+    else if (s_muzzleApplied)
+    {
+        for (unsigned int i = 1; i <= count; ++i)
+        {
+            if (!s_savedViewFlashValid[i])
+                continue;
+
+            const unsigned int wd = defs[i];
+            if (wd != 0)
+                *reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH) = s_savedViewFlash[i];
+
+            s_savedViewFlashValid[i] = false;
+        }
+        s_muzzleApplied = false;
+    }
 }
 
 void DrawBranding()
@@ -121,6 +216,7 @@ void Menus_OpenByName_Hook(UiContext *dc, const char *menuName)
     }
 }
 
+
 static const float colorWhiteRGBA[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
 void CG_DrawPlayerInfo()
@@ -143,6 +239,67 @@ void CG_DrawPlayerInfo()
     const float y = 50.f;
 
     R_AddCmdDrawText(buff, 256, consoleFont, x, y, 1.0, 1.0, 0.0, colorWhiteRGBA, 0);
+}
+
+typedef int (*CG_Compass_IsVisible_fn_t)(int);
+static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
+    reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
+
+static void ForceFollowHudGroup()
+{
+    if (compass_group0 == nullptr || !compass_group0->current.enabled)
+        return;
+    volatile int *group = reinterpret_cast<volatile int *>(0x849F4288u);
+    if (*group == 6)
+        *group = 0;
+}
+
+static void ReadCompassDiag()
+{
+    // Compass draw gate. Function_82348BD0 (default HUD-map draw, used when the
+    // hud-map-mode dvar at 0x823f56e8 reads 0) skips the ENTIRE compass when the
+    // per-client byte at 0x823a7408 + client*0xe34 is 0.
+    //   g0   = that byte for local client 0 (0 in follow + 1 alive => this is the gate)
+    //   gAny = first client index 0..17 whose byte is set, else -1
+    //   map  = hud-map-mode dvar value (0 => 82348BD0 draws; nonzero => 82320308
+    //          draws instead and the g0 byte is irrelevant)
+    const uint32_t COMPASS_BYTE = 0x823a7408u;
+    const uint32_t COMPASS_STRIDE = 0xe34u;
+
+    int g0 = *reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE);
+    int gAny = -1;
+    for (int c = 0; c < 18; ++c)
+    {
+        if (*reinterpret_cast<volatile uint8_t *>(COMPASS_BYTE + (uint32_t)c * COMPASS_STRIDE) != 0)
+        {
+            gAny = c;
+            break;
+        }
+    }
+
+    int map = -1;
+    uint32_t mapDvar = *reinterpret_cast<volatile uint32_t *>(0x823F56E8u);
+    if (mapDvar != 0)
+        map = *reinterpret_cast<volatile int *>(mapDvar + 0xCu);
+
+    uint32_t cg_base = *reinterpret_cast<volatile uint32_t *>(0x823F28A0u);
+    int mode = -1;
+    if (cg_base != 0)
+    {
+        uint32_t uiptr = *reinterpret_cast<volatile uint32_t *>(cg_base + 0x24u);
+        if (uiptr != 0)
+            mode = *reinterpret_cast<volatile int *>(uiptr + 0x10u);
+    }
+    int vis = CG_Compass_IsVisible_fn(0);
+    int field = *reinterpret_cast<volatile int *>(0x849F4288u);
+
+    char buff[256];
+    sprintf_s(buff, "PDIAG4 g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
+              g0, gAny, map, mode, vis, field);
+    static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
+    float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
+    const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
+    R_AddCmdDrawText(buff, 256, diagFont, x, 150.f, 1.0f, 1.0f, 0.0f, col, 0);
 }
 
 cg::cg()
@@ -169,6 +326,16 @@ cg::cg()
 
     Dvar_RegisterBool("r_drawDynEnts", true, 0, "Draw dynamic entities");
 
+    // Muzzle flash toggle. Applied by nulling weaponDef->viewFlashEffect as data
+    // from the OnCG_DrawActive event (no detour, no runtime code patch).
+    cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
+
+    compass_group0 = Dvar_RegisterBool("compass_group0", true, 0, "Follow-spec: rewrite HUD group 6 to 0 so the in-game HUD (compass) draws");
+
+    // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
+    // Read back via `\compass_hook_v` in console (11 = this build).
+    Dvar_RegisterInt("compass_hook_v", 15, 0, 100, 0, "Codxe compass hook build marker (v15 -- HUD group 6->0 force, compass_group0 dvar)");
+
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
 
@@ -190,6 +357,10 @@ cg::cg()
     Events::OnCG_DrawActive(
         []()
         {
+            ApplyMuzzleFlashState();
+            ReadCompassDiag();
+            ForceFollowHudGroup();
+
             if (cg_draw_player_info->current.enabled)
             {
                 CG_DrawPlayerInfo();
@@ -204,6 +375,25 @@ cg::~cg()
     UI_SafeTranslateString_Detour.Remove();
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
+
+    // Restore any view-flash handles we zeroed so the weapon defs are clean.
+    if (s_muzzleApplied)
+    {
+        unsigned int count = *reinterpret_cast<volatile unsigned int *>(BG_NUMWEAPONS_ADDR);
+        if (count > MAX_TRACKED_WEAPONS - 1)
+            count = MAX_TRACKED_WEAPONS - 1;
+
+        unsigned int *const defs = reinterpret_cast<unsigned int *>(BG_WEAPONDEFS_ARRAY);
+        for (unsigned int i = 1; i <= count; ++i)
+        {
+            if (!s_savedViewFlashValid[i])
+                continue;
+
+            const unsigned int wd = defs[i];
+            if (wd != 0)
+                *reinterpret_cast<volatile unsigned int *>(wd + WEAPONDEF_VIEWFLASH) = s_savedViewFlash[i];
+        }
+    }
 }
 } // namespace mp
 } // namespace iw3
