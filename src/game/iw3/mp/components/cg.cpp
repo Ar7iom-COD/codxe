@@ -439,7 +439,8 @@ static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign
 // an A/B fallback alongside the native blips.
 static int s_whiteMat = 0;
 
-static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
+                               int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
     if (s_whiteMat == 0)
         s_whiteMat = R_RegisterMaterial_fn(4, "white");
@@ -462,9 +463,8 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
         return;
 
     float ds = static_cast<float>(caster_dot_size->current.integer);
-    float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
 
-    const char *b = Dvar_GetString("caster_blips");
+    const char *b = Dvar_GetString(blipDvar);
     while (b != nullptr && *b != '\0')
     {
         float px = static_cast<float>(atof(b));
@@ -488,7 +488,7 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
 
         float qx = ox + u * ow - ds * 0.5f, qy = oy + v * oh - ds * 0.5f, qw = ds, qh = ds;
         CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
-        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, red, s_whiteMat);
+        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
     }
 
     float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
@@ -502,6 +502,58 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
         float yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
         CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
         R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+    }
+}
+
+static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+{
+    static const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    DrawCasterDotsFrom("caster_blips", red, mode, scratch, rect, horzAlign, vertAlign);
+}
+
+// v29 enemy radar layer. The engine fills the 24-slot compass actor array from
+// the FOLLOWED player's compass view: teammates always, enemies only under
+// UAV (see the 82322868 annotation). Forcing g_compassShowEnemies is a
+// server-wide radar leak (retired, v52). So the enemy team is drawn by us:
+// GSC publishes both teams' world positions (caster_blips_al / caster_blips_ax,
+// refreshed each radar tick), and we pick the list OPPOSITE to the followed
+// player's team -- read from the same per-client clientinfo block the native
+// drawer gates on: clientIdx = *(cg+0x24)+0xec, team = clientinfo+0xe8f84
+// (stride 0x4e4 from cg base; 1=axis, 2=allies, 0/3 invalid).
+static void DrawEnemyDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+{
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+    int snap = *reinterpret_cast<volatile int *>(cgBase + 0x24);
+    if (snap == 0)
+        return;
+    int clientIdx = *reinterpret_cast<volatile int *>(snap + 0xec);
+    if (clientIdx < 0 || clientIdx > 63)
+        return;
+    int info = clientIdx * 0x4e4 + cgBase;
+    int team = 0;
+    if (*reinterpret_cast<volatile int *>(info + 0xe8f58) != 0)
+        team = *reinterpret_cast<volatile int *>(info + 0xe8f84);
+
+    static const float red[4] = {1.0f, 0.15f, 0.15f, 1.0f};
+    static const float green[4] = {0.25f, 0.9f, 0.3f, 1.0f};
+
+    if (team == 1)      // following axis -> enemies are allies
+    {
+        DrawCasterDotsFrom("caster_blips_al", red, mode, scratch, rect, horzAlign, vertAlign);
+    }
+    else if (team == 2) // following allies -> enemies are axis
+    {
+        DrawCasterDotsFrom("caster_blips_ax", red, mode, scratch, rect, horzAlign, vertAlign);
+    }
+    else
+    {
+        // v30: freecam (viewed client is the spectating host, team 0/3). The
+        // native drawer's own gate blanks the arrows here BY DESIGN -- there
+        // is no followed compass view to fill the actor array from. So in
+        // freecam we draw BOTH teams from the GSC blip feed: allies green,
+        // axis red. Following someone returns to native arrows + enemy reds.
+        DrawCasterDotsFrom("caster_blips_al", green, mode, scratch, rect, horzAlign, vertAlign);
+        DrawCasterDotsFrom("caster_blips_ax", red, mode, scratch, rect, horzAlign, vertAlign);
     }
 }
 
@@ -561,6 +613,9 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
         DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
     else
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
+
+    // v29: enemy team as red dots, composited over the native arrows.
+    DrawEnemyDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
     ++s_diagDrawCalls;
 }
@@ -681,8 +736,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 28, 0, 100, 0,
-        "Codxe compass hook build marker (v28 -- map+arrows share the hooked blit rect, align 5 identity)");
+    Dvar_RegisterInt("compass_hook_v", 30, 0, 100, 0,
+        "Codxe compass hook build marker (v30 -- enemy dots + freecam both-team dots)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
