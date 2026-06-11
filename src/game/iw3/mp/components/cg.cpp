@@ -23,17 +23,13 @@ dvar_s *cg_no_muzzleflash = nullptr;
 // Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
 // 5 = quickmessage. Follow-spectate sets group 6 (via 821EF648), and group 6
 // does not contain the compass item, so it is never iterated/drawn.
-// Test: while the local client sits in group 6, rewrite it to 0 so the HUD
-// draws the in-game group. ONLY rewrites 6 -> 0, so scoreboard (7), quick-
-// message (5) and every other group are untouched. Data write, dvar-gated,
-// fully reversible. Known risks: may pull in more of the in-game HUD than
-// just the compass, and group-6 consumers (follow cam / input) may misbehave.
 dvar_s *compass_group0 = nullptr;
 
 // v17 native follow-spec compass: draw the engine's own compass actor blips
 // (both teams: friendly arrows + enemy dots) by calling Function_82322868
-// directly each frame, no .ff edit and no menu. Placement is dvar-tunable so
-// it can be dialed in on Xenia without rebuilding.
+// directly each frame, no .ff edit and no menu. RETIRED for the caster radar
+// (render-pass problem -- see PublishCasterBounds below) but kept as an A/B
+// fallback, default OFF.
 dvar_s *compass_native = nullptr;
 dvar_s *compass_native_bg = nullptr;
 dvar_s *compass_native_mode = nullptr;
@@ -42,13 +38,20 @@ dvar_s *compass_native_y = nullptr;
 dvar_s *compass_native_size = nullptr;
 dvar_s *compass_native_align = nullptr;
 
-// v21 caster radar dvars: replace native team-arrow blips with uniform red dots
-// for ALL players + a yellow followed-player marker.
+// v21 caster radar dvars (DLL-draw path -- now inert, kept for the fallback).
 dvar_s *caster_dots = nullptr;
 dvar_s *caster_dot_size = nullptr;
 
-// Forward declaration: v22 draws the spec compass/dots from the 2D UI hook
-// (UI_DrawBuildNumber_Hook), which is defined above the draw fn itself.
+// v23 caster radar: GSC draws, DLL publishes. events.h exposes only
+// OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
+// chain (8230EB50/821F1AE8/...) all open with `mfspr r12,LR; bl ...`, the
+// prologue codxe's Detour mis-relocates (freeze). So the DLL cannot reach the
+// 2D pass to flush a draw in plain spectate. Instead it publishes the compass
+// projection basis (world origin/size + north vector) -- all STATIC per map --
+// and GSC hudelems (which DO render in plain spectate) draw the map + dots.
+dvar_s *caster_publish = nullptr;
+
+// Forward declaration: drawn from the (now inert) UI_DrawBuildNumber_Hook.
 static void DrawNativeSpecCompass();
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
@@ -161,6 +164,64 @@ static void ApplyMuzzleFlashState()
     }
 }
 
+// v23 caster radar publisher. The compass projection basis -- world origin
+// (cg+0x4e480/4), world size (cg+0x4e488/c) and north vector (cg+0x4e478/4) --
+// is STATIC per map, so we publish it once per map via Cbuf `set` (the string
+// path getdvarfloat reads reliably). GSC then projects every player with this
+// basis and draws the map + dots as hudelems, which render in plain spectate
+// (unlike a DLL draw from the 3D OnCG_DrawActive pass). Pure data reads/writes,
+// no detour, no render-pass dependency.
+static void PublishCasterBounds()
+{
+    if (caster_publish == nullptr || !caster_publish->current.enabled)
+        return;
+
+    const char *mn = Dvar_GetString("mapname");
+    if (mn == nullptr || mn[0] == '\0')
+        return;
+
+    static char lastMap[64] = {0};
+    static bool published = false;
+
+    bool sameMap = true;
+    for (int k = 0; k < 63; ++k)
+    {
+        if (lastMap[k] != mn[k])
+            sameMap = false;
+        if (mn[k] == '\0')
+            break;
+    }
+    if (!sameMap)
+    {
+        int k = 0;
+        for (; mn[k] != '\0' && k < 63; ++k)
+            lastMap[k] = mn[k];
+        lastMap[k] = '\0';
+        published = false;
+    }
+    if (published)
+        return;
+
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+    float wsx = *reinterpret_cast<volatile float *>(cgBase + 0x4e488);
+    float wsy = *reinterpret_cast<volatile float *>(cgBase + 0x4e48c);
+    if (wsx == 0.0f || wsy == 0.0f)
+        return; // compass bounds not loaded yet this frame -- retry next frame
+
+    float wox = *reinterpret_cast<volatile float *>(cgBase + 0x4e480);
+    float woy = *reinterpret_cast<volatile float *>(cgBase + 0x4e484);
+    float nx = *reinterpret_cast<volatile float *>(cgBase + 0x4e478);
+    float ny = *reinterpret_cast<volatile float *>(cgBase + 0x4e474);
+
+    char cmd[320];
+    sprintf_s(cmd,
+              "set caster_wox %f;set caster_woy %f;set caster_wsx %f;set caster_wsy %f;"
+              "set caster_nx %f;set caster_ny %f\n",
+              wox, woy, wsx, wsy, nx, ny);
+    Cbuf_AddText(0, cmd);
+    published = true;
+}
+
 void DrawBranding()
 {
     const char *brandingWithBuild = branding::GetBrandingString();
@@ -177,10 +238,10 @@ void UI_DrawBuildNumber_Hook(const int localClientNum)
 {
     DrawBranding();
 
-    // v22: draw the spec compass/dots from the 2D UI pass (NOT OnCG_DrawActive,
-    // which is the 3D scene pass) so the stretchpics flush every frame -- incl.
-    // plain follow-spectate with no scoreboard open. Self-gated to valid
-    // follow-spectate inside, so this is inert in menus / live play.
+    // v23: the native DLL spec draw is kept only as an A/B fallback (compass_native
+    // default OFF). It does NOT fire here in plain spectate -- this hook is the
+    // reason v22 failed (UI_DrawBuildNumber does not run during plain spectate).
+    // Left in place for menu/A-B use; inert unless compass_native is toggled on.
     DrawNativeSpecCompass();
 
     // Omit the original build number drawing
@@ -272,10 +333,7 @@ void CG_DrawPlayerInfo()
 // Engine's own "valid followed player" test, lifted from Function_8231E070's
 // early-out: followedSlot (0x849f3664) must be in [1..count(0x849f3620)] and
 // the player-slot pointer it indexes via 0x849f2df0 + (slot+0x20c)*4 must be
-// live. Group 6 is the GENERIC spectate/intermission UI state -- it is also
-// active at the CHOOSE TEAM screen (v15 broke team select by forcing there).
-// This check is what distinguishes "locked onto a player" from "sitting in
-// spec UI", so the group rewrite only fires mid-follow. Local client 0 only.
+// live. Local client 0 only.
 static bool ValidFollowedPlayer()
 {
     int followedSlot = *reinterpret_cast<volatile int *>(0x849F3664u);
@@ -292,47 +350,24 @@ static bool ValidFollowedPlayer()
 
 // Native compass actor-blip drawer. Function_82322868 loops the compass-actor
 // array (24 slots, engine-filled every frame from the snapshot) and draws BOTH
-// teams -- friendly directional arrows + enemy dots -- through the per-client
-// compass transform at 0x8246f308. Verified in Ghidra: every wrapper around it
-// is a NOP or __savefpr/__restfpr register thunk, so it has NO menu-paint
-// context dependency, and the full-map path is NOT behind the follow-spec gate
-// that hides the rotating compass. So we can call it straight from the per-
-// frame draw with a hand-built rectDef, no menu open and no .ff edit.
-//   p1 = local client (0)
-//   p2 = mode: 0 = full-map projection, 1 = rotating compass
-//   p3 = scratch rect ptr (only read in rotating mode -- we pass a zeroed rect)
-//   p4 = rectDef { float x,y,w,h; int horzAlign, vertAlign } -- the screen box
-//   p5 = base color RGBA floats (p5[3] alpha is written/clamped by the fn)
+// teams. KEPT as an A/B fallback only (compass_native default OFF).
 typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
 static CompassDrawActors_fn_t const CompassDrawActors_fn =
     reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
 
-// Native compass MAP BACKGROUND -- self-drawn so WE own the material. We do NOT
-// call 82325E78: that fn paints whatever 2D material the menu bound via stack
-// pass-through, which we can't reproduce out of context (that unbound material
-// was the v18 hang, not unsafety). Instead we replicate its body and pass the
-// material explicitly, so map + blips share the exact same projection + matrix
-// and line up by construction. Verified call chain in Ghidra (82310BE8 shows
-// the same recipe: register material, then draw through the compass matrix).
-//
 // R_RegisterMaterial(type, name) -> handle. type 4 = 2D/UI material.
 typedef int (*R_RegisterMaterial_fn_t)(int, const char *);
 static R_RegisterMaterial_fn_t const R_RegisterMaterial_fn =
     reinterpret_cast<R_RegisterMaterial_fn_t>(0x822A0298u);
-// Compass projection (82323E28): fills oA,oB,oC,oD = x,y,w,h (rect * compass
-// scale in full-map mode). Identical call the blip drawer makes internally.
-//   (mode, cgBase, scratch, rectDef, &oA, &oB, &oC, &oD)
+// Compass projection (82323E28): fills oA,oB,oC,oD = x,y,w,h.
 typedef void (*CompassProject_fn_t)(int, int, void *, void *, float *, float *, float *, float *);
 static CompassProject_fn_t const CompassProject_fn =
     reinterpret_cast<CompassProject_fn_t>(0x82323E28u);
-// Per-client compass matrix transform (822b36e8) -- the alignment glue shared
-// with the blips. (matrix, &a, &b, &c, &d, horzAlign, vertAlign)
+// Per-client compass matrix transform (822b36e8).
 typedef void (*CompassMatrixXform_fn_t)(float *, float *, float *, float *, float *, int, int);
 static CompassMatrixXform_fn_t const CompassMatrixXform_fn =
     reinterpret_cast<CompassMatrixXform_fn_t>(0x822B36E8u);
-// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material). color +
-// material are the 9th/10th args; declaring them explicitly puts the material
-// in the slot the fn reads -- which the menu pass-through chain denied v18.
+// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material).
 typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
 static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
     reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
@@ -347,11 +382,6 @@ struct compassRectDef_s
     int vertAlign;
 };
 
-// The actor projection runs through the per-client compass transform matrix at
-// 0x8246f308 (stride 0x44). If that matrix is stale/zero in follow (no menu
-// open) the projected coords would be garbage, so bail rather than risk a bad
-// draw -- a stale matrix then shows NOTHING instead of crashing, which itself
-// tells us the matrix needs explicit setup.
 static bool CompassMatrixReady()
 {
     const volatile float *m = reinterpret_cast<volatile float *>(0x8246F308u);
@@ -364,8 +394,6 @@ static bool CompassMatrixReady()
     return true;
 }
 
-// Register compass_map_<mapname> and cache the handle (re-register only when the
-// map name changes). Returns 0 if unavailable -> caller skips the map draw.
 static int RegisterCompassMapMaterial()
 {
     const char *mn = Dvar_GetString("mapname");
@@ -397,16 +425,12 @@ static int RegisterCompassMapMaterial()
     return cachedHandle;
 }
 
-// Draw the real map texture through the SAME projection + matrix the blips use.
-// rect is the compassRectDef_s; horz/vertAlign come from it.
 static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
     int handle = RegisterCompassMapMaterial();
     if (handle == 0)
         return;
 
-    // client 0 (the host spectator). cgBase only used by the rotating branch;
-    // full-map ignores it. matrix is the per-client compass transform.
     int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
     float *matrix = reinterpret_cast<float *>(0x8246F308u);
 
@@ -418,19 +442,9 @@ static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign
     R_DrawStretchPic_fn(a, b, c, d, 0.0f, 0.0f, 1.0f, 1.0f, white, handle);
 }
 
-// v21 caster radar. The native compass actor array is team-filtered to the
-// followed player's view (teammates + UAV enemies), so it can't show everyone.
-// Instead we take ALL players' world x/y from GSC via the "caster_blips" dvar
-// (an "x y x y ..." string the spectator publishes every frame) and draw each
-// as a uniform red dot, plus the followed player (cg+0x478e0/4) as a larger
-// yellow marker. Each dot is projected with the mode-1 (static full-map) math
-// reversed from FUN_82323740's else-branch:
-//   u = (north.x*dx - north.y*dy) / worldW
-//   v = -(north.y*dx + north.x*dy) / worldH        (dx,dy = pos - worldOrigin)
-//   screen = projRect(ox,oy,ow,oh) -> (ox + u*ow, oy + v*oh)
-// then pushed through the SAME CompassProject + CompassMatrixXform as the map,
-// so dots land exactly on the map by construction (matches the native mode-1
-// blip placement that was confirmed aligned). cg reads at client 0.
+// v21 caster radar DLL draw -- INERT now (caster_dots default OFF). Kept as an
+// A/B fallback alongside the native blips. The shipping radar is GSC-drawn
+// (see PublishCasterBounds + caster_radar() in main.gsc).
 static int s_whiteMat = 0;
 
 static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
@@ -443,11 +457,9 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
     int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
     float *matrix = reinterpret_cast<float *>(0x8246F308u);
 
-    // Same projected rect the map uses (pre-matrix): ox,oy,ow,oh.
     float ox = 0.0f, oy = 0.0f, ow = 0.0f, oh = 0.0f;
     CompassProject_fn(mode, cgBase, scratch, rect, &ox, &oy, &ow, &oh);
 
-    // Compass world basis: north vector, world origin, world size.
     float nX = *reinterpret_cast<volatile float *>(cgBase + 0x4e478);
     float nY = *reinterpret_cast<volatile float *>(cgBase + 0x4e474);
     float wOx = *reinterpret_cast<volatile float *>(cgBase + 0x4e480);
@@ -487,7 +499,6 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
         R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, red, s_whiteMat);
     }
 
-    // Followed player (cg+0x478e0/4) -> yellow, larger, drawn on top.
     float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
     float fdy = *reinterpret_cast<volatile float *>(cgBase + 0x478e4) - wOy;
     float fu = (nX * fdx - nY * fdy) / wW;
@@ -506,16 +517,6 @@ static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
         return;
-
-    // v22 true follow-spectate gate. 0x849f4288 (per-client +0x14a0) is the HUD
-    // menu-group/state: ==6 ONLY in valid follow-spectate (per 8231E070); live
-    // play is 0 (in-game HUD) or 7 (scoreboard), never 6. This stops the dots
-    // leaking over gameplay when stats are opened mid-match. Side effect: the
-    // dots correctly HIDE when the spectator opens the scoreboard (6 -> 7),
-    // which is fine for casting -- the scoreboard covers the map area anyway.
-    if (*reinterpret_cast<volatile int *>(0x849F4288u) != 6)
-        return;
-    // Only mid-follow (locked onto a player). Skips CHOOSE TEAM / spec UI.
     if (!ValidFollowedPlayer())
         return;
     if (!CompassMatrixReady())
@@ -529,21 +530,15 @@ static void DrawNativeSpecCompass()
     rect.horzAlign = compass_native_align->current.integer;
     rect.vertAlign = compass_native_align->current.integer;
 
-    // p3 scratch (unused in full-map mode; zeroed for the rotating path).
     compassRectDef_s scratch = {0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
 
     int mode = compass_native_mode->current.integer;
 
-    // Real native map background first, so blips/dots draw on top. Self-drawn
-    // with our own material handle through the same projection -> aligned.
     if (compass_native_bg != nullptr && compass_native_bg->current.enabled)
         DrawNativeSpecMap(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
-    // p5 alpha is written by the draw fn, so refresh every frame.
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    // Caster radar: all players as red dots + yellow followed marker. Falls
-    // back to the native team blips when caster_dots is off.
     if (caster_dots != nullptr && caster_dots->current.enabled)
         DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
     else
@@ -578,40 +573,39 @@ cg::cg()
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
 
-    // compass_group0 is now inert (the field 6->0 force was retired -- it was
-    // built on the disproven "82348BD0 is the map" theory). Left registered so
-    // existing configs referencing it don't error; it no longer does anything.
-    compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op in v17)");
+    compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
-    // Native follow-spec compass (v17). Toggle + dvar-tunable placement so the
-    // map box can be dialed in on Xenia with no rebuild.
-    compass_native = Dvar_RegisterBool("compass_native", true, 0,
-        "Follow-spec: draw native engine compass blips (both teams) via fn 82322868");
-    // Native map background (v20): self-drawn compass_map_<mapname> through the
-    // same projection+matrix as the blips. Safe -- we own the material handle.
+    // Native DLL spec compass -- RETIRED as the shipping path (render-pass: only
+    // flushes when a 2D HUD pass runs, i.e. scoreboard open). Default OFF; left
+    // as an A/B fallback. The shipping caster radar is GSC-drawn (see below).
+    compass_native = Dvar_RegisterBool("compass_native", false, 0,
+        "A/B fallback: draw native engine compass blips via fn 82322868 (default off)");
     compass_native_bg = Dvar_RegisterBool("compass_native_bg", true, 0,
-        "Follow-spec: draw the native compass map texture under the blips");
-    compass_native_mode = Dvar_RegisterInt("compass_native_mode", 0, 0, 1, 0,
-        "Native spec compass projection: 0=full map, 1=rotating");
+        "Fallback: draw the native compass map texture under the blips");
+    compass_native_mode = Dvar_RegisterInt("compass_native_mode", 1, 0, 1, 0,
+        "Native spec compass projection: 0=player-centered, 1=static full-map");
     compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
         "Native spec compass rect X");
     compass_native_y = Dvar_RegisterInt("compass_native_y", 16, -2000, 2000, 0,
         "Native spec compass rect Y");
-    compass_native_size = Dvar_RegisterInt("compass_native_size", 112, 8, 1024, 0,
+    compass_native_size = Dvar_RegisterInt("compass_native_size", 200, 8, 1024, 0,
         "Native spec compass rect size (square, w=h)");
     compass_native_align = Dvar_RegisterInt("compass_native_align", 0, 0, 7, 0,
         "Native spec compass rect horz/vert align enum (0-7)");
 
-    // v21 caster radar: all players as red dots + yellow followed marker.
-    // Player x/y are published by GSC into the "caster_blips" dvar each frame.
+    // v21 fallback dvars (inert unless compass_native + caster_dots toggled on).
     caster_dots = Dvar_RegisterBool("caster_dots", true, 0,
-        "Follow-spec: draw all players as red dots (caster radar) instead of native team blips");
+        "Fallback DLL draw: all players as red dots instead of native team blips");
     caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
-        "Caster radar dot size (projected units)");
+        "Fallback DLL draw: dot size (projected units)");
+
+    // v23 SHIPPING caster radar: DLL publishes the static compass projection
+    // basis once per map; GSC draws map + dots as hudelems (render in spectate).
+    caster_publish = Dvar_RegisterBool("caster_publish", true, 0,
+        "Publish compass projection basis (caster_wox/woy/wsx/wsy/nx/ny) for the GSC caster radar");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
-    // Read back via `\compass_hook_v` in console.
-    Dvar_RegisterInt("compass_hook_v", 22, 0, 100, 0, "Codxe compass hook build marker (v22 -- spec compass drawn from 2D UI pass (shows without scoreboard) + follow-spec gate (no live-play leak))");
+    Dvar_RegisterInt("compass_hook_v", 23, 0, 100, 0, "Codxe compass hook build marker (v23 -- DLL publishes compass basis; GSC draws the caster radar)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -635,11 +629,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
-
-            // v22: DrawNativeSpecCompass() moved to UI_DrawBuildNumber_Hook (the
-            // 2D UI pass) so it flushes every frame incl. plain spectate. Drawing
-            // it from this 3D pass made it paint only when a 2D HUD pass was
-            // forced (scoreboard open) -- the "needs stats open" bug.
+            PublishCasterBounds();
 
             if (cg_draw_player_info->current.enabled)
             {
