@@ -522,6 +522,11 @@ static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const 
 static int s_diagBlipParsed = 0;
 static int s_diagBlipEntValid = 0;
 static int s_diagBlipDrawn = 0;
+// v42: first two drawn dots' map-space u/v as percent (0..100). Splits the
+// SD mystery: counters said 5 dots submitted while the map looked clean, so
+// either they cluster at one point (stale origins -> u0==u1) or they land
+// at sane distinct spots (contrast problem, not logic).
+static int s_diagU0 = -1, s_diagV0 = -1, s_diagU1 = -1, s_diagV1 = -1;
 
 static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool nativePing,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
@@ -602,6 +607,16 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
         static const float pingWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         const float *tint = usePing ? pingWhite : dotColor;
+        if (s_diagBlipDrawn == 0)
+        {
+            s_diagU0 = static_cast<int>(u * 100.0f);
+            s_diagV0 = static_cast<int>(v * 100.0f);
+        }
+        else if (s_diagBlipDrawn == 1)
+        {
+            s_diagU1 = static_cast<int>(u * 100.0f);
+            s_diagV1 = static_cast<int>(v * 100.0f);
+        }
         ++s_diagBlipDrawn;
         R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, tint, dotMat);
     }
@@ -901,6 +916,7 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
             s_diagBlipParsed = 0;
             s_diagBlipEntValid = 0;
             s_diagBlipDrawn = 0;
+            s_diagU0 = -1; s_diagV0 = -1; s_diagU1 = -1; s_diagV1 = -1;
             DrawNativeSpecCompass(x, y, w, h);
             s_inNativeBlit = false;
             return;
@@ -985,8 +1001,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 41, 0, 100, 0,
-        "Codxe compass hook build marker (v41 -- strict name-verified material resolve)");
+    Dvar_RegisterInt("compass_hook_v", 42, 0, 100, 0,
+        "Codxe compass hook build marker (v42 -- dot u/v position diag)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1041,11 +1057,11 @@ cg::cg()
                 const int dgCg2 = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
                 const int dgWb = static_cast<int>(*reinterpret_cast<volatile float *>(dgCg2 + 0x4e488));
                 char ndiag[240];
-                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d",
-                          s_diagAnyHits, s_diagHookHits, s_diagDrawCalls, RegisterCompassMapMaterial(),
+                sprintf_s(ndiag, sizeof(ndiag), "NDIAG al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d u0=%d,%d u1=%d,%d",
                           dgAl ? static_cast<int>(strlen(dgAl)) : -1,
                           dgAx ? static_cast<int>(strlen(dgAx)) : -1,
-                          dgTeam, dgWb, s_diagBlipParsed, s_diagBlipEntValid, s_diagBlipDrawn);
+                          dgTeam, dgWb, s_diagBlipParsed, s_diagBlipEntValid, s_diagBlipDrawn,
+                          s_diagU0, s_diagV0, s_diagU1, s_diagV1);
                 static Font_s *ndiagFont = R_RegisterFont("fonts/consoleFont");
                 float ndiagCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
                 R_AddCmdDrawText(ndiag, 128, ndiagFont, 10.f, 150.f, 1.0f, 1.0f, 0.0f, ndiagCol, 0);
