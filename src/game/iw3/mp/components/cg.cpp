@@ -364,6 +364,23 @@ static CompassDrawPlayer_fn_t const CompassDrawPlayer_fn =
 typedef int (*R_RegisterMaterial_fn_t)(int, const char *);
 static R_RegisterMaterial_fn_t const R_RegisterMaterial_fn =
     reinterpret_cast<R_RegisterMaterial_fn_t>(0x822A0298u);
+
+// v41: STRICT material resolve. The v36 sentinel is RETIRED -- evidence
+// (default-material blobs at Crash bomb sites, wrong player icon) shows
+// R_RegisterMaterial creates a DISTINCT default-backed handle per unknown
+// name, so it matches neither 0 nor a probe sentinel. Instead verify the
+// resolved Material's own name: iw3 Material.info.name sits at +0; a
+// default-backed material carries its own name, not the requested one.
+static int ResolveMaterialStrict(const char *name)
+{
+    const int h = R_RegisterMaterial_fn(4, name);
+    if (h == 0)
+        return 0;
+    const char *matName = *reinterpret_cast<const char *const volatile *>(h);
+    if (matName == nullptr || strcmp(matName, name) != 0)
+        return 0;
+    return h;
+}
 // Compass projection (82323E28): fills oA,oB,oC,oD = x,y,w,h.
 typedef void (*CompassProject_fn_t)(int, int, void *, void *, float *, float *, float *, float *);
 static CompassProject_fn_t const CompassProject_fn =
@@ -574,11 +591,8 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         static int s_pingMat = 0;
         if (s_pingMat == 0)
         {
-            const int m = R_RegisterMaterial_fn(4, "compassping_enemy");
-            static int s_missing = -1;
-            if (s_missing == -1)
-                s_missing = R_RegisterMaterial_fn(4, "codxe_no_such_material");
-            s_pingMat = (m != 0 && m != s_missing) ? m : s_whiteMat;
+            const int m = ResolveMaterialStrict("compassping_enemy");
+            s_pingMat = (m != 0) ? m : s_whiteMat;
         }
         const bool usePing = nativePing && s_pingMat != s_whiteMat;
         const int dotMat = usePing ? s_pingMat : s_whiteMat;
@@ -608,30 +622,19 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         // probe candidates once, sentinel-guarded; white tint preserves the
         // texture's own yellow. All probes missing -> the previous
         // hand-rotated arrow stays as fallback.
+        // v41: probe list RETIRED (one of the loose names resolved to a
+        // wrong/default-backed material -> "unidentified icon"). Single
+        // known material: compassping_player, the stock minimap self-arrow
+        // (white texture), strict-verified by name, tinted yellow.
         static int s_playerArrowMat = -2; // -2 unprobed, 0 = none found
         if (s_playerArrowMat == -2)
-        {
-            static int s_missing2 = -1;
-            if (s_missing2 == -1)
-                s_missing2 = R_RegisterMaterial_fn(4, "codxe_no_such_material");
-            static const char *const cands[] = {"compass_arrow", "compassping_player", "compass_player_arrow"};
-            s_playerArrowMat = 0;
-            for (int ci = 0; ci < 3; ++ci)
-            {
-                const int m = R_RegisterMaterial_fn(4, cands[ci]);
-                if (m != 0 && m != s_missing2)
-                {
-                    s_playerArrowMat = m;
-                    break;
-                }
-            }
-        }
+            s_playerArrowMat = ResolveMaterialStrict("compassping_player");
 
         if (wantArrow && s_playerArrowMat != 0)
         {
-            static float arrowWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-            arrowWhite[3] = 1.0f; // alpha read at +0xc; mode 1 skips the fade
-            CompassDrawPlayer_fn(0, mode, scratch, rect, s_playerArrowMat, arrowWhite);
+            static float arrowYellow[4] = {1.0f, 0.85f, 0.1f, 1.0f};
+            arrowYellow[3] = 1.0f; // alpha read at +0xc; mode 1 skips the fade
+            CompassDrawPlayer_fn(0, mode, scratch, rect, s_playerArrowMat, arrowYellow);
         }
         else if (wantArrow)
         {
@@ -759,17 +762,10 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         name[k] = '\0';
         while (*b == ' ') ++b;
 
-        // v36: R_RegisterMaterial does NOT return 0 for a missing name --
-        // it returns the engine's default material (the yellow "missing"
-        // pattern; round-end screenshot evidence). Resolve that sentinel
-        // handle once via a guaranteed-missing name and skip any objective
-        // that resolves to it: wrong names now vanish instead of drawing
-        // yellow blobs.
-        static int s_defaultMat = -1;
-        if (s_defaultMat == -1)
-            s_defaultMat = R_RegisterMaterial_fn(4, "codxe_no_such_material");
-        const int mat = R_RegisterMaterial_fn(4, name);
-        if (mat == 0 || mat == s_defaultMat)
+        // v41: strict name-verified resolve (v36 sentinel retired -- it
+        // never matched, see ResolveMaterialStrict).
+        const int mat = ResolveMaterialStrict(name);
+        if (mat == 0)
             continue;
 
         float dx = px - wOx, dy = py - wOy;
@@ -989,8 +985,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 40, 0, 100, 0,
-        "Codxe compass hook build marker (v40 -- v39 + projection diag wb/bp/be/bd)");
+    Dvar_RegisterInt("compass_hook_v", 41, 0, 100, 0,
+        "Codxe compass hook build marker (v41 -- strict name-verified material resolve)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
