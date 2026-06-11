@@ -246,25 +246,45 @@ typedef int (*CG_Compass_IsVisible_fn_t)(int);
 static CG_Compass_IsVisible_fn_t const CG_Compass_IsVisible_fn =
     reinterpret_cast<CG_Compass_IsVisible_fn_t>(0x82304290u);
 
-// Follow-spectate kills the compass because spec entry (822D2468) wipes the
-// per-client key-routing block at 0x82435a00.. (stride 0x24): with bit 0x10 of
-// the word at 0x82435a18 clear, CL_KeyEvent (822DD1E8) never forwards keys to
-// the in-game HUD menu handler (821EF510), which is the ONLY code path that
-// opens the full-screen HUD menu (name @ 0x82052dc4) whose ownerdraws
-// (0xb4..0xbc) ARE the compass map. The dispatcher caller 821F0E90 is further
-// short-circuited by the byte at 0x82435a12. Both are plain data, re-wiped on
-// spec entry only, so we re-assert them every frame while compass_menu_force
-// is on; the spectator's next button press makes the ENGINE open its own HUD
-// menu (821EF510 tail: clear bit, call 821D47E8).
+// v17 RETIRED: forcing bit 0x10 of the key-routing word at 0x82435a18 hijacks
+// the input layer (CL_KeyEvent forwards everything to the HUD-menu handler) --
+// team-select / spawn menus stop receiving input and the bit is never cleared
+// outside spec entry. Game-breaking, confirmed in-game.
+//
+// v18: skip the routing layer. The engine opens the in-game HUD menu (the
+// menulist whose ownerdraws 0xb4..0xbc ARE the compass) via
+// Function_821D47E8(name @ 0x82052dc4) -- the tail of 821EF510. We make that
+// exact call ourselves, ONCE per cast session, on the 0->1 edge of
+// compass_menu_force, from OnCG_DrawActive (same thread CL_KeyEvent runs on).
+// No input state is touched. The dispatcher gate byte at 0x82435a12 is still
+// re-asserted each frame while casting (data only, read by 821F0E90 when
+// iterating ownerdraws; it does not route input).
+typedef void (*HudMenu_OpenByName_fn_t)(const char *name, int a2, int a3, int a4);
+static HudMenu_OpenByName_fn_t const HudMenu_OpenByName_fn =
+    reinterpret_cast<HudMenu_OpenByName_fn_t>(0x821D47E8u);
+
+static unsigned int s_menuOpenCalls = 0;
+
 static void ForceHudMenuRouting()
 {
-    if (compass_menu_force == nullptr || !compass_menu_force->current.enabled)
+    static bool wasOn = false;
+
+    const bool on = (compass_menu_force != nullptr && compass_menu_force->current.enabled);
+    if (!on)
+    {
+        wasOn = false;
         return;
-    // Local client 0 only.
-    volatile unsigned int *bits = reinterpret_cast<volatile unsigned int *>(0x82435a18u);
-    volatile unsigned char *gate = reinterpret_cast<volatile unsigned char *>(0x82435a12u);
-    *bits |= 0x10u;
-    *gate = 1;
+    }
+
+    // Dispatcher gate byte (data read, not input routing).
+    *reinterpret_cast<volatile unsigned char *>(0x82435a12u) = 1;
+
+    if (!wasOn)
+    {
+        wasOn = true;
+        HudMenu_OpenByName_fn(reinterpret_cast<const char *>(0x82052dc4u), 0, 0, 0);
+        ++s_menuOpenCalls;
+    }
 }
 
 static void ForceFollowHudGroup()
@@ -317,8 +337,8 @@ static void ReadCompassDiag()
 
     char buff[256];
     int bits = (int)*reinterpret_cast<volatile unsigned int *>(0x82435a18u);
-    sprintf_s(buff, "PDIAG5 bits=%x g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
-              bits, g0, gAny, map, mode, vis, field);
+    sprintf_s(buff, "PDIAG6 oc=%u bits=%x g0=%d gAny=%d map=%d mode=%d vis=%d field=%d",
+              s_menuOpenCalls, bits, g0, gAny, map, mode, vis, field);
     static Font_s *diagFont = R_RegisterFont("fonts/consoleFont");
     float col[4] = {0.3f, 1.0f, 1.0f, 1.0f};
     const float x = 10.f * scrPlaceFullUnsafe.scaleVirtualToFull[0];
@@ -356,11 +376,11 @@ cg::cg()
     compass_group0 = Dvar_RegisterBool("compass_group0", true, 0, "Follow-spec: rewrite HUD group 6 to 0 so the in-game HUD (compass) draws");
 
     compass_menu_force = Dvar_RegisterBool("compass_menu_force", false, 0,
-        "Follow-spec: re-assert key routing bit 0x10 + dispatcher gate so the engine reopens the in-game HUD menu (compass)");
+        "Follow-spec: one-shot open of the in-game HUD menu (compass) on 0->1; no input routing touched");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // Read back via `\compass_hook_v` in console (11 = this build).
-    Dvar_RegisterInt("compass_hook_v", 17, 0, 100, 0, "Codxe compass hook build marker (v17 -- HUD-menu key-routing force, compass_menu_force dvar)");
+    Dvar_RegisterInt("compass_hook_v", 18, 0, 100, 0, "Codxe compass hook build marker (v18 -- one-shot HudMenu open, no input routing)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
