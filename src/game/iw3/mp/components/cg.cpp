@@ -669,7 +669,7 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 26, 0, 100, 0,
+    Dvar_RegisterInt("compass_hook_v", 27, 0, 100, 0,
         "Codxe compass hook build marker (v27 -- follow gate removed, falsified by NDIAG)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
