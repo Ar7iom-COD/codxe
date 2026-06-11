@@ -497,6 +497,15 @@ static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const 
     R_DrawRotQuad_fn(c, color, s_arrowMat);
 }
 
+// v40: projection diag. wb = world-bounds width as int (0 = bounds block
+// never initialized -- the lazy-init theory), bp = blip ids parsed last
+// frame, be = entities valid (type==1), bd = dots actually drawn (survived
+// the u/v cull). bp>0 be>0 bd=0 wb sane => projection math; wb=0 => bounds
+// uninitialized; be=0 => entity resolve.
+static int s_diagBlipParsed = 0;
+static int s_diagBlipEntValid = 0;
+static int s_diagBlipDrawn = 0;
+
 static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool nativePing,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
@@ -785,14 +794,6 @@ static unsigned int s_diagHookHits = 0;
 static unsigned int s_diagFollowFail = 0;
 static unsigned int s_diagMatrixFail = 0;
 static unsigned int s_diagDrawCalls = 0;
-// v40: projection diag. wb = world-bounds width as int (0 = bounds block
-// never initialized -- the lazy-init theory), bp = blip ids parsed last
-// frame, be = entities valid (type==1), bd = dots actually drawn (survived
-// the u/v cull). bp>0 be>0 bd=0 wb sane => projection math; wb=0 => bounds
-// uninitialized; be=0 => entity resolve.
-static int s_diagBlipParsed = 0;
-static int s_diagBlipEntValid = 0;
-static int s_diagBlipDrawn = 0;
 
 // v28 geometry fix. v27 arrows drew but landed outside the scMap: the rect
 // dvars went through hudelem-independent placement (virtual coords + align
