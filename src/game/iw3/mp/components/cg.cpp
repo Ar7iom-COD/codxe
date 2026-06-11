@@ -27,9 +27,9 @@ dvar_s *compass_group0 = nullptr;
 
 // v17 native follow-spec compass: draw the engine's own compass actor blips
 // (both teams: friendly arrows + enemy dots) by calling Function_82322868
-// directly each frame, no .ff edit and no menu. RETIRED for the caster radar
-// (render-pass problem -- see PublishCasterBounds below) but kept as an A/B
-// fallback, default OFF.
+// directly each frame, no .ff edit and no menu.
+// v24: NO LONGER inert. The draw is now triggered from the R_DrawStretchPic
+// detour, piggybacking on the GSC scMap blit (see R_DrawStretchPic_Hook).
 dvar_s *compass_native = nullptr;
 dvar_s *compass_native_bg = nullptr;
 dvar_s *compass_native_mode = nullptr;
@@ -46,12 +46,15 @@ dvar_s *caster_dot_size = nullptr;
 // OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
 // chain (8230EB50/821F1AE8/...) all open with `mfspr r12,LR; bl ...`, the
 // prologue codxe's Detour mis-relocates (freeze). So the DLL cannot reach the
-// 2D pass to flush a draw in plain spectate. Instead it publishes the compass
-// projection basis (world origin/size + north vector) -- all STATIC per map --
-// and GSC hudelems (which DO render in plain spectate) draw the map + dots.
+// 2D pass via a chain detour in plain spectate. v23 answered this by having
+// GSC hudelems draw everything; v24 adds the missing piece: R_DrawStretchPic
+// (0x8216BAE8) IS detour-safe (its `bl __savefpr` is instruction 6, outside
+// the 4-instruction relocation window) and it runs in the spectate 2D pass --
+// proven by the GSC scMap hudelem rendering there. Detouring it gives the DLL
+// a 2D-pass execution point in plain spectate.
 dvar_s *caster_publish = nullptr;
 
-// Forward declaration: drawn from the (now inert) UI_DrawBuildNumber_Hook.
+// Forward declaration: drawn from the R_DrawStretchPic detour (v24).
 static void DrawNativeSpecCompass();
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
@@ -236,13 +239,16 @@ Detour UI_DrawBuildNumber_Detour;
 
 void UI_DrawBuildNumber_Hook(const int localClientNum)
 {
+    (void)localClientNum;
+
     DrawBranding();
 
-    // v23: the native DLL spec draw is kept only as an A/B fallback (compass_native
-    // default OFF). It does NOT fire here in plain spectate -- this hook is the
-    // reason v22 failed (UI_DrawBuildNumber does not run during plain spectate).
-    // Left in place for menu/A-B use; inert unless compass_native is toggled on.
-    DrawNativeSpecCompass();
+    // v24: DrawNativeSpecCompass() REMOVED from this hook. Two reasons, both
+    // proven: (1) UI_DrawBuildNumber does not fire during plain spectate, so
+    // it can never be the spec draw site (v22 failure); (2) it DOES fire in
+    // the main menu and gameplay, so with compass_native enabled it was the
+    // "radar everywhere" leak. The spec draw now lives in
+    // R_DrawStretchPic_Hook, triggered by the GSC scMap blit itself.
 
     // Omit the original build number drawing
     // UI_DrawBuildNumber_Detour.GetOriginal<decltype(UI_DrawBuildNumber)>()
@@ -350,7 +356,8 @@ static bool ValidFollowedPlayer()
 
 // Native compass actor-blip drawer. Function_82322868 loops the compass-actor
 // array (24 slots, engine-filled every frame from the snapshot) and draws BOTH
-// teams. KEPT as an A/B fallback only (compass_native default OFF).
+// teams (friendly arrows + enemy dots). v24: this is the SHIPPING blip drawer,
+// fired from R_DrawStretchPic_Hook.
 typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
 static CompassDrawActors_fn_t const CompassDrawActors_fn =
     reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
@@ -442,9 +449,8 @@ static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign
     R_DrawStretchPic_fn(a, b, c, d, 0.0f, 0.0f, 1.0f, 1.0f, white, handle);
 }
 
-// v21 caster radar DLL draw -- INERT now (caster_dots default OFF). Kept as an
-// A/B fallback alongside the native blips. The shipping radar is GSC-drawn
-// (see PublishCasterBounds + caster_radar() in main.gsc).
+// v21 caster radar DLL draw -- INERT (caster_dots default OFF in v24). Kept as
+// an A/B fallback alongside the native blips.
 static int s_whiteMat = 0;
 
 static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
@@ -545,6 +551,48 @@ static void DrawNativeSpecCompass()
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
 }
 
+// --- v24: R_DrawStretchPic detour -- the spec 2D-pass execution point --------
+//
+// Detour safety verified in Ghidra: 0x8216BAE8 opens
+//     mfspr r12,LR / stw r12,-8(r1) / std r30,-0x18(r1) / std r31,-0x10(r1)
+// -- four position-independent, branch-free instructions, which is exactly the
+// 16-byte window codxe's Detour relocates (WriteFarBranch = 4 instructions).
+// The `bl __savefpr` sits at instruction 6, outside the window, so the
+// mis-relocation freeze (early-`bl` prologues) does not apply here.
+//
+// Trigger: the GSC caster map hudelem (scMap, material compass_map_<mapname>)
+// renders through this function in plain follow-spectate. When we see that
+// exact material blit and compass_native is on, the caster map was JUST drawn
+// at the right place, in the right pass -- so we composite the native actor
+// blips immediately after it. By construction this can never draw in the main
+// menu (no scMap there), during gameplay (shoutcaster auto-off destroys
+// scMap), or for playing clients (spectator-team hudelem).
+//
+// s_inNativeBlit guards re-entrancy: the blip drawer itself submits pics
+// through this same function.
+
+Detour R_DrawStretchPic_Detour;
+static bool s_inNativeBlit = false;
+
+void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t0, float s1, float t1,
+                           const float *color, int material)
+{
+    R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t0, s1, t1, color, material);
+
+    if (s_inNativeBlit)
+        return;
+    if (compass_native == nullptr || !compass_native->current.enabled)
+        return;
+
+    const int mapHandle = RegisterCompassMapMaterial();
+    if (mapHandle == 0 || material != mapHandle)
+        return;
+
+    s_inNativeBlit = true;
+    DrawNativeSpecCompass();
+    s_inNativeBlit = false;
+}
+
 cg::cg()
 {
     Menus_OpenByName_Detour = Detour(Menus_OpenByName, Menus_OpenByName_Hook);
@@ -552,6 +600,13 @@ cg::cg()
 
     UI_DrawBuildNumber_Detour = Detour(UI_DrawBuildNumber, UI_DrawBuildNumber_Hook);
     UI_DrawBuildNumber_Detour.Install();
+
+    // v24: 2D-pass execution point for the native spec compass. Prologue
+    // verified branch-free for the 4-instruction relocation window (see the
+    // comment block above R_DrawStretchPic_Hook).
+    R_DrawStretchPic_Detour = Detour(reinterpret_cast<void *>(0x8216BAE8u),
+                                     reinterpret_cast<const void *>(R_DrawStretchPic_Hook));
+    R_DrawStretchPic_Detour.Install();
 
     // Default to true for idle gun sway
     // This is the default behavior in the original game.
@@ -575,37 +630,40 @@ cg::cg()
 
     compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
-    // Native DLL spec compass -- RETIRED as the shipping path (render-pass: only
-    // flushes when a 2D HUD pass runs, i.e. scoreboard open). Default OFF; left
-    // as an A/B fallback. The shipping caster radar is GSC-drawn (see below).
+    // v24 native spec compass: enabled by GSC (caster_radar) while casting;
+    // drawn from the R_DrawStretchPic detour when the GSC scMap blit is seen.
     compass_native = Dvar_RegisterBool("compass_native", false, 0,
-        "A/B fallback: draw native engine compass blips via fn 82322868 (default off)");
-    compass_native_bg = Dvar_RegisterBool("compass_native_bg", true, 0,
-        "Fallback: draw the native compass map texture under the blips");
+        "Draw native engine compass blips over the GSC caster map (set by GSC while casting)");
+    compass_native_bg = Dvar_RegisterBool("compass_native_bg", false, 0,
+        "Also draw the native compass map texture under the blips (off: GSC scMap is the backdrop)");
     compass_native_mode = Dvar_RegisterInt("compass_native_mode", 1, 0, 1, 0,
         "Native spec compass projection: 0=player-centered, 1=static full-map");
     compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
         "Native spec compass rect X");
     compass_native_y = Dvar_RegisterInt("compass_native_y", 16, -2000, 2000, 0,
         "Native spec compass rect Y");
-    compass_native_size = Dvar_RegisterInt("compass_native_size", 200, 8, 1024, 0,
+    compass_native_size = Dvar_RegisterInt("compass_native_size", 180, 8, 1024, 0,
         "Native spec compass rect size (square, w=h)");
     compass_native_align = Dvar_RegisterInt("compass_native_align", 0, 0, 7, 0,
         "Native spec compass rect horz/vert align enum (0-7)");
 
-    // v21 fallback dvars (inert unless compass_native + caster_dots toggled on).
-    caster_dots = Dvar_RegisterBool("caster_dots", true, 0,
+    // v24: caster_dots default OFF so the native actor blips (arrows + enemy
+    // dots, fn 82322868) draw instead of the v21 red-square fallback.
+    caster_dots = Dvar_RegisterBool("caster_dots", false, 0,
         "Fallback DLL draw: all players as red dots instead of native team blips");
     caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
         "Fallback DLL draw: dot size (projected units)");
 
-    // v23 SHIPPING caster radar: DLL publishes the static compass projection
-    // basis once per map; GSC draws map + dots as hudelems (render in spectate).
+    // v23 caster radar publisher: DLL publishes the static compass projection
+    // basis once per map; GSC uses it for objective markers (and the dots, when
+    // they existed).
     caster_publish = Dvar_RegisterBool("caster_publish", true, 0,
         "Publish compass projection basis (caster_wox/woy/wsx/wsy/nx/ny) for the GSC caster radar");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
-    Dvar_RegisterInt("compass_hook_v", 23, 0, 100, 0, "Codxe compass hook build marker (v23 -- DLL publishes compass basis; GSC draws the caster radar)");
+    // GSC gates compass_native enablement on this being >= 24.
+    Dvar_RegisterInt("compass_hook_v", 24, 0, 100, 0,
+        "Codxe compass hook build marker (v24 -- native blips drawn from the R_DrawStretchPic detour)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -642,6 +700,7 @@ cg::~cg()
 {
     Menus_OpenByName_Detour.Remove();
     UI_DrawBuildNumber_Detour.Remove();
+    R_DrawStretchPic_Detour.Remove();
     UI_SafeTranslateString_Detour.Remove();
     BG_CalculateWeaponPosition_IdleAngles_Detour.Remove();
     BG_CalculateView_IdleAngles_Detour.Remove();
