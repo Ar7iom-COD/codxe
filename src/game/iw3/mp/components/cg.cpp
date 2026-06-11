@@ -486,7 +486,7 @@ static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const 
     R_DrawRotQuad_fn(c, color, s_arrowMat);
 }
 
-static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
+static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool nativePing,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
     if (s_whiteMat == 0)
@@ -543,12 +543,30 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
         if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
             continue;
 
-        // v34: reference layout -- enemy blips are DOTS (UAV style), not
-        // arrows. (The v32 enemy arrows worked; restyled by request.)
+        // v37: the game's own red ping texture ("compassping_enemy", in the
+        // xex string table) instead of a flat tinted square -- the native
+        // UAV-dot look. Texture carries its own red; tint stays the caller's
+        // color so the rare freecam ally pass can still tint. Soft-edged
+        // texture reads smaller than its quad, so 2x the square size.
+        // Sentinel-guarded; flat square is the fallback, never a yellow blob.
+        static int s_pingMat = 0;
+        if (s_pingMat == 0)
+        {
+            const int m = R_RegisterMaterial_fn(4, "compassping_enemy");
+            static int s_missing = -1;
+            if (s_missing == -1)
+                s_missing = R_RegisterMaterial_fn(4, "codxe_no_such_material");
+            s_pingMat = (m != 0 && m != s_missing) ? m : s_whiteMat;
+        }
+        const bool usePing = nativePing && s_pingMat != s_whiteMat;
+        const int dotMat = usePing ? s_pingMat : s_whiteMat;
+        const float sz = usePing ? ds * 2.0f : ds;
         float acx = ox + u * ow, acy = oy + v * oh;
-        float qx = acx - ds * 0.5f, qy = acy - ds * 0.5f, qw = ds, qh = ds;
+        float qx = acx - sz * 0.5f, qy = acy - sz * 0.5f, qw = sz, qh = sz;
         CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
-        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
+        static const float pingWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        const float *tint = usePing ? pingWhite : dotColor;
+        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, tint, dotMat);
     }
 
     float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
@@ -591,7 +609,7 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
 static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
     static const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-    DrawCasterDotsFrom("caster_blips", red, mode, scratch, rect, horzAlign, vertAlign);
+    DrawCasterDotsFrom("caster_blips", red, true, mode, scratch, rect, horzAlign, vertAlign);
 }
 
 // v29 enemy radar layer. The engine fills the 24-slot compass actor array from
@@ -622,11 +640,11 @@ static void DrawEnemyDots(int mode, void *scratch, void *rect, int horzAlign, in
 
     if (team == 1)      // following axis -> enemies are allies
     {
-        DrawCasterDotsFrom("caster_blips_al", red, mode, scratch, rect, horzAlign, vertAlign);
+        DrawCasterDotsFrom("caster_blips_al", red, true, mode, scratch, rect, horzAlign, vertAlign);
     }
     else if (team == 2) // following allies -> enemies are axis
     {
-        DrawCasterDotsFrom("caster_blips_ax", red, mode, scratch, rect, horzAlign, vertAlign);
+        DrawCasterDotsFrom("caster_blips_ax", red, true, mode, scratch, rect, horzAlign, vertAlign);
     }
     else
     {
@@ -635,8 +653,8 @@ static void DrawEnemyDots(int mode, void *scratch, void *rect, int horzAlign, in
         // is no followed compass view to fill the actor array from. So in
         // freecam we draw BOTH teams from the GSC blip feed: allies green,
         // axis red. Following someone returns to native arrows + enemy reds.
-        DrawCasterDotsFrom("caster_blips_al", green, mode, scratch, rect, horzAlign, vertAlign);
-        DrawCasterDotsFrom("caster_blips_ax", red, mode, scratch, rect, horzAlign, vertAlign);
+        DrawCasterDotsFrom("caster_blips_al", green, false, mode, scratch, rect, horzAlign, vertAlign);
+        DrawCasterDotsFrom("caster_blips_ax", red, true, mode, scratch, rect, horzAlign, vertAlign);
     }
 }
 
@@ -683,8 +701,17 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         name[k] = '\0';
         while (*b == ' ') ++b;
 
+        // v36: R_RegisterMaterial does NOT return 0 for a missing name --
+        // it returns the engine's default material (the yellow "missing"
+        // pattern; round-end screenshot evidence). Resolve that sentinel
+        // handle once via a guaranteed-missing name and skip any objective
+        // that resolves to it: wrong names now vanish instead of drawing
+        // yellow blobs.
+        static int s_defaultMat = -1;
+        if (s_defaultMat == -1)
+            s_defaultMat = R_RegisterMaterial_fn(4, "codxe_no_such_material");
         const int mat = R_RegisterMaterial_fn(4, name);
-        if (mat == 0)
+        if (mat == 0 || mat == s_defaultMat)
             continue;
 
         float dx = px - wOx, dy = py - wOy;
@@ -901,8 +928,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 35, 0, 100, 0,
-        "Codxe compass hook build marker (v35 -- compass hidden while UI menus are open)");
+    Dvar_RegisterInt("compass_hook_v", 38, 0, 100, 0,
+        "Codxe compass hook build marker (v38 -- ping texture + blip-feed diag in NDIAG)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -933,9 +960,33 @@ cg::cg()
             // PDIAG runs). The Cbuf publish below stays for the GSC print.
             if (compass_native != nullptr && compass_native->current.enabled)
             {
-                char ndiag[160];
-                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d",
-                          s_diagAnyHits, s_diagHookHits, s_diagDrawCalls, RegisterCompassMapMaterial());
+                // v38 blip diag: al/ax = caster_blips_* string lengths (0 =
+                // GSC publisher empty), tm = followed clientinfo team
+                // (1 axis / 2 allies / 0,3 freecam-invalid). Splits "nothing
+                // on compass" between the GSC feed and the DLL team pick.
+                int dgTeam = -1;
+                {
+                    const int dgCg = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+                    const int dgSnap = *reinterpret_cast<volatile int *>(dgCg + 0x24);
+                    if (dgSnap != 0)
+                    {
+                        const int dgIdx = *reinterpret_cast<volatile int *>(dgSnap + 0xec);
+                        if (dgIdx >= 0 && dgIdx <= 63)
+                        {
+                            const int dgInfo = dgIdx * 0x4e4 + dgCg;
+                            if (*reinterpret_cast<volatile int *>(dgInfo + 0xe8f58) != 0)
+                                dgTeam = *reinterpret_cast<volatile int *>(dgInfo + 0xe8f84);
+                        }
+                    }
+                }
+                const char *dgAl = Dvar_GetString("caster_blips_al");
+                const char *dgAx = Dvar_GetString("caster_blips_ax");
+                char ndiag[200];
+                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d al=%d ax=%d tm=%d",
+                          s_diagAnyHits, s_diagHookHits, s_diagDrawCalls, RegisterCompassMapMaterial(),
+                          dgAl ? static_cast<int>(strlen(dgAl)) : -1,
+                          dgAx ? static_cast<int>(strlen(dgAx)) : -1,
+                          dgTeam);
                 static Font_s *ndiagFont = R_RegisterFont("fonts/consoleFont");
                 float ndiagCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
                 R_AddCmdDrawText(ndiag, 128, ndiagFont, 10.f, 150.f, 1.0f, 1.0f, 0.0f, ndiagCol, 0);
