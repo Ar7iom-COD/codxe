@@ -41,6 +41,7 @@ dvar_s *compass_native_align = nullptr;
 // v21 caster radar dvars (DLL-draw path -- now inert, kept for the fallback).
 dvar_s *caster_dots = nullptr;
 dvar_s *caster_dot_size = nullptr;
+dvar_s *caster_arrows = nullptr;
 
 // v23 caster radar: GSC draws, DLL publishes. events.h exposes only
 // OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
@@ -439,6 +440,52 @@ static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign
 // an A/B fallback alongside the native blips.
 static int s_whiteMat = 0;
 
+// v32: native-styled arrows for our own blips. The engine's per-actor icon
+// chain bottoms out in Function_8216B420(corners[8], color[4], material):
+// four screen-space corner pairs, color, material -- rotation is just corner
+// math, done by the caller (82318A88 via sin/cos). We call the bottom of the
+// chain directly with the engine's own arrow material
+// ("compassping_friendly_mp", the actor icon; its firing/yelling variants are
+// the overlay handles the drawer uses) and OUR color: red for enemies,
+// yellow for the followed player. NOTE: the old "compassping_* draws blank"
+// retirement was about GSC setShader (hudelem shader pool); DLL-side
+// R_RegisterMaterial is the path compass_map_* already resolves through.
+typedef void (*R_DrawRotQuad_fn_t)(const float *corners8, const float *color4, int material);
+static R_DrawRotQuad_fn_t const R_DrawRotQuad_fn =
+    reinterpret_cast<R_DrawRotQuad_fn_t>(0x8216B420u);
+
+static int s_arrowMat = 0;
+
+// yawDeg: actor world yaw. Screen rotation = mapNorthRef (cg+0x4e470, the
+// same reference the engine drawer subtracts actor yaw from) minus yawDeg.
+// ASSUMPTION flagged: corner order TL,TR,BR,BL -- if the arrow renders
+// mirrored/flipped in-game, the order is permuted (cosmetic, one-line fix).
+static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const float *color)
+{
+    if (s_arrowMat == 0)
+        s_arrowMat = R_RegisterMaterial_fn(4, "compassping_friendly_mp");
+    if (s_arrowMat == 0)
+        return;
+
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+    float northRef = *reinterpret_cast<volatile float *>(cgBase + 0x4e470);
+
+    const float deg2rad = 0.017453292f;
+    float a = (northRef - yawDeg) * deg2rad;
+    float sa = sinf(a);
+    float ca = cosf(a);
+    float h = size * 0.5f;
+
+    // unrotated corners relative to center: TL(-h,-h) TR(h,-h) BR(h,h) BL(-h,h)
+    float c[8];
+    c[0] = cx + (-h * ca - -h * sa); c[1] = cy + (-h * sa + -h * ca);
+    c[2] = cx + ( h * ca - -h * sa); c[3] = cy + ( h * sa + -h * ca);
+    c[4] = cx + ( h * ca -  h * sa); c[5] = cy + ( h * sa +  h * ca);
+    c[6] = cx + (-h * ca -  h * sa); c[7] = cy + (-h * sa +  h * ca);
+
+    R_DrawRotQuad_fn(c, color, s_arrowMat);
+}
+
 static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
@@ -464,21 +511,31 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
 
     float ds = static_cast<float>(caster_dot_size->current.integer);
 
+    // v31: the dvar carries CLIENT IDS, not positions. GSC keeps the slow,
+    // authoritative filtering (team / alive via sessionstate+health, 4Hz);
+    // positions are resolved HERE every frame from cg_entities (base ptr at
+    // 0x823F5054[client0], stride 0x1d0, origin x/y at +0x1c/+0x20, entity
+    // type at +0xc4 == 1 for players; player entityNum == clientNum). This
+    // removes the 4Hz dot tick -- dots now move per frame like the arrows.
+    const int entBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F5054u));
+    if (entBase == 0)
+        return;
+
     const char *b = Dvar_GetString(blipDvar);
     while (b != nullptr && *b != '\0')
     {
-        float px = static_cast<float>(atof(b));
+        int id = atoi(b);
         while (*b != '\0' && *b != ' ')
             ++b;
         while (*b == ' ')
             ++b;
-        if (*b == '\0')
-            break;
-        float py = static_cast<float>(atof(b));
-        while (*b != '\0' && *b != ' ')
-            ++b;
-        while (*b == ' ')
-            ++b;
+        if (id < 0 || id > 63)
+            continue;
+        const int ent = entBase + id * 0x1d0;
+        if (*reinterpret_cast<volatile int *>(ent + 0xc4) != 1)
+            continue;
+        float px = *reinterpret_cast<volatile float *>(ent + 0x1c);
+        float py = *reinterpret_cast<volatile float *>(ent + 0x20);
 
         float dx = px - wOx, dy = py - wOy;
         float u = (nX * dx - nY * dy) / wW;
@@ -486,9 +543,24 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
         if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
             continue;
 
-        float qx = ox + u * ow - ds * 0.5f, qy = oy + v * oh - ds * 0.5f, qw = ds, qh = ds;
-        CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
-        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
+        // v32: entity yaw. ASSUMPTION flagged: apos.trBase yaw at ent+0x44,
+        // inferred from pos.trBase at +0x1c and trajectory_t pair layout --
+        // not yet read in Ghidra. Visual check: arrows tracking aim = right;
+        // random spin = wrong offset (fall back to dots by clearing
+        // caster_arrows).
+        float yaw = *reinterpret_cast<volatile float *>(ent + 0x44);
+
+        float acx = ox + u * ow, acy = oy + v * oh;
+        if (caster_arrows != nullptr && caster_arrows->current.enabled)
+        {
+            DrawNativeArrow(acx, acy, ds * 2.0f, yaw, dotColor);
+        }
+        else
+        {
+            float qx = acx - ds * 0.5f, qy = acy - ds * 0.5f, qw = ds, qh = ds;
+            CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
+            R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
+        }
     }
 
     float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
@@ -497,11 +569,34 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
     float fv = -(nY * fdx + nX * fdy) / wH;
     if (fu >= 0.0f && fu <= 1.0f && fv >= 0.0f && fv <= 1.0f)
     {
-        float fs = ds * 1.6f;
-        float fqx = ox + fu * ow - fs * 0.5f, fqy = oy + fv * oh - fs * 0.5f, fqw = fs, fqh = fs;
-        float yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
-        CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
-        R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+        float yellow[4] = {1.0f, 0.85f, 0.1f, 1.0f};
+        // Followed player's yaw from their own entity (viewed clientNum from
+        // the snapshot; player entityNum == clientNum).
+        int snap2 = *reinterpret_cast<volatile int *>(cgBase + 0x24);
+        int vc = (snap2 != 0) ? *reinterpret_cast<volatile int *>(snap2 + 0xec) : -1;
+        float fyaw = 0.0f;
+        bool haveYaw = false;
+        if (vc >= 0 && vc <= 63 && entBase != 0)
+        {
+            const int vent = entBase + vc * 0x1d0;
+            if (*reinterpret_cast<volatile int *>(vent + 0xc4) == 1)
+            {
+                fyaw = *reinterpret_cast<volatile float *>(vent + 0x44);
+                haveYaw = true;
+            }
+        }
+        float fcx = ox + fu * ow, fcy = oy + fv * oh;
+        if (haveYaw && caster_arrows != nullptr && caster_arrows->current.enabled)
+        {
+            DrawNativeArrow(fcx, fcy, ds * 2.6f, fyaw, yellow);
+        }
+        else
+        {
+            float fs = ds * 1.6f;
+            float fqx = fcx - fs * 0.5f, fqy = fcy - fs * 0.5f, fqw = fs, fqh = fs;
+            CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
+            R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+        }
     }
 }
 
@@ -725,6 +820,9 @@ cg::cg()
     caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
         "Fallback DLL draw: dot size (projected units)");
 
+    caster_arrows = Dvar_RegisterBool("caster_arrows", true, 0,
+        "Draw caster blips as native-styled rotated arrows (off: plain square dots)");
+
     // v23 caster radar publisher: DLL publishes the static compass projection
     // basis once per map; GSC uses it for objective markers (and the dots, when
     // they existed).
@@ -736,8 +834,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 30, 0, 100, 0,
-        "Codxe compass hook build marker (v30 -- enemy dots + freecam both-team dots)");
+    Dvar_RegisterInt("compass_hook_v", 32, 0, 100, 0,
+        "Codxe compass hook build marker (v32 -- native-styled rotated arrows for enemy + followed blips)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
