@@ -519,14 +519,29 @@ static void DrawCasterDots(int mode, void *scratch, void *rect, int horzAlign, i
     }
 }
 
+// v25 diagnostics: per-gate counters, published ~1/sec as compass_native_diag
+// from OnCG_DrawActive (Cbuf on the cgame thread, same as PublishCasterBounds).
+// h = hook saw the scMap material blit, f = ValidFollowedPlayer failed,
+// m = compass matrix not ready, d = actor-draw actually invoked.
+static unsigned int s_diagHookHits = 0;
+static unsigned int s_diagFollowFail = 0;
+static unsigned int s_diagMatrixFail = 0;
+static unsigned int s_diagDrawCalls = 0;
+
 static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
         return;
     if (!ValidFollowedPlayer())
+    {
+        ++s_diagFollowFail;
         return;
+    }
     if (!CompassMatrixReady())
+    {
+        ++s_diagMatrixFail;
         return;
+    }
 
     compassRectDef_s rect;
     rect.x = static_cast<float>(compass_native_x->current.integer);
@@ -549,6 +564,8 @@ static void DrawNativeSpecCompass()
         DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
     else
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
+
+    ++s_diagDrawCalls;
 }
 
 // --- v24: R_DrawStretchPic detour -- the spec 2D-pass execution point --------
@@ -587,6 +604,8 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
     const int mapHandle = RegisterCompassMapMaterial();
     if (mapHandle == 0 || material != mapHandle)
         return;
+
+    ++s_diagHookHits;
 
     s_inNativeBlit = true;
     DrawNativeSpecCompass();
@@ -662,8 +681,11 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 24, 0, 100, 0,
-        "Codxe compass hook build marker (v24 -- native blips drawn from the R_DrawStretchPic detour)");
+    Dvar_RegisterString("compass_native_diag", "", 0,
+        "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
+
+    Dvar_RegisterInt("compass_hook_v", 25, 0, 100, 0,
+        "Codxe compass hook build marker (v25 -- gate diagnostics published as compass_native_diag)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -688,6 +710,22 @@ cg::cg()
         {
             ApplyMuzzleFlashState();
             PublishCasterBounds();
+
+            // v25: publish the gate counters ~1/sec while compass_native is
+            // on, so GSC can print them (no console on Xenia/hardware).
+            if (compass_native != nullptr && compass_native->current.enabled)
+            {
+                static unsigned int lastPublish = 0;
+                const unsigned int now = GetTickCount();
+                if (now - lastPublish >= 1000)
+                {
+                    lastPublish = now;
+                    char diag[160];
+                    sprintf_s(diag, "set compass_native_diag h=%u_f=%u_m=%u_d=%u\n",
+                              s_diagHookHits, s_diagFollowFail, s_diagMatrixFail, s_diagDrawCalls);
+                    Cbuf_AddText(0, diag);
+                }
+            }
 
             if (cg_draw_player_info->current.enabled)
             {
