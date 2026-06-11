@@ -337,22 +337,7 @@ void CG_DrawPlayerInfo()
 }
 
 // Engine's own "valid followed player" test, lifted from Function_8231E070's
-// early-out: followedSlot (0x849f3664) must be in [1..count(0x849f3620)] and
-// the player-slot pointer it indexes via 0x849f2df0 + (slot+0x20c)*4 must be
-// live. Local client 0 only.
-static bool ValidFollowedPlayer()
-{
-    int followedSlot = *reinterpret_cast<volatile int *>(0x849F3664u);
-    int idx = followedSlot - 1;
-    int count = *reinterpret_cast<volatile int *>(0x849F3620u);
-    if (idx < 0 || idx >= count)
-        return false;
-    uint32_t slot = *reinterpret_cast<volatile uint32_t *>(
-        0x849F2DF0u + (((uint32_t)followedSlot + 0x20Cu) << 2));
-    if (slot == 0)
-        return false;
-    return *reinterpret_cast<volatile uint32_t *>(slot) != 0;
-}
+// (ValidFollowedPlayer removed in v27 -- falsified by NDIAG, see DrawNativeSpecCompass)
 
 // Native compass actor-blip drawer. Function_82322868 loops the compass-actor
 // array (24 slots, engine-filled every frame from the snapshot) and draws BOTH
@@ -532,11 +517,11 @@ static void DrawNativeSpecCompass()
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
         return;
-    if (!ValidFollowedPlayer())
-    {
-        ++s_diagFollowFail;
-        return;
-    }
+    // v27: ValidFollowedPlayer gate REMOVED. NDIAG h=213 f=213 m=0 d=0 while
+    // actively following proved the 0x849F3664 followedSlot chain is wrong
+    // (hypothesis from a prior session, never validated). The gate guarded
+    // nothing: the draw never uses the followed slot -- CompassDrawActors
+    // reads the engine-filled snapshot actor array with its own guards.
     if (!CompassMatrixReady())
     {
         ++s_diagMatrixFail;
@@ -685,7 +670,7 @@ cg::cg()
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
     Dvar_RegisterInt("compass_hook_v", 26, 0, 100, 0,
-        "Codxe compass hook build marker (v26 -- stretchpic native draw + on-screen gate diagnostics)");
+        "Codxe compass hook build marker (v27 -- follow gate removed, falsified by NDIAG)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
