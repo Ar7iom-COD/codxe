@@ -55,7 +55,8 @@ dvar_s *caster_dot_size = nullptr;
 dvar_s *caster_publish = nullptr;
 
 // Forward declaration: drawn from the R_DrawStretchPic detour (v24).
-static void DrawNativeSpecCompass();
+// v28: takes the hooked scMap blit rect (final screen coords).
+static void DrawNativeSpecCompass(float bx, float by, float bw, float bh);
 
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
@@ -513,7 +514,18 @@ static unsigned int s_diagFollowFail = 0;
 static unsigned int s_diagMatrixFail = 0;
 static unsigned int s_diagDrawCalls = 0;
 
-static void DrawNativeSpecCompass()
+// v28 geometry fix. v27 arrows drew but landed outside the scMap: the rect
+// dvars went through hudelem-independent placement (virtual coords + align
+// enum) while the scMap hudelem has its own placement -- two pipelines, two
+// rects. Ghidra: FUN_822b36e8 align case 5 is a pure identity (skips every
+// transform), and the R_DrawStretchPic hook already receives the scMap blit's
+// FINAL screen rect. So we feed that rect straight through with align 5/5 --
+// map and arrows then share one transform chain and land inside the scMap
+// quad by construction. CompassProject (82323E28) aspect-fits the world
+// aspect into the rect + insets the border; that reshape applies identically
+// to the native map bg and the arrows, so they stay mutually aligned. The
+// compass_native_x/y/size/align dvars are inert as of v28.
+static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
 {
     if (compass_native == nullptr || !compass_native->current.enabled)
         return;
@@ -529,12 +541,12 @@ static void DrawNativeSpecCompass()
     }
 
     compassRectDef_s rect;
-    rect.x = static_cast<float>(compass_native_x->current.integer);
-    rect.y = static_cast<float>(compass_native_y->current.integer);
-    rect.w = static_cast<float>(compass_native_size->current.integer);
-    rect.h = static_cast<float>(compass_native_size->current.integer);
-    rect.horzAlign = compass_native_align->current.integer;
-    rect.vertAlign = compass_native_align->current.integer;
+    rect.x = bx;
+    rect.y = by;
+    rect.w = bw;
+    rect.h = bh;
+    rect.horzAlign = 5; // identity placement (FUN_822b36e8 case 5)
+    rect.vertAlign = 5;
 
     compassRectDef_s scratch = {0.0f, 0.0f, 0.0f, 0.0f, 0, 0};
 
@@ -593,7 +605,7 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
     ++s_diagHookHits;
 
     s_inNativeBlit = true;
-    DrawNativeSpecCompass();
+    DrawNativeSpecCompass(x, y, w, h);
     s_inNativeBlit = false;
 }
 
@@ -638,8 +650,8 @@ cg::cg()
     // drawn from the R_DrawStretchPic detour when the GSC scMap blit is seen.
     compass_native = Dvar_RegisterBool("compass_native", false, 0,
         "Draw native engine compass blips over the GSC caster map (set by GSC while casting)");
-    compass_native_bg = Dvar_RegisterBool("compass_native_bg", false, 0,
-        "Also draw the native compass map texture under the blips (off: GSC scMap is the backdrop)");
+    compass_native_bg = Dvar_RegisterBool("compass_native_bg", true, 0,
+        "Draw the native compass map texture under the blips, aspect-fitted like the arrows (v28 default on)");
     compass_native_mode = Dvar_RegisterInt("compass_native_mode", 1, 0, 1, 0,
         "Native spec compass projection: 0=player-centered, 1=static full-map");
     compass_native_x = Dvar_RegisterInt("compass_native_x", 16, -2000, 2000, 0,
@@ -669,8 +681,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 27, 0, 100, 0,
-        "Codxe compass hook build marker (v27 -- follow gate removed, falsified by NDIAG)");
+    Dvar_RegisterInt("compass_hook_v", 28, 0, 100, 0,
+        "Codxe compass hook build marker (v28 -- map+arrows share the hooked blit rect, align 5 identity)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
