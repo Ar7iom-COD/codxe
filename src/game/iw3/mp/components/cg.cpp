@@ -349,6 +349,17 @@ typedef void (*CompassDrawActors_fn_t)(int, int, void *, void *, float *);
 static CompassDrawActors_fn_t const CompassDrawActors_fn =
     reinterpret_cast<CompassDrawActors_fn_t>(0x82322868u);
 
+// v39: native viewed-player arrow drawer (ownerdraw 0xb7 case in dispatcher
+// 82307B28). Mode 1 projects the FOLLOWED position cg+0x478e0 through the
+// engine's own projector (FUN_82323740), rotates by refdef yaw cg+0x4b964
+// (per-frame smooth, unlike the snapshot-stepped entity yaw), sizes from the
+// native compass dvars, draws via the icon wrapper 82318A88. Args mirror the
+// dispatcher call: r3 client, r4 mode, r5 scratch, r6 rect, r7 material,
+// r8 color (alpha read at +0xc).
+typedef void (*CompassDrawPlayer_fn_t)(int, int, void *, void *, int, float *);
+static CompassDrawPlayer_fn_t const CompassDrawPlayer_fn =
+    reinterpret_cast<CompassDrawPlayer_fn_t>(0x82324C08u);
+
 // R_RegisterMaterial(type, name) -> handle. type 4 = 2D/UI material.
 typedef int (*R_RegisterMaterial_fn_t)(int, const char *);
 static R_RegisterMaterial_fn_t const R_RegisterMaterial_fn =
@@ -529,11 +540,13 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
             ++b;
         while (*b == ' ')
             ++b;
+        ++s_diagBlipParsed;
         if (id < 0 || id > 63)
             continue;
         const int ent = entBase + id * 0x1d0;
         if (*reinterpret_cast<volatile int *>(ent + 0xc4) != 1)
             continue;
+        ++s_diagBlipEntValid;
         float px = *reinterpret_cast<volatile float *>(ent + 0x1c);
         float py = *reinterpret_cast<volatile float *>(ent + 0x20);
 
@@ -566,6 +579,7 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
         static const float pingWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         const float *tint = usePing ? pingWhite : dotColor;
+        ++s_diagBlipDrawn;
         R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, tint, dotMat);
     }
 
@@ -576,32 +590,67 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
     if (fu >= 0.0f && fu <= 1.0f && fv >= 0.0f && fv <= 1.0f)
     {
         float yellow[4] = {1.0f, 0.85f, 0.1f, 1.0f};
-        // Followed player's yaw from their own entity (viewed clientNum from
-        // the snapshot; player entityNum == clientNum).
-        int snap2 = *reinterpret_cast<volatile int *>(cgBase + 0x24);
-        int vc = (snap2 != 0) ? *reinterpret_cast<volatile int *>(snap2 + 0xec) : -1;
-        float fyaw = 0.0f;
-        bool haveYaw = false;
-        if (vc >= 0 && vc <= 63 && entBase != 0)
+        float fcx = ox + fu * ow, fcy = oy + fv * oh;
+        const bool wantArrow = (caster_arrows != nullptr && caster_arrows->current.enabled);
+
+        // v39: NATIVE viewed-player arrow -- the exact menu-compass look,
+        // engine-projected and refdef-yaw-rotated every frame. The arrow
+        // material is menu-defined (no name in the xex string table), so
+        // probe candidates once, sentinel-guarded; white tint preserves the
+        // texture's own yellow. All probes missing -> the previous
+        // hand-rotated arrow stays as fallback.
+        static int s_playerArrowMat = -2; // -2 unprobed, 0 = none found
+        if (s_playerArrowMat == -2)
         {
-            const int vent = entBase + vc * 0x1d0;
-            if (*reinterpret_cast<volatile int *>(vent + 0xc4) == 1)
+            static int s_missing2 = -1;
+            if (s_missing2 == -1)
+                s_missing2 = R_RegisterMaterial_fn(4, "codxe_no_such_material");
+            static const char *const cands[] = {"compass_arrow", "compassping_player", "compass_player_arrow"};
+            s_playerArrowMat = 0;
+            for (int ci = 0; ci < 3; ++ci)
             {
-                fyaw = *reinterpret_cast<volatile float *>(vent + 0x44);
-                haveYaw = true;
+                const int m = R_RegisterMaterial_fn(4, cands[ci]);
+                if (m != 0 && m != s_missing2)
+                {
+                    s_playerArrowMat = m;
+                    break;
+                }
             }
         }
-        float fcx = ox + fu * ow, fcy = oy + fv * oh;
-        if (haveYaw && caster_arrows != nullptr && caster_arrows->current.enabled)
+
+        if (wantArrow && s_playerArrowMat != 0)
         {
-            DrawNativeArrow(fcx, fcy, ds * 2.6f, fyaw, yellow);
+            static float arrowWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            arrowWhite[3] = 1.0f; // alpha read at +0xc; mode 1 skips the fade
+            CompassDrawPlayer_fn(0, mode, scratch, rect, s_playerArrowMat, arrowWhite);
         }
-        else
+        else if (wantArrow)
         {
-            float fs = ds * 1.6f;
-            float fqx = fcx - fs * 0.5f, fqy = fcy - fs * 0.5f, fqw = fs, fqh = fs;
-            CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
-            R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+            // fallback: snapshot-yaw hand-rotated arrow (pre-v39 path)
+            int snap2 = *reinterpret_cast<volatile int *>(cgBase + 0x24);
+            int vc = (snap2 != 0) ? *reinterpret_cast<volatile int *>(snap2 + 0xec) : -1;
+            float fyaw = 0.0f;
+            bool haveYaw = false;
+            if (vc >= 0 && vc <= 63 && entBase != 0)
+            {
+                const int vent = entBase + vc * 0x1d0;
+                if (*reinterpret_cast<volatile int *>(vent + 0xc4) == 1)
+                {
+                    fyaw = *reinterpret_cast<volatile float *>(vent + 0x44);
+                    haveYaw = true;
+                }
+            }
+            if (haveYaw)
+            {
+                DrawNativeArrow(fcx, fcy, ds * 2.6f, fyaw, yellow);
+            }
+            else
+            {
+                float fs = ds * 1.6f;
+                float fqx = fcx - fs * 0.5f, fqy = fcy - fs * 0.5f, fqw = fs, fqh = fs;
+                CompassMatrixXform_fn(matrix, &fqx, &fqy, &fqw, &fqh, horzAlign, vertAlign);
+                R_DrawStretchPic_fn(fqx, fqy, fqw, fqh, 0.0f, 0.0f, 1.0f, 1.0f, yellow, s_whiteMat);
+            }
         }
     }
 }
@@ -736,6 +785,14 @@ static unsigned int s_diagHookHits = 0;
 static unsigned int s_diagFollowFail = 0;
 static unsigned int s_diagMatrixFail = 0;
 static unsigned int s_diagDrawCalls = 0;
+// v40: projection diag. wb = world-bounds width as int (0 = bounds block
+// never initialized -- the lazy-init theory), bp = blip ids parsed last
+// frame, be = entities valid (type==1), bd = dots actually drawn (survived
+// the u/v cull). bp>0 be>0 bd=0 wb sane => projection math; wb=0 => bounds
+// uninitialized; be=0 => entity resolve.
+static int s_diagBlipParsed = 0;
+static int s_diagBlipEntValid = 0;
+static int s_diagBlipDrawn = 0;
 
 // v28 geometry fix. v27 arrows drew but landed outside the scMap: the rect
 // dvars went through hudelem-independent placement (virtual coords + align
@@ -844,6 +901,9 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
             ++s_diagHookHits;
 
             s_inNativeBlit = true;
+            s_diagBlipParsed = 0;
+            s_diagBlipEntValid = 0;
+            s_diagBlipDrawn = 0;
             DrawNativeSpecCompass(x, y, w, h);
             s_inNativeBlit = false;
             return;
@@ -928,8 +988,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 38, 0, 100, 0,
-        "Codxe compass hook build marker (v38 -- ping texture + blip-feed diag in NDIAG)");
+    Dvar_RegisterInt("compass_hook_v", 40, 0, 100, 0,
+        "Codxe compass hook build marker (v40 -- v39 + projection diag wb/bp/be/bd)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -981,12 +1041,14 @@ cg::cg()
                 }
                 const char *dgAl = Dvar_GetString("caster_blips_al");
                 const char *dgAx = Dvar_GetString("caster_blips_ax");
-                char ndiag[200];
-                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d al=%d ax=%d tm=%d",
+                const int dgCg2 = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+                const int dgWb = static_cast<int>(*reinterpret_cast<volatile float *>(dgCg2 + 0x4e488));
+                char ndiag[240];
+                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d",
                           s_diagAnyHits, s_diagHookHits, s_diagDrawCalls, RegisterCompassMapMaterial(),
                           dgAl ? static_cast<int>(strlen(dgAl)) : -1,
                           dgAx ? static_cast<int>(strlen(dgAx)) : -1,
-                          dgTeam);
+                          dgTeam, dgWb, s_diagBlipParsed, s_diagBlipEntValid, s_diagBlipDrawn);
                 static Font_s *ndiagFont = R_RegisterFont("fonts/consoleFont");
                 float ndiagCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
                 R_AddCmdDrawText(ndiag, 128, ndiagFont, 10.f, 150.f, 1.0f, 1.0f, 0.0f, ndiagCol, 0);
