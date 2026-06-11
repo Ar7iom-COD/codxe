@@ -543,24 +543,12 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor,
         if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
             continue;
 
-        // v32: entity yaw. ASSUMPTION flagged: apos.trBase yaw at ent+0x44,
-        // inferred from pos.trBase at +0x1c and trajectory_t pair layout --
-        // not yet read in Ghidra. Visual check: arrows tracking aim = right;
-        // random spin = wrong offset (fall back to dots by clearing
-        // caster_arrows).
-        float yaw = *reinterpret_cast<volatile float *>(ent + 0x44);
-
+        // v34: reference layout -- enemy blips are DOTS (UAV style), not
+        // arrows. (The v32 enemy arrows worked; restyled by request.)
         float acx = ox + u * ow, acy = oy + v * oh;
-        if (caster_arrows != nullptr && caster_arrows->current.enabled)
-        {
-            DrawNativeArrow(acx, acy, ds * 2.0f, yaw, dotColor);
-        }
-        else
-        {
-            float qx = acx - ds * 0.5f, qy = acy - ds * 0.5f, qw = ds, qh = ds;
-            CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
-            R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
-        }
+        float qx = acx - ds * 0.5f, qy = acy - ds * 0.5f, qw = ds, qh = ds;
+        CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
+        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, dotColor, s_whiteMat);
     }
 
     float fdx = *reinterpret_cast<volatile float *>(cgBase + 0x478e0) - wOx;
@@ -652,10 +640,71 @@ static void DrawEnemyDots(int mode, void *scratch, void *rect, int horzAlign, in
     }
 }
 
+// v34 objective icons. GSC publishes "x y material " triples in caster_objs
+// once per map (bomb sites / dom flags / hq radios; compass_waypoint_*
+// materials are precached by the gametype scripts, so R_RegisterMaterial
+// resolves them by name -- a wrong name returns 0 and that icon is silently
+// skipped). Projection identical to the player blips.
+static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
+{
+    int cgBase = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+
+    float ox = 0.0f, oy = 0.0f, ow = 0.0f, oh = 0.0f;
+    CompassProject_fn(mode, cgBase, scratch, rect, &ox, &oy, &ow, &oh);
+
+    float nX = *reinterpret_cast<volatile float *>(cgBase + 0x4e478);
+    float nY = *reinterpret_cast<volatile float *>(cgBase + 0x4e474);
+    float wOx = *reinterpret_cast<volatile float *>(cgBase + 0x4e480);
+    float wOy = *reinterpret_cast<volatile float *>(cgBase + 0x4e484);
+    float wW = *reinterpret_cast<volatile float *>(cgBase + 0x4e488);
+    float wH = *reinterpret_cast<volatile float *>(cgBase + 0x4e48c);
+    if (wW == 0.0f || wH == 0.0f)
+        return;
+
+    float *matrix = reinterpret_cast<float *>(0x8246F308u);
+    const float iconSize = static_cast<float>(caster_dot_size->current.integer) * 2.6f;
+    static const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+    const char *b = Dvar_GetString("caster_objs");
+    while (b != nullptr && *b != '\0')
+    {
+        float px = static_cast<float>(atof(b));
+        while (*b != '\0' && *b != ' ') ++b;
+        while (*b == ' ') ++b;
+        if (*b == '\0') break;
+        float py = static_cast<float>(atof(b));
+        while (*b != '\0' && *b != ' ') ++b;
+        while (*b == ' ') ++b;
+        if (*b == '\0') break;
+        char name[64];
+        int k = 0;
+        while (*b != '\0' && *b != ' ' && k < 63)
+            name[k++] = *b++;
+        name[k] = '\0';
+        while (*b == ' ') ++b;
+
+        const int mat = R_RegisterMaterial_fn(4, name);
+        if (mat == 0)
+            continue;
+
+        float dx = px - wOx, dy = py - wOy;
+        float u = (nX * dx - nY * dy) / wW;
+        float v = -(nY * dx + nX * dy) / wH;
+        if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f)
+            continue;
+
+        float qx = ox + u * ow - iconSize * 0.5f, qy = oy + v * oh - iconSize * 0.5f;
+        float qw = iconSize, qh = iconSize;
+        CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
+        R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, white, mat);
+    }
+}
+
 // v25 diagnostics: per-gate counters, published ~1/sec as compass_native_diag
 // from OnCG_DrawActive (Cbuf on the cgame thread, same as PublishCasterBounds).
 // h = hook saw the scMap material blit, f = ValidFollowedPlayer failed,
 // m = compass matrix not ready, d = actor-draw actually invoked.
+static unsigned int s_diagAnyHits = 0;   // v33: hook entered at all (any material)
 static unsigned int s_diagHookHits = 0;
 static unsigned int s_diagFollowFail = 0;
 static unsigned int s_diagMatrixFail = 0;
@@ -709,6 +758,9 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
     else
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
 
+    // v34: objective icons under the player blips.
+    DrawObjectiveIcons(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
+
     // v29: enemy team as red dots, composited over the native arrows.
     DrawEnemyDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
@@ -741,22 +793,37 @@ static bool s_inNativeBlit = false;
 void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t0, float s1, float t1,
                            const float *color, int material)
 {
+    ++s_diagAnyHits;
+
+    if (!s_inNativeBlit && compass_native != nullptr && compass_native->current.enabled)
+    {
+        const int mapHandle = RegisterCompassMapMaterial();
+        if (mapHandle != 0 && material == mapHandle)
+        {
+            // v35: real UI menu open (pause/options/team/class). CL_KeyEvent
+            // (822DD1E8) gates all menu key routing on KEYCATCH_UI = bit 0x10
+            // of the catcher word at 0x82435a18 + client*0x24; the engine
+            // sets it for every Menus_OpenByName-style menu and clears it on
+            // close (plain spectate = 0 -- the v17 lesson). While set, the
+            // whole caster compass leaks over the menu, so SWALLOW the scMap
+            // blit itself: skip the original call and every composite layer.
+            // Frame-perfect, no GSC involvement.
+            const uint32_t catchers = *reinterpret_cast<volatile uint32_t *>(0x82435a18u);
+            if ((catchers & 0x10u) != 0)
+                return;
+
+            R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t0, s1, t1, color, material);
+
+            ++s_diagHookHits;
+
+            s_inNativeBlit = true;
+            DrawNativeSpecCompass(x, y, w, h);
+            s_inNativeBlit = false;
+            return;
+        }
+    }
+
     R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t0, s1, t1, color, material);
-
-    if (s_inNativeBlit)
-        return;
-    if (compass_native == nullptr || !compass_native->current.enabled)
-        return;
-
-    const int mapHandle = RegisterCompassMapMaterial();
-    if (mapHandle == 0 || material != mapHandle)
-        return;
-
-    ++s_diagHookHits;
-
-    s_inNativeBlit = true;
-    DrawNativeSpecCompass(x, y, w, h);
-    s_inNativeBlit = false;
 }
 
 cg::cg()
@@ -834,8 +901,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 32, 0, 100, 0,
-        "Codxe compass hook build marker (v32 -- native-styled rotated arrows for enemy + followed blips)");
+    Dvar_RegisterInt("compass_hook_v", 35, 0, 100, 0,
+        "Codxe compass hook build marker (v35 -- compass hidden while UI menus are open)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -866,9 +933,9 @@ cg::cg()
             // PDIAG runs). The Cbuf publish below stays for the GSC print.
             if (compass_native != nullptr && compass_native->current.enabled)
             {
-                char ndiag[128];
-                sprintf_s(ndiag, "NDIAG h=%u f=%u m=%u d=%u",
-                          s_diagHookHits, s_diagFollowFail, s_diagMatrixFail, s_diagDrawCalls);
+                char ndiag[160];
+                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u d=%u mh=%d",
+                          s_diagAnyHits, s_diagHookHits, s_diagDrawCalls, RegisterCompassMapMaterial());
                 static Font_s *ndiagFont = R_RegisterFont("fonts/consoleFont");
                 float ndiagCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
                 R_AddCmdDrawText(ndiag, 128, ndiagFont, 10.f, 150.f, 1.0f, 1.0f, 0.0f, ndiagCol, 0);
