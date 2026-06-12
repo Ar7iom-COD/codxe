@@ -1,4 +1,3 @@
-
 /**
  * Load Singleplayer maps in Multiplayer.
  *  Inspiration
@@ -438,12 +437,59 @@ const ZoneOverride ZONE_OVERRIDES[] = {
 
 int g_zoneOverrideIndex = -1;
 
+// IW3 localize asset: { value, name }. Log prints both fields so the
+// Xenia log itself confirms the layout on first run.
+struct LocalizeEntry_
+{
+    const char *value;
+    const char *name;
+};
+
+static const char LOC_OLDSCHOOL_NEW[] = "Promod Live 2.11";
+static const char LOC_HARDCORE_NEW[]  = "Practice";
+
+static void Localize_Override(XAssetEntry *entry)
+{
+    LocalizeEntry_ *loc = reinterpret_cast<LocalizeEntry_ *>(entry->asset.header.data);
+    if (!loc || !loc->value || !loc->name)
+        return;
+
+    if (strcmp(loc->value, "Old School Mode") == 0)
+    {
+        DbgPrint("LOC swap: key=%s old=[%s] new=[%s]\n", loc->name, loc->value, LOC_OLDSCHOOL_NEW);
+        loc->value = LOC_OLDSCHOOL_NEW;
+    }
+    else if (strcmp(loc->value, "Hardcore Mode") == 0)
+    {
+        DbgPrint("LOC swap: key=%s old=[%s] new=[%s]\n", loc->name, loc->value, LOC_HARDCORE_NEW);
+        loc->value = LOC_HARDCORE_NEW;
+    }
+    else if (strstr(loc->value, "Old School") || strstr(loc->value, "Hardcore"))
+    {
+        // Near-miss: label text differs from our exact match. Log key+value for v2.
+        DbgPrint("LOC near-miss: key=%s value=[%s]\n", loc->name, loc->value);
+    }
+}
+
 Detour DB_LinkXAssetEntry_Detour;
 XAssetEntry *DB_LinkXAssetEntry_Hook(XAssetEntry *newEntry, int allowOverride)
 {
     XAsset xasset;
     xasset.type = newEntry->asset.type;
     xasset.header = newEntry->asset.header;
+
+    if (newEntry->asset.type == ASSET_TYPE_LOCALIZE_ENTRY)
+        Localize_Override(newEntry);
+
+    // TEMP evidence pass: find CoD4 / Infinity Ward logo material names for
+    // the GSC shoutcaster HUD (precacheShader/setShader). Remove once known.
+    if (newEntry->asset.type == ASSET_TYPE_MATERIAL)
+    {
+        // Material starts with MaterialInfo { const char *name; ... }
+        const char *mtlName = *reinterpret_cast<const char **>(newEntry->asset.header.data);
+        if (mtlName && (strstr(mtlName, "logo") || strstr(mtlName, "infinity") || strstr(mtlName, "iw_")))
+            DbgPrint("MTL: %s\n", mtlName);
+    }
 
     if (mpsp::is_sp_map)
     {
