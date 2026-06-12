@@ -43,6 +43,7 @@ dvar_s *caster_dots = nullptr;
 dvar_s *caster_dot_size = nullptr;
 dvar_s *caster_arrows = nullptr;
 dvar_s *caster_font = nullptr;    // v51: stat-table font index (0-6)
+dvar_s *caster_obj_size = nullptr; // v52: objective icon size, decoupled from dots
 
 // v23 caster radar: GSC draws, DLL publishes. events.h exposes only
 // OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
@@ -642,20 +643,6 @@ static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const 
     R_DrawRotQuad_fn(c, color, s_arrowMat);
 }
 
-// v40: projection diag. wb = world-bounds width as int (0 = bounds block
-// never initialized -- the lazy-init theory), bp = blip ids parsed last
-// frame, be = entities valid (type==1), bd = dots actually drawn (survived
-// the u/v cull). bp>0 be>0 bd=0 wb sane => projection math; wb=0 => bounds
-// uninitialized; be=0 => entity resolve.
-static int s_diagBlipParsed = 0;
-static int s_diagBlipEntValid = 0;
-static int s_diagBlipDrawn = 0;
-// v42: first two drawn dots' map-space u/v as percent (0..100). Splits the
-// SD mystery: counters said 5 dots submitted while the map looked clean, so
-// either they cluster at one point (stale origins -> u0==u1) or they land
-// at sane distinct spots (contrast problem, not logic).
-static int s_diagU0 = -1, s_diagV0 = -1, s_diagU1 = -1, s_diagV1 = -1;
-
 static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool nativePing,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
@@ -699,13 +686,11 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
             ++b;
         while (*b == ' ')
             ++b;
-        ++s_diagBlipParsed;
         if (id < 0 || id > 63)
             continue;
         const int ent = entBase + id * 0x1d0;
         if (*reinterpret_cast<volatile int *>(ent + 0xc4) != 1)
             continue;
-        ++s_diagBlipEntValid;
         float px = *reinterpret_cast<volatile float *>(ent + 0x1c);
         float py = *reinterpret_cast<volatile float *>(ent + 0x20);
 
@@ -734,17 +719,6 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         CompassMatrixXform_fn(matrix, &qx, &qy, &qw, &qh, horzAlign, vertAlign);
         static const float pingWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         const float *tint = usePing ? pingWhite : dotColor;
-        if (s_diagBlipDrawn == 0)
-        {
-            s_diagU0 = static_cast<int>(u * 100.0f);
-            s_diagV0 = static_cast<int>(v * 100.0f);
-        }
-        else if (s_diagBlipDrawn == 1)
-        {
-            s_diagU1 = static_cast<int>(u * 100.0f);
-            s_diagV1 = static_cast<int>(v * 100.0f);
-        }
-        ++s_diagBlipDrawn;
         R_DrawStretchPic_fn(qx, qy, qw, qh, 0.0f, 0.0f, 1.0f, 1.0f, tint, dotMat);
     }
 
@@ -882,7 +856,10 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         return;
 
     float *matrix = reinterpret_cast<float *>(0x8246F308u);
-    const float iconSize = static_cast<float>(caster_dot_size->current.integer) * 2.6f;
+    // v52: decoupled from caster_dot_size (was x2.6 of it -- the v98 dot
+    // bump ballooned every objective icon incl. the bomb). Absolute size.
+    const float iconSize = static_cast<float>(
+        (caster_obj_size != nullptr) ? caster_obj_size->current.integer : 24);
     static const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     const char *b = Dvar_GetString("caster_objs");
@@ -1041,16 +1018,6 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
     }
 }
 
-// v25 diagnostics: per-gate counters, published ~1/sec as compass_native_diag
-// from OnCG_DrawActive (Cbuf on the cgame thread, same as PublishCasterBounds).
-// h = hook saw the scMap material blit, f = ValidFollowedPlayer failed,
-// m = compass matrix not ready, d = actor-draw actually invoked.
-static unsigned int s_diagAnyHits = 0;   // v33: hook entered at all (any material)
-static unsigned int s_diagHookHits = 0;
-static unsigned int s_diagFollowFail = 0;
-static unsigned int s_diagMatrixFail = 0;
-static unsigned int s_diagDrawCalls = 0;
-
 // v28 geometry fix. v27 arrows drew but landed outside the scMap: the rect
 // dvars went through hudelem-independent placement (virtual coords + align
 // enum) while the scMap hudelem has its own placement -- two pipelines, two
@@ -1072,10 +1039,7 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
     // nothing: the draw never uses the followed slot -- CompassDrawActors
     // reads the engine-filled snapshot actor array with its own guards.
     if (!CompassMatrixReady())
-    {
-        ++s_diagMatrixFail;
         return;
-    }
 
     compassRectDef_s rect;
     rect.x = bx;
@@ -1105,7 +1069,6 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
     // v29: enemy team as red dots, composited over the native arrows.
     DrawEnemyDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
 
-    ++s_diagDrawCalls;
 }
 
 // --- v24: R_DrawStretchPic detour -- the spec 2D-pass execution point --------
@@ -1134,8 +1097,6 @@ static bool s_inNativeBlit = false;
 void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t0, float s1, float t1,
                            const float *color, int material)
 {
-    ++s_diagAnyHits;
-
     if (!s_inNativeBlit && compass_native != nullptr && compass_native->current.enabled)
     {
         const int mapHandle = RegisterCompassMapMaterial();
@@ -1155,13 +1116,7 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
 
             R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t0, s1, t1, color, material);
 
-            ++s_diagHookHits;
-
             s_inNativeBlit = true;
-            s_diagBlipParsed = 0;
-            s_diagBlipEntValid = 0;
-            s_diagBlipDrawn = 0;
-            s_diagU0 = -1; s_diagV0 = -1; s_diagU1 = -1; s_diagV1 = -1;
             DrawNativeSpecCompass(x, y, w, h);
             s_inNativeBlit = false;
             return;
@@ -1232,6 +1187,9 @@ cg::cg()
     caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
         "Fallback DLL draw: dot size (projected units)");
 
+    caster_obj_size = Dvar_RegisterInt("caster_obj_size", 24, 4, 96, 0,
+        "Caster objective icon size (sites, flags, radios, bomb), projected units");
+
     caster_font = Dvar_RegisterInt("caster_font", 0, 0, 6, 0,
         "Stat table font: 0 console 1 small 2 normal 3 bold 4 objective 5 big 6 extraBig");
 
@@ -1265,11 +1223,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
-        "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
-
-    Dvar_RegisterInt("compass_hook_v", 51, 0, 100, 0,
-        "Codxe compass hook build marker (v51 -- selectable stat-table font)");
+    Dvar_RegisterInt("compass_hook_v", 53, 0, 100, 0,
+        "Codxe compass hook build marker (v53 -- NDIAG closed; font + obj icon size)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1294,63 +1249,6 @@ cg::cg()
         {
             ApplyMuzzleFlashState();
             PublishCasterBounds();
-
-            // v26: counters drawn on screen directly (R_AddCmdDrawText from
-            // OnCG_DrawActive renders in plain follow-spec -- proven by the
-            // PDIAG runs). The Cbuf publish below stays for the GSC print.
-            if (compass_native != nullptr && compass_native->current.enabled)
-            {
-                // v38 blip diag: al/ax = caster_blips_* string lengths (0 =
-                // GSC publisher empty), tm = followed clientinfo team
-                // (1 axis / 2 allies / 0,3 freecam-invalid). Splits "nothing
-                // on compass" between the GSC feed and the DLL team pick.
-                int dgTeam = -1;
-                {
-                    const int dgCg = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
-                    const int dgSnap = *reinterpret_cast<volatile int *>(dgCg + 0x24);
-                    if (dgSnap != 0)
-                    {
-                        const int dgIdx = *reinterpret_cast<volatile int *>(dgSnap + 0xec);
-                        if (dgIdx >= 0 && dgIdx <= 63)
-                        {
-                            const int dgInfo = dgIdx * 0x4e4 + dgCg;
-                            if (*reinterpret_cast<volatile int *>(dgInfo + 0xe8f58) != 0)
-                                dgTeam = *reinterpret_cast<volatile int *>(dgInfo + 0xe8f84);
-                        }
-                    }
-                }
-                const char *dgAl = Dvar_GetString("caster_blips_al");
-                const char *dgAx = Dvar_GetString("caster_blips_ax");
-                const int dgCg2 = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
-                const int dgWb = static_cast<int>(*reinterpret_cast<volatile float *>(dgCg2 + 0x4e488));
-                char ndiag[240];
-                // v43: a/h restored -- v42 dropped them and the frozen-counter
-                // ambiguity returned immediately (identical u0/u1 across maps
-                // could not be told apart from live clustered dots). a = hook
-                // entered at all, h = scMap material matched. h FROZEN while
-                // spectating with the map visible = match branch dead (gate /
-                // material); h LIVE = pipeline running, read bd and u0/u1.
-                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d u0=%d,%d u1=%d,%d",
-                          s_diagAnyHits, s_diagHookHits,
-                          dgAl ? static_cast<int>(strlen(dgAl)) : -1,
-                          dgAx ? static_cast<int>(strlen(dgAx)) : -1,
-                          dgTeam, dgWb, s_diagBlipParsed, s_diagBlipEntValid, s_diagBlipDrawn,
-                          s_diagU0, s_diagV0, s_diagU1, s_diagV1);
-                static Font_s *ndiagFont = R_RegisterFont("fonts/consoleFont");
-                float ndiagCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
-                R_AddCmdDrawText(ndiag, 128, ndiagFont, 10.f, 150.f, 1.0f, 1.0f, 0.0f, ndiagCol, 0);
-
-                static unsigned int lastPublish = 0;
-                const unsigned int now = GetTickCount();
-                if (now - lastPublish >= 1000)
-                {
-                    lastPublish = now;
-                    char diag[160];
-                    sprintf_s(diag, "set compass_native_diag h=%u_f=%u_m=%u_d=%u\n",
-                              s_diagHookHits, s_diagFollowFail, s_diagMatrixFail, s_diagDrawCalls);
-                    Cbuf_AddText(0, diag);
-                }
-            }
 
             if (cg_draw_player_info->current.enabled)
             {
