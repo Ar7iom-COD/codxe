@@ -70,6 +70,13 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh);
 // Coordinate space is the R_AddCmdDrawText space (~1024x768 virtual,
 // calibrated against the NDIAG line at 10,150).
 // ============================================================================
+// v47: frame counter (ticks in OnCG_DrawActive) + the frame the caster
+// map composite last drew. Stats render only while the map is live on
+// screen, so they can never outlive the overlay (the death-screen /
+// gameplay leak). Declared here, above DrawCasterStats, for /W4 /WX.
+static unsigned int s_frameCounter = 0;
+static unsigned int s_lastMapBlitFrame = 0;
+
 dvar_s *caster_stats_xl = nullptr;
 dvar_s *caster_stats_xr = nullptr;
 dvar_s *caster_stats_y = nullptr;
@@ -501,12 +508,6 @@ static bool CompassMatrixReady()
 // few seconds after map load.
 static char s_mapMatLastName[160] = {0};
 static int s_mapMatHandle = 0;
-// v47: frame counter (ticks in OnCG_DrawActive) + the frame the caster
-// map composite last drew. Stats render only while the map is live on
-// screen, so they can never outlive the overlay (the death-screen /
-// gameplay leak).
-static unsigned int s_frameCounter = 0;
-static unsigned int s_lastMapBlitFrame = 0;
 static int s_pingMat = 0;           // hoisted from DrawEnemyDots (v46)
 static int s_playerArrowMat = -2;   // hoisted; -2 unprobed, 0 none found
 
