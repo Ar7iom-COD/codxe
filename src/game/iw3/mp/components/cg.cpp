@@ -59,6 +59,73 @@ dvar_s *caster_publish = nullptr;
 // v28: takes the hooked scMap blit rect (final screen coords).
 static void DrawNativeSpecCompass(float bx, float by, float bw, float bh);
 
+// ============================================================================
+// v45 caster stat columns. ZERO hudelems: GSC publishes 10 pipe-separated row
+// strings ("k/d/p r.rr") in caster_stats, this draws them as screen text from
+// OnCG_DrawActive (the NDIAG-proven path -- renders in plain follow-spec).
+// Rows 0-4 = allies column (left of screen, right of the HP bars), rows 5-9 =
+// axis column (left of the right-side bars). Empty field = row hidden. GSC
+// publishes "" when the shoutcaster overlay is off, which is the on/off gate.
+// Positions are dvars so alignment tuning is a GSC redeploy, not a rebuild.
+// Coordinate space is the R_AddCmdDrawText space (~1024x768 virtual,
+// calibrated against the NDIAG line at 10,150).
+// ============================================================================
+dvar_s *caster_stats_xl = nullptr;
+dvar_s *caster_stats_xr = nullptr;
+dvar_s *caster_stats_y = nullptr;
+dvar_s *caster_stats_dy = nullptr;
+
+static void DrawCasterStats()
+{
+    const char *s = Dvar_GetString("caster_stats");
+    if (s == nullptr || *s == '\0')
+        return;
+
+    // Same menu gate as the scMap blit swallow (v35): KEYCATCH_UI bit set =
+    // a real engine menu is open, draw nothing over it.
+    const uint32_t catchers = *reinterpret_cast<volatile uint32_t *>(0x82435a18u);
+    if ((catchers & 0x10u) != 0)
+        return;
+
+    static Font_s *statFont = R_RegisterFont("fonts/consoleFont");
+    static const float statCol[4] = {1.0f, 1.0f, 1.0f, 0.9f};
+
+    const float xl = static_cast<float>(caster_stats_xl->current.integer);
+    const float xr = static_cast<float>(caster_stats_xr->current.integer);
+    const float y0 = static_cast<float>(caster_stats_y->current.integer);
+    const float dy = static_cast<float>(caster_stats_dy->current.integer);
+
+    int row = 0;
+    const char *p = s;
+    while (row < 10)
+    {
+        // Extract field [p, q) up to '|' or end.
+        const char *q = p;
+        while (*q != '\0' && *q != '|')
+            ++q;
+
+        if (q > p)
+        {
+            char field[48];
+            int n = static_cast<int>(q - p);
+            if (n > 47)
+                n = 47;
+            for (int i = 0; i < n; ++i)
+                field[i] = p[i];
+            field[n] = '\0';
+
+            const float fx = (row < 5) ? xl : xr;
+            const float fy = y0 + static_cast<float>(row % 5) * dy;
+            R_AddCmdDrawText(field, 48, statFont, fx, fy, 1.0f, 1.0f, 0.0f, statCol, 0);
+        }
+
+        if (*q == '\0')
+            break;
+        p = q + 1;
+        ++row;
+    }
+}
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -416,6 +483,21 @@ static bool CompassMatrixReady()
     return true;
 }
 
+// v46: ALL material-handle caches are process-lifetime statics, but
+// material handles are per-map-load pointers. After a map change the old
+// pointers dangle; on Xenia the deterministic allocator often hands the
+// same addresses back (so stale handles "work"), until a different map
+// order shifts the pool -- then every cached handle is garbage, the blit
+// match never fires again, and the whole overlay is dead until process
+// restart. That is the "infected session" / "random per-map" failure
+// class. Fix: a 4s refresh tick (in OnCG_DrawActive) zeroes every cache
+// and lazy re-resolution repopulates them. Worst case: icons blank for a
+// few seconds after map load.
+static char s_mapMatLastName[160] = {0};
+static int s_mapMatHandle = 0;
+static int s_pingMat = 0;           // hoisted from DrawEnemyDots (v46)
+static int s_playerArrowMat = -2;   // hoisted; -2 unprobed, 0 none found
+
 static int RegisterCompassMapMaterial()
 {
     const char *mn = Dvar_GetString("mapname");
@@ -432,19 +514,17 @@ static int RegisterCompassMapMaterial()
         name[i] = mn[j];
     name[i] = '\0';
 
-    static char lastName[160] = {0};
-    static int cachedHandle = 0;
-    bool same = (cachedHandle != 0);
+    bool same = (s_mapMatHandle != 0);
     for (int k = 0; same && k <= i; ++k)
-        if (lastName[k] != name[k])
+        if (s_mapMatLastName[k] != name[k])
             same = false;
     if (same)
-        return cachedHandle;
+        return s_mapMatHandle;
 
-    cachedHandle = R_RegisterMaterial_fn(4, name);
+    s_mapMatHandle = R_RegisterMaterial_fn(4, name);
     for (int k = 0; k <= i; ++k)
-        lastName[k] = name[k];
-    return cachedHandle;
+        s_mapMatLastName[k] = name[k];
+    return s_mapMatHandle;
 }
 
 static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
@@ -593,7 +673,6 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         // color so the rare freecam ally pass can still tint. Soft-edged
         // texture reads smaller than its quad, so 2x the square size.
         // Sentinel-guarded; flat square is the fallback, never a yellow blob.
-        static int s_pingMat = 0;
         if (s_pingMat == 0)
         {
             const int m = ResolveMaterialStrict("compassping_enemy");
@@ -641,7 +720,6 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         // wrong/default-backed material -> "unidentified icon"). Single
         // known material: compassping_player, the stock minimap self-arrow
         // (white texture), strict-verified by name, tinted yellow.
-        static int s_playerArrowMat = -2; // -2 unprobed, 0 = none found
         if (s_playerArrowMat == -2)
             s_playerArrowMat = ResolveMaterialStrict("compassping_player");
 
@@ -1034,13 +1112,27 @@ cg::cg()
     caster_publish = Dvar_RegisterBool("caster_publish", true, 0,
         "Publish compass projection basis (caster_wox/woy/wsx/wsy/nx/ny) for the GSC caster radar");
 
+    // v45 stat-column dvars. The string itself is GSC-registered via setdvar;
+    // only the positions live here. Defaults calibrated from the NDIAG line
+    // in the ~1024x768 text space; tune from GSC with setdvar (no rebuild).
+    Dvar_RegisterString("caster_stats", "", DVAR_FLAG_NONE,
+        "10 pipe-separated stat row strings (rows 0-4 allies col, 5-9 axis col); empty = off");
+    caster_stats_xl = Dvar_RegisterInt("caster_stats_xl", 215, -200, 2000, 0,
+        "Stat column x, allies side (text space)");
+    caster_stats_xr = Dvar_RegisterInt("caster_stats_xr", 720, -200, 2000, 0,
+        "Stat column x, axis side (text space)");
+    caster_stats_y = Dvar_RegisterInt("caster_stats_y", 462, 0, 2000, 0,
+        "Stat rows base y (text space)");
+    caster_stats_dy = Dvar_RegisterInt("caster_stats_dy", 28, 1, 200, 0,
+        "Stat row pitch (text space)");
+
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 44, 0, 100, 0,
-        "Codxe compass hook build marker (v44 -- per-followed-team red/green site shields)");
+    Dvar_RegisterInt("compass_hook_v", 46, 0, 100, 0,
+        "Codxe compass hook build marker (v46 -- per-map material handle refresh, fixes infected sessions)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1127,6 +1219,26 @@ cg::cg()
             {
                 CG_DrawPlayerInfo();
             }
+
+            // v46: material-cache refresh tick, see comment at
+            // s_mapMatHandle. 240 frames ~= 4s at 60fps.
+            {
+                static unsigned int s_matRefreshFrames = 0;
+                if (++s_matRefreshFrames >= 240)
+                {
+                    s_matRefreshFrames = 0;
+                    s_mapMatHandle = 0;
+                    s_mapMatLastName[0] = '\0';
+                    s_whiteMat = 0;
+                    s_arrowMat = 0;
+                    s_pingMat = 0;
+                    s_playerArrowMat = -2;
+                }
+            }
+
+            // v45: caster stat columns (gated inside on caster_stats
+            // non-empty + no engine menu open).
+            DrawCasterStats();
         });
 }
 
