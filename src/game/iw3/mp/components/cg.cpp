@@ -1101,8 +1101,13 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
     float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
     if (caster_dots != nullptr && caster_dots->current.enabled)
+    {
         DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
+    }
     else
+    {
+        // v54 fix: the original else-body was braceless; the swap
+        // expansion needs its own scope.
         const float fs = static_cast<float>(
             (caster_arrow_friendly != nullptr) ? caster_arrow_friendly->current.integer : 32);
         const float ofw = ArrowSizePush(0, fs);
@@ -1110,6 +1115,7 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
         ArrowSizePop(0, ofw);
         ArrowSizePop(1, ofh);
+    }
 
     // v34: objective icons under the player blips.
     DrawObjectiveIcons(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
