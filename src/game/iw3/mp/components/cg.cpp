@@ -1399,7 +1399,7 @@ cg::cg()
                 if (probeName != nullptr && probeName[0] != '\0')
                 {
                     char info[160];
-                    XAssetEntry *ae = DB_FindXAssetEntry(ASSET_TYPE_IMAGE, probeName);
+                    XAssetEntryPoolEntry *ae = DB_FindXAssetEntry(ASSET_TYPE_IMAGE, probeName);
                     if (ae == nullptr)
                     {
                         sprintf_s(info, sizeof(info), "IMG %s: NOT FOUND", probeName);
