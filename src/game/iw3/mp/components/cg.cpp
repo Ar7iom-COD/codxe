@@ -77,6 +77,10 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh);
 static unsigned int s_frameCounter = 0;
 static unsigned int s_lastMapBlitFrame = 0;
 
+// v49: the followed client slot, published for GSC every frame
+// (caster_followed; -1 = none/freelook). Backs the round-end re-follow.
+dvar_s *caster_followed = nullptr;
+
 dvar_s *caster_stats_xl = nullptr;
 dvar_s *caster_stats_xr = nullptr;
 dvar_s *caster_stats_y = nullptr;
@@ -882,13 +886,18 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         // protect the bomb), otherwise -> red lettered DEFUSE. Both
         // material families precached by sd.gsc.
         bool plantedTok = (name[0] == '!');
-        // v48: team-OWNED site tokens. "@<t><lbl>" / "#<t><lbl>" where
-        // t is the owning team's clientinfo int (1=axis, 2=allies) and
-        // lbl is an optional letter. Following the owning team -> green
-        // DEFEND; otherwise red TARGET ('@', sab art) or red CAPTURE
-        // ('#', koth art) -- each gametype FF only precaches its own
-        // enemy-view family. Freecam/invalid tm takes the enemy view.
-        const bool ownedTok = (name[0] == '@' || name[0] == '#');
+        // v48/v49: team tokens. First char picks the pair, the digit is
+        // the relevant team's clientinfo int (1=axis, 2=allies), then an
+        // optional letter. Following that team -> first material, else
+        // second. All on the waypoint_* art family -- every variant is
+        // precached by its own gametype (the compass_* lettered twins
+        // are NOT, e.g. dom never precaches compass capture letters).
+        //   '@' owned site (sab):    defend / target
+        //   '#' owned site (koth):   defend / capture
+        //   '$' owned flag (dom):    defend / captureneutral
+        //   '%' planted-by (sab):    defend / defuse
+        // Freecam/invalid tm takes the second (enemy-view) material.
+        const bool ownedTok = (name[0] == '@' || name[0] == '#' || name[0] == '$' || name[0] == '%');
         if (plantedTok || ownedTok || name[0] == '_')
         {
             int atkTeam = 0;
@@ -919,11 +928,18 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
             {
                 const int ownerTeam = name[1] - '0';
                 const bool owner = (ownerTeam == 1 || ownerTeam == 2) && (tm == ownerTeam);
-                const char *base;
-                if (owner)
-                    base = "compass_waypoint_defend";
-                else
-                    base = (name[0] == '@') ? "compass_waypoint_target" : "compass_waypoint_capture";
+                const char *base = "waypoint_defend";
+                if (!owner)
+                {
+                    if (name[0] == '@')
+                        base = "waypoint_target";
+                    else if (name[0] == '#')
+                        base = "waypoint_capture";
+                    else if (name[0] == '$')
+                        base = "waypoint_captureneutral";
+                    else
+                        base = "waypoint_defuse";
+                }
                 if (name[2] != '\0')
                     sprintf_s(composed, sizeof(composed), "%s_%s", base, name + 2);
                 else
@@ -937,8 +953,11 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
                 for (; name[1 + li] != '\0' && li < 6; ++li)
                     lbl[1 + li] = name[1 + li];
                 lbl[1 + li] = '\0';
+                // v49: waypoint_* family (defend_a/_b, defuse_a/_b are
+                // precached by sd.gsc; the compass_* twins also are, but
+                // one family keeps the map art consistent).
                 sprintf_s(composed, sizeof(composed), "%s%s",
-                          followingAttack ? "compass_waypoint_defend" : "compass_waypoint_defuse", lbl);
+                          followingAttack ? "waypoint_defend" : "waypoint_defuse", lbl);
             }
             else
             {
@@ -1167,6 +1186,9 @@ cg::cg()
     caster_publish = Dvar_RegisterBool("caster_publish", true, 0,
         "Publish compass projection basis (caster_wox/woy/wsx/wsy/nx/ny) for the GSC caster radar");
 
+    caster_followed = Dvar_RegisterInt("caster_followed", -1, -1, 63, 0,
+        "Followed client slot while spectating, -1 when none (published by the DLL)");
+
     // v45 stat-column dvars. The string itself is GSC-registered via setdvar;
     // only the positions live here. Defaults calibrated from the NDIAG line
     // in the ~1024x768 text space; tune from GSC with setdvar (no rebuild).
@@ -1188,8 +1210,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 48, 0, 100, 0,
-        "Codxe compass hook build marker (v48 -- team-owned site tokens for sab/koth)");
+    Dvar_RegisterInt("compass_hook_v", 49, 0, 100, 0,
+        "Codxe compass hook build marker (v49 -- dom/sab relative tokens, caster_followed publish)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1275,6 +1297,24 @@ cg::cg()
             if (cg_draw_player_info->current.enabled)
             {
                 CG_DrawPlayerInfo();
+            }
+
+            // v49: publish the followed client slot for GSC.
+            if (caster_followed != nullptr)
+            {
+                int slot = -1;
+                const int cgB = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
+                if (cgB != 0)
+                {
+                    const int snapO = *reinterpret_cast<volatile int *>(cgB + 0x24);
+                    if (snapO != 0)
+                    {
+                        const int ciO = *reinterpret_cast<volatile int *>(snapO + 0xec);
+                        if (ciO >= 0 && ciO <= 63)
+                            slot = ciO;
+                    }
+                }
+                caster_followed->current.integer = slot;
             }
 
             // v46: material-cache refresh tick, see comment at
