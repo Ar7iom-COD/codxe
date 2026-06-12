@@ -90,7 +90,9 @@ dvar_s *caster_stats_xr = nullptr;
 dvar_s *caster_stats_y = nullptr;
 dvar_s *caster_stats_dy = nullptr;
 dvar_s *caster_stats_dx = nullptr;  // v55: K->D column gap (text units)
-dvar_s *caster_stats_hdr = nullptr; // v55: draw the K / D header row
+dvar_s *caster_stats_hdr = nullptr; // v55: draw the Kills/Deaths header row
+dvar_s *caster_hdr_scale = nullptr; // v56: header text scale, percent
+dvar_s *caster_imginfo = nullptr;   // v58: image-spec probe (donor recon)
 
 // v51: selectable stat-table font. Index -> stock IW3 font asset name;
 // out-of-range falls back to 0. R_RegisterFont returning null (font
@@ -149,17 +151,23 @@ static void DrawCasterStats()
     const float dx = static_cast<float>(
         (caster_stats_dx != nullptr) ? caster_stats_dx->current.integer : 45);
 
-    // v55: K / D header one row above both columns. Same x anchors as
-    // the sub-fields below, so the header aligns by construction.
+    // v55: header one row above both columns, same x anchors as the
+    // sub-fields below, so it aligns by construction. v56: full words
+    // at reduced scale (caster_hdr_scale percent) so they fit the
+    // column footprint without widening dx.
     if (caster_stats_hdr == nullptr || caster_stats_hdr->current.enabled)
     {
-        char hk[2]; hk[0] = 'K'; hk[1] = '\0';
-        char hd[2]; hd[0] = 'D'; hd[1] = '\0';
+        // v57: back to K / D -- the full words clipped the right-side
+        // bars (v56 RETIRED before deploy). caster_hdr_scale kept.
+        char hk[8] = "K";
+        char hd[8] = "D";
+        const float hs = static_cast<float>(
+            (caster_hdr_scale != nullptr) ? caster_hdr_scale->current.integer : 75) / 100.0f;
         const float hy = y0 - dy;
-        R_AddCmdDrawText(hk, 2, statFont, xl, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
-        R_AddCmdDrawText(hd, 2, statFont, xl + dx, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
-        R_AddCmdDrawText(hk, 2, statFont, xr, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
-        R_AddCmdDrawText(hd, 2, statFont, xr + dx, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hk, 8, statFont, xl, hy, hs, hs, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hd, 8, statFont, xl + dx, hy, hs, hs, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hk, 8, statFont, xr, hy, hs, hs, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hd, 8, statFont, xr + dx, hy, hs, hs, 0.0f, statCol, 0);
     }
 
     int row = 0;
@@ -1320,12 +1328,17 @@ cg::cg()
     caster_stats_dx = Dvar_RegisterInt("caster_stats_dx", 45, 5, 400, 0,
         "Gap between the K and D stat sub-columns (text space)");
     caster_stats_hdr = Dvar_RegisterBool("caster_stats_hdr", true, 0,
-        "Draw the K / D header row above the stat columns");
+        "Draw the Kills / Deaths header row above the stat columns");
+    caster_hdr_scale = Dvar_RegisterInt("caster_hdr_scale", 100, 25, 150, 0,
+        "Header text scale, percent of the stat row size");
+
+    caster_imginfo = Dvar_RegisterString("caster_imginfo", "", DVAR_FLAG_NONE,
+        "Image name to probe on screen (dims/format readout); empty = off");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 55, 0, 100, 0,
-        "Codxe compass hook build marker (v55 -- K/D stat columns + header)");
+    Dvar_RegisterInt("compass_hook_v", 58, 0, 100, 0,
+        "Codxe compass hook build marker (v58 -- image-spec probe)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1372,6 +1385,53 @@ cg::cg()
                     }
                 }
                 caster_followed->current.integer = slot;
+            }
+
+            // v58: on-screen image-spec readout for the rounded-bar
+            // donor hunt. Xenia mounts game:\ read-only (imagedump
+            // writes all fail), but the replacement only needs the
+            // donor's dims + DXT format -- and the engine knows those.
+            // Set caster_imginfo to an image name; specs draw at 10,170
+            // until cleared. Same DB lookup image_loader keys on, so a
+            // FOUND here means Image_Replace would match that name.
+            {
+                const char *probeName = Dvar_GetString("caster_imginfo");
+                if (probeName != nullptr && probeName[0] != '\0')
+                {
+                    char info[160];
+                    XAssetEntry *ae = DB_FindXAssetEntry(ASSET_TYPE_IMAGE, probeName);
+                    if (ae == nullptr)
+                    {
+                        sprintf_s(info, sizeof(info), "IMG %s: NOT FOUND", probeName);
+                    }
+                    else
+                    {
+                        GfxImage *img = ae->entry.asset.header.image;
+                        const char *fmt = "null-basemap";
+                        int rawFmt = -1;
+                        if (img->texture.basemap != nullptr)
+                        {
+                            rawFmt = static_cast<int>(img->texture.basemap->Format.DataFormat);
+                            if (rawFmt == static_cast<int>(GPUTEXTUREFORMAT_DXT1))
+                                fmt = "DXT1";
+                            else if (rawFmt == static_cast<int>(GPUTEXTUREFORMAT_DXT2_3))
+                                fmt = "DXT3";
+                            else if (rawFmt == static_cast<int>(GPUTEXTUREFORMAT_DXT4_5))
+                                fmt = "DXT5";
+                            else if (rawFmt == static_cast<int>(GPUTEXTUREFORMAT_DXN))
+                                fmt = "DXN";
+                            else
+                                fmt = "other";
+                        }
+                        sprintf_s(info, sizeof(info), "IMG %s: w=%d h=%d %s(%d) map=%d strm=%d",
+                                  probeName, static_cast<int>(img->width), static_cast<int>(img->height),
+                                  fmt, rawFmt, static_cast<int>(img->mapType),
+                                  img->streaming ? 1 : 0);
+                    }
+                    static Font_s *probeFont = R_RegisterFont("fonts/consoleFont");
+                    static const float probeCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
+                    R_AddCmdDrawText(info, 160, probeFont, 10.f, 170.f, 1.0f, 1.0f, 0.0f, probeCol, 0);
+                }
             }
 
             // v46: material-cache refresh tick, see comment at
