@@ -1337,8 +1337,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 58, 0, 100, 0,
-        "Codxe compass hook build marker (v58 -- image-spec probe)");
+    Dvar_RegisterInt("compass_hook_v", 59, 0, 100, 0,
+        "Codxe compass hook build marker (v59 -- probe reports material resolve)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1423,10 +1423,14 @@ cg::cg()
                             else
                                 fmt = "other";
                         }
-                        sprintf_s(info, sizeof(info), "IMG %s: w=%d h=%d %s(%d) map=%d strm=%d",
+                        // v59: mat flag = a MATERIAL with this exact name
+                        // strict-resolves (what GSC precacheShader/setShader
+                        // needs; the image existing is not enough).
+                        const int matOk = (ResolveMaterialStrict(probeName) != 0) ? 1 : 0;
+                        sprintf_s(info, sizeof(info), "IMG %s: w=%d h=%d %s(%d) map=%d strm=%d mat=%d",
                                   probeName, static_cast<int>(img->width), static_cast<int>(img->height),
                                   fmt, rawFmt, static_cast<int>(img->mapType),
-                                  img->streaming ? 1 : 0);
+                                  img->streaming ? 1 : 0, matOk);
                     }
                     static Font_s *probeFont = R_RegisterFont("fonts/consoleFont");
                     static const float probeCol[4] = {0.3f, 1.0f, 1.0f, 1.0f};
