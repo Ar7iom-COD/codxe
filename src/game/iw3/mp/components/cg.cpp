@@ -1001,8 +1001,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 42, 0, 100, 0,
-        "Codxe compass hook build marker (v42 -- dot u/v position diag)");
+    Dvar_RegisterInt("compass_hook_v", 43, 0, 100, 0,
+        "Codxe compass hook build marker (v43 -- liveness counters restored alongside u/v diag)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1057,7 +1057,14 @@ cg::cg()
                 const int dgCg2 = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F28A0u));
                 const int dgWb = static_cast<int>(*reinterpret_cast<volatile float *>(dgCg2 + 0x4e488));
                 char ndiag[240];
-                sprintf_s(ndiag, sizeof(ndiag), "NDIAG al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d u0=%d,%d u1=%d,%d",
+                // v43: a/h restored -- v42 dropped them and the frozen-counter
+                // ambiguity returned immediately (identical u0/u1 across maps
+                // could not be told apart from live clustered dots). a = hook
+                // entered at all, h = scMap material matched. h FROZEN while
+                // spectating with the map visible = match branch dead (gate /
+                // material); h LIVE = pipeline running, read bd and u0/u1.
+                sprintf_s(ndiag, sizeof(ndiag), "NDIAG a=%u h=%u al=%d ax=%d tm=%d wb=%d bp=%d be=%d bd=%d u0=%d,%d u1=%d,%d",
+                          s_diagAnyHits, s_diagHookHits,
                           dgAl ? static_cast<int>(strlen(dgAl)) : -1,
                           dgAx ? static_cast<int>(strlen(dgAx)) : -1,
                           dgTeam, dgWb, s_diagBlipParsed, s_diagBlipEntValid, s_diagBlipDrawn,
