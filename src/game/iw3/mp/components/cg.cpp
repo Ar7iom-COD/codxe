@@ -777,9 +777,47 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         name[k] = '\0';
         while (*b == ' ') ++b;
 
+        // v44: a bare "_a"/"_b" token is an SD site label (gsc v78+); pick
+        // the shield per the FOLLOWED team like the native compass does --
+        // red target when following the attacking team, green defend
+        // otherwise (incl. freecam). caster_atk carries the engine team
+        // name of the attackers; clientinfo team ints are 1=axis 2=allies.
+        char composed[64];
+        const char *drawName = name;
+        if (name[0] == '_')
+        {
+            int atkTeam = 0;
+            const char *atk = Dvar_GetString("caster_atk");
+            if (atk != nullptr)
+            {
+                if (atk[0] == 'a' && atk[1] == 'x')
+                    atkTeam = 1;
+                else if (atk[0] == 'a' && atk[1] == 'l')
+                    atkTeam = 2;
+            }
+            int tm = 0;
+            {
+                const int snapO = *reinterpret_cast<volatile int *>(cgBase + 0x24);
+                if (snapO != 0)
+                {
+                    const int ciO = *reinterpret_cast<volatile int *>(snapO + 0xec);
+                    if (ciO >= 0 && ciO <= 63)
+                    {
+                        const int infoO = ciO * 0x4e4 + cgBase;
+                        if (*reinterpret_cast<volatile int *>(infoO + 0xe8f58) != 0)
+                            tm = *reinterpret_cast<volatile int *>(infoO + 0xe8f84);
+                    }
+                }
+            }
+            const bool followingAttack = (atkTeam != 0 && tm == atkTeam);
+            sprintf_s(composed, sizeof(composed), "%s%s",
+                      followingAttack ? "compass_waypoint_target" : "compass_waypoint_defend", name);
+            drawName = composed;
+        }
+
         // v41: strict name-verified resolve (v36 sentinel retired -- it
         // never matched, see ResolveMaterialStrict).
-        const int mat = ResolveMaterialStrict(name);
+        const int mat = ResolveMaterialStrict(drawName);
         if (mat == 0)
             continue;
 
@@ -1001,8 +1039,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 43, 0, 100, 0,
-        "Codxe compass hook build marker (v43 -- liveness counters restored alongside u/v diag)");
+    Dvar_RegisterInt("compass_hook_v", 44, 0, 100, 0,
+        "Codxe compass hook build marker (v44 -- per-followed-team red/green site shields)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
