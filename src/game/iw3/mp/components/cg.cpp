@@ -44,6 +44,8 @@ dvar_s *caster_dot_size = nullptr;
 dvar_s *caster_arrows = nullptr;
 dvar_s *caster_font = nullptr;    // v51: stat-table font index (0-6)
 dvar_s *caster_obj_size = nullptr; // v52: objective icon size, decoupled from dots
+dvar_s *caster_arrow_friendly = nullptr; // v54: caster-map team arrow size
+dvar_s *caster_arrow_player = nullptr;   // v54: caster-map followed-arrow size
 
 // v23 caster radar: GSC draws, DLL publishes. events.h exposes only
 // OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
@@ -643,6 +645,40 @@ static void DrawNativeArrow(float cx, float cy, float size, float yawDeg, const 
     R_DrawRotQuad_fn(c, color, s_arrowMat);
 }
 
+// v54: caster-only native arrow sizing. v99/v100 set the cg_hudMap*
+// engine dvars from GSC, which leaked the big icons into every other
+// mode-1 surface (they are global client dvars). Instead the size
+// values are swapped in ONLY around our two native draw calls and
+// restored immediately after: the mode-1 size code reads the dvar
+// value (+0xc) through four fixed pointer slots -- actors w/h via
+// 0x823E0418/0x823E03EC (823239A8 mode!=0), player arrow w/h via
+// 0x823E03CC/0x823E0464 (82324C08 mode 1). Same-thread, same-call
+// save/write/restore: no other surface can observe the big values.
+static const uint32_t kArrowDvarSlots[4] = {
+    0x823E0418u, 0x823E03ECu, // actor blip w, h
+    0x823E03CCu, 0x823E0464u, // player arrow w, h
+};
+
+static float ArrowSizePush(int slot, float newVal)
+{
+    const uint32_t dv = *reinterpret_cast<volatile uint32_t *>(kArrowDvarSlots[slot]);
+    if (dv == 0)
+        return -1.0f;
+    volatile float *val = reinterpret_cast<volatile float *>(dv + 0xc);
+    const float old = *val;
+    *val = newVal;
+    return old;
+}
+
+static void ArrowSizePop(int slot, float oldVal)
+{
+    if (oldVal < 0.0f)
+        return;
+    const uint32_t dv = *reinterpret_cast<volatile uint32_t *>(kArrowDvarSlots[slot]);
+    if (dv != 0)
+        *reinterpret_cast<volatile float *>(dv + 0xc) = oldVal;
+}
+
 static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool nativePing,
                                int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
@@ -749,7 +785,13 @@ static void DrawCasterDotsFrom(const char *blipDvar, const float *dotColor, bool
         {
             static float arrowYellow[4] = {1.0f, 0.85f, 0.1f, 1.0f};
             arrowYellow[3] = 1.0f; // alpha read at +0xc; mode 1 skips the fade
+            const float ps = static_cast<float>(
+                (caster_arrow_player != nullptr) ? caster_arrow_player->current.integer : 44);
+            const float opw = ArrowSizePush(2, ps);
+            const float oph = ArrowSizePush(3, ps);
             CompassDrawPlayer_fn(0, mode, scratch, rect, s_playerArrowMat, arrowYellow);
+            ArrowSizePop(2, opw);
+            ArrowSizePop(3, oph);
         }
         else if (wantArrow)
         {
@@ -1061,7 +1103,13 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
     if (caster_dots != nullptr && caster_dots->current.enabled)
         DrawCasterDots(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
     else
+        const float fs = static_cast<float>(
+            (caster_arrow_friendly != nullptr) ? caster_arrow_friendly->current.integer : 32);
+        const float ofw = ArrowSizePush(0, fs);
+        const float ofh = ArrowSizePush(1, fs);
         CompassDrawActors_fn(0, mode, &scratch, &rect, color);
+        ArrowSizePop(0, ofw);
+        ArrowSizePop(1, ofh);
 
     // v34: objective icons under the player blips.
     DrawObjectiveIcons(mode, &scratch, &rect, rect.horzAlign, rect.vertAlign);
@@ -1190,6 +1238,11 @@ cg::cg()
     caster_obj_size = Dvar_RegisterInt("caster_obj_size", 24, 4, 96, 0,
         "Caster objective icon size (sites, flags, radios, bomb), projected units");
 
+    caster_arrow_friendly = Dvar_RegisterInt("caster_arrow_friendly", 32, 4, 96, 0,
+        "Caster map team arrow size (swap-scoped to the caster draw only)");
+    caster_arrow_player = Dvar_RegisterInt("caster_arrow_player", 44, 4, 96, 0,
+        "Caster map followed-player arrow size (swap-scoped to the caster draw only)");
+
     caster_font = Dvar_RegisterInt("caster_font", 0, 0, 6, 0,
         "Stat table font: 0 console 1 small 2 normal 3 bold 4 objective 5 big 6 extraBig");
 
@@ -1223,8 +1276,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 53, 0, 100, 0,
-        "Codxe compass hook build marker (v53 -- NDIAG closed; font + obj icon size)");
+    Dvar_RegisterInt("compass_hook_v", 54, 0, 100, 0,
+        "Codxe compass hook build marker (v54 -- swap-scoped arrow sizes, no dvar leak)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
