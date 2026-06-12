@@ -81,6 +81,12 @@ static void DrawCasterStats()
     if (s == nullptr || *s == '\0')
         return;
 
+    // v47: draw only while the caster map composited within the last
+    // second -- stats track the overlay exactly, killing the brief leak
+    // into gameplay/death screens.
+    if (s_frameCounter - s_lastMapBlitFrame > 60u)
+        return;
+
     // Same menu gate as the scMap blit swallow (v35): KEYCATCH_UI bit set =
     // a real engine menu is open, draw nothing over it.
     const uint32_t catchers = *reinterpret_cast<volatile uint32_t *>(0x82435a18u);
@@ -495,6 +501,12 @@ static bool CompassMatrixReady()
 // few seconds after map load.
 static char s_mapMatLastName[160] = {0};
 static int s_mapMatHandle = 0;
+// v47: frame counter (ticks in OnCG_DrawActive) + the frame the caster
+// map composite last drew. Stats render only while the map is live on
+// screen, so they can never outlive the overlay (the death-screen /
+// gameplay leak).
+static unsigned int s_frameCounter = 0;
+static unsigned int s_lastMapBlitFrame = 0;
 static int s_pingMat = 0;           // hoisted from DrawEnemyDots (v46)
 static int s_playerArrowMat = -2;   // hoisted; -2 unprobed, 0 none found
 
@@ -529,6 +541,7 @@ static int RegisterCompassMapMaterial()
 
 static void DrawNativeSpecMap(int mode, void *scratch, void *rect, int horzAlign, int vertAlign)
 {
+    s_lastMapBlitFrame = s_frameCounter; // v47: overlay is live this frame
     int handle = RegisterCompassMapMaterial();
     if (handle == 0)
         return;
@@ -862,7 +875,20 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         // name of the attackers; clientinfo team ints are 1=axis 2=allies.
         char composed[64];
         const char *drawName = name;
-        if (name[0] == '_')
+        // v47: '!' prefix = PLANTED site label from the sd publisher
+        // ("!a"/"!b"). Per the followed team, like the bare-label path:
+        // following the attacking team -> green lettered DEFEND (they
+        // protect the bomb), otherwise -> red lettered DEFUSE. Both
+        // material families precached by sd.gsc.
+        bool plantedTok = (name[0] == '!');
+        // v48: team-OWNED site tokens. "@<t><lbl>" / "#<t><lbl>" where
+        // t is the owning team's clientinfo int (1=axis, 2=allies) and
+        // lbl is an optional letter. Following the owning team -> green
+        // DEFEND; otherwise red TARGET ('@', sab art) or red CAPTURE
+        // ('#', koth art) -- each gametype FF only precaches its own
+        // enemy-view family. Freecam/invalid tm takes the enemy view.
+        const bool ownedTok = (name[0] == '@' || name[0] == '#');
+        if (plantedTok || ownedTok || name[0] == '_')
         {
             int atkTeam = 0;
             const char *atk = Dvar_GetString("caster_atk");
@@ -888,8 +914,36 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
                 }
             }
             const bool followingAttack = (atkTeam != 0 && tm == atkTeam);
-            sprintf_s(composed, sizeof(composed), "%s%s",
-                      followingAttack ? "compass_waypoint_target" : "compass_waypoint_defend", name);
+            if (ownedTok)
+            {
+                const int ownerTeam = name[1] - '0';
+                const bool owner = (ownerTeam == 1 || ownerTeam == 2) && (tm == ownerTeam);
+                const char *base;
+                if (owner)
+                    base = "compass_waypoint_defend";
+                else
+                    base = (name[0] == '@') ? "compass_waypoint_target" : "compass_waypoint_capture";
+                if (name[2] != '\0')
+                    sprintf_s(composed, sizeof(composed), "%s_%s", base, name + 2);
+                else
+                    sprintf_s(composed, sizeof(composed), "%s", base);
+            }
+            else if (plantedTok)
+            {
+                char lbl[8];
+                lbl[0] = '_';
+                int li = 0;
+                for (; name[1 + li] != '\0' && li < 6; ++li)
+                    lbl[1 + li] = name[1 + li];
+                lbl[1 + li] = '\0';
+                sprintf_s(composed, sizeof(composed), "%s%s",
+                          followingAttack ? "compass_waypoint_defend" : "compass_waypoint_defuse", lbl);
+            }
+            else
+            {
+                sprintf_s(composed, sizeof(composed), "%s%s",
+                          followingAttack ? "compass_waypoint_target" : "compass_waypoint_defend", name);
+            }
             drawName = composed;
         }
 
@@ -1117,13 +1171,15 @@ cg::cg()
     // in the ~1024x768 text space; tune from GSC with setdvar (no rebuild).
     Dvar_RegisterString("caster_stats", "", DVAR_FLAG_NONE,
         "10 pipe-separated stat row strings (rows 0-4 allies col, 5-9 axis col); empty = off");
-    caster_stats_xl = Dvar_RegisterInt("caster_stats_xl", 215, -200, 2000, 0,
+    // v47: recalibrated from on-screen measurements (text space is
+    // ~1.5 px per unit at 1080p, not the v45 estimate).
+    caster_stats_xl = Dvar_RegisterInt("caster_stats_xl", 265, -200, 2000, 0,
         "Stat column x, allies side (text space)");
-    caster_stats_xr = Dvar_RegisterInt("caster_stats_xr", 720, -200, 2000, 0,
+    caster_stats_xr = Dvar_RegisterInt("caster_stats_xr", 950, -200, 2000, 0,
         "Stat column x, axis side (text space)");
-    caster_stats_y = Dvar_RegisterInt("caster_stats_y", 462, 0, 2000, 0,
+    caster_stats_y = Dvar_RegisterInt("caster_stats_y", 430, 0, 2000, 0,
         "Stat rows base y (text space)");
-    caster_stats_dy = Dvar_RegisterInt("caster_stats_dy", 28, 1, 200, 0,
+    caster_stats_dy = Dvar_RegisterInt("caster_stats_dy", 27, 1, 200, 0,
         "Stat row pitch (text space)");
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
@@ -1131,8 +1187,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 46, 0, 100, 0,
-        "Codxe compass hook build marker (v46 -- per-map material handle refresh, fixes infected sessions)");
+    Dvar_RegisterInt("compass_hook_v", 48, 0, 100, 0,
+        "Codxe compass hook build marker (v48 -- team-owned site tokens for sab/koth)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1223,6 +1279,7 @@ cg::cg()
             // v46: material-cache refresh tick, see comment at
             // s_mapMatHandle. 240 frames ~= 4s at 60fps.
             {
+                ++s_frameCounter; // v47
                 static unsigned int s_matRefreshFrames = 0;
                 if (++s_matRefreshFrames >= 240)
                 {
