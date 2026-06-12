@@ -89,6 +89,8 @@ dvar_s *caster_stats_xl = nullptr;
 dvar_s *caster_stats_xr = nullptr;
 dvar_s *caster_stats_y = nullptr;
 dvar_s *caster_stats_dy = nullptr;
+dvar_s *caster_stats_dx = nullptr;  // v55: K->D column gap (text units)
+dvar_s *caster_stats_hdr = nullptr; // v55: draw the K / D header row
 
 // v51: selectable stat-table font. Index -> stock IW3 font asset name;
 // out-of-range falls back to 0. R_RegisterFont returning null (font
@@ -144,6 +146,21 @@ static void DrawCasterStats()
     const float xr = static_cast<float>(caster_stats_xr->current.integer);
     const float y0 = static_cast<float>(caster_stats_y->current.integer);
     const float dy = static_cast<float>(caster_stats_dy->current.integer);
+    const float dx = static_cast<float>(
+        (caster_stats_dx != nullptr) ? caster_stats_dx->current.integer : 45);
+
+    // v55: K / D header one row above both columns. Same x anchors as
+    // the sub-fields below, so the header aligns by construction.
+    if (caster_stats_hdr == nullptr || caster_stats_hdr->current.enabled)
+    {
+        char hk[2]; hk[0] = 'K'; hk[1] = '\0';
+        char hd[2]; hd[0] = 'D'; hd[1] = '\0';
+        const float hy = y0 - dy;
+        R_AddCmdDrawText(hk, 2, statFont, xl, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hd, 2, statFont, xl + dx, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hk, 2, statFont, xr, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
+        R_AddCmdDrawText(hd, 2, statFont, xr + dx, hy, 1.0f, 1.0f, 0.0f, statCol, 0);
+    }
 
     int row = 0;
     const char *p = s;
@@ -166,7 +183,27 @@ static void DrawCasterStats()
 
             const float fx = (row < 5) ? xl : xr;
             const float fy = y0 + static_cast<float>(row % 5) * dy;
-            R_AddCmdDrawText(field, 48, statFont, fx, fy, 1.0f, 1.0f, 0.0f, statCol, 0);
+            // v55: "K D" sub-columns. GSC v102 publishes the row as
+            // kills + space + deaths; split and column-place both.
+            int sp = -1;
+            for (int i = 0; i < n; ++i)
+            {
+                if (field[i] == ' ')
+                {
+                    sp = i;
+                    break;
+                }
+            }
+            if (sp > 0)
+            {
+                field[sp] = '\0';
+                R_AddCmdDrawText(field, 48, statFont, fx, fy, 1.0f, 1.0f, 0.0f, statCol, 0);
+                R_AddCmdDrawText(field + sp + 1, 48, statFont, fx + dx, fy, 1.0f, 1.0f, 0.0f, statCol, 0);
+            }
+            else
+            {
+                R_AddCmdDrawText(field, 48, statFont, fx, fy, 1.0f, 1.0f, 0.0f, statCol, 0);
+            }
         }
 
         if (*q == '\0')
@@ -1280,10 +1317,15 @@ cg::cg()
     caster_stats_dy = Dvar_RegisterInt("caster_stats_dy", 27, 1, 200, 0,
         "Stat row pitch (text space)");
 
+    caster_stats_dx = Dvar_RegisterInt("caster_stats_dx", 45, 5, 400, 0,
+        "Gap between the K and D stat sub-columns (text space)");
+    caster_stats_hdr = Dvar_RegisterBool("caster_stats_hdr", true, 0,
+        "Draw the K / D header row above the stat columns");
+
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 54, 0, 100, 0,
-        "Codxe compass hook build marker (v54 -- swap-scoped arrow sizes, no dvar leak)");
+    Dvar_RegisterInt("compass_hook_v", 55, 0, 100, 0,
+        "Codxe compass hook build marker (v55 -- K/D stat columns + header)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
