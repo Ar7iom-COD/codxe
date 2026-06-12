@@ -42,6 +42,7 @@ dvar_s *compass_native_align = nullptr;
 dvar_s *caster_dots = nullptr;
 dvar_s *caster_dot_size = nullptr;
 dvar_s *caster_arrows = nullptr;
+dvar_s *caster_font = nullptr;    // v51: stat-table font index (0-6)
 
 // v23 caster radar: GSC draws, DLL publishes. events.h exposes only
 // OnCG_DrawActive (3D pass) -- no 2D/HUD draw event -- and the spectate 2D HUD
@@ -86,6 +87,23 @@ dvar_s *caster_stats_xr = nullptr;
 dvar_s *caster_stats_y = nullptr;
 dvar_s *caster_stats_dy = nullptr;
 
+// v51: selectable stat-table font. Index -> stock IW3 font asset name;
+// out-of-range falls back to 0. R_RegisterFont returning null (font
+// asset absent in this build) also falls back to consoleFont so the
+// table never draws with a null font handle. Cache is index-keyed and
+// flushed by the v46 4s tick (same never-latch rule as materials).
+static const char *const kCasterFonts[7] = {
+    "fonts/consoleFont",  // 0
+    "fonts/smallFont",    // 1
+    "fonts/normalFont",   // 2
+    "fonts/boldFont",     // 3
+    "fonts/objectiveFont",// 4
+    "fonts/bigFont",      // 5
+    "fonts/extraBigFont", // 6
+};
+static Font_s *s_statFont = nullptr;
+static int s_statFontIdx = -1;
+
 static void DrawCasterStats()
 {
     const char *s = Dvar_GetString("caster_stats");
@@ -104,7 +122,19 @@ static void DrawCasterStats()
     if ((catchers & 0x10u) != 0)
         return;
 
-    static Font_s *statFont = R_RegisterFont("fonts/consoleFont");
+    int fidx = (caster_font != nullptr) ? caster_font->current.integer : 0;
+    if (fidx < 0 || fidx > 6)
+        fidx = 0;
+    if (s_statFont == nullptr || fidx != s_statFontIdx)
+    {
+        s_statFont = R_RegisterFont(kCasterFonts[fidx]);
+        if (s_statFont == nullptr)
+            s_statFont = R_RegisterFont("fonts/consoleFont");
+        s_statFontIdx = fidx;
+    }
+    if (s_statFont == nullptr)
+        return;
+    Font_s *statFont = s_statFont;
     static const float statCol[4] = {1.0f, 1.0f, 1.0f, 0.9f};
 
     const float xl = static_cast<float>(caster_stats_xl->current.integer);
@@ -1202,6 +1232,9 @@ cg::cg()
     caster_dot_size = Dvar_RegisterInt("caster_dot_size", 6, 1, 64, 0,
         "Fallback DLL draw: dot size (projected units)");
 
+    caster_font = Dvar_RegisterInt("caster_font", 0, 0, 6, 0,
+        "Stat table font: 0 console 1 small 2 normal 3 bold 4 objective 5 big 6 extraBig");
+
     caster_arrows = Dvar_RegisterBool("caster_arrows", true, 0,
         "Draw caster blips as native-styled rotated arrows (off: plain square dots)");
 
@@ -1235,8 +1268,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 50, 0, 100, 0,
-        "Codxe compass hook build marker (v50 -- entity-tracked bomb carrier icon)");
+    Dvar_RegisterInt("compass_hook_v", 51, 0, 100, 0,
+        "Codxe compass hook build marker (v51 -- selectable stat-table font)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1356,6 +1389,8 @@ cg::cg()
                     s_arrowMat = 0;
                     s_pingMat = 0;
                     s_playerArrowMat = -2;
+                    s_statFont = nullptr;   // v51
+                    s_statFontIdx = -1;
                 }
             }
 
