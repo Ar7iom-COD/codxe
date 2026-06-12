@@ -880,6 +880,31 @@ static void DrawObjectiveIcons(int mode, void *scratch, void *rect, int horzAlig
         // name of the attackers; clientinfo team ints are 1=axis 2=allies.
         char composed[64];
         const char *drawName = name;
+
+        // v50: '&<entnum>' = bomb tracked at a LIVE entity (the carrier).
+        // The published x/y are only a fallback -- the entity position is
+        // read here EVERY FRAME from cg_entities (same base/stride/type
+        // check as the blips: 0x823F5054, stride 0x1d0, origin +0x1c/
+        // +0x20, type +0xc4 == 1), so the icon moves as smoothly as the
+        // arrows instead of teleporting on the 1s GSC republish.
+        if (name[0] == '&')
+        {
+            int en = 0;
+            for (int d = 1; name[d] >= '0' && name[d] <= '9'; ++d)
+                en = en * 10 + (name[d] - '0');
+            const int entBase2 = static_cast<int>(*reinterpret_cast<volatile uint32_t *>(0x823F5054u));
+            if (entBase2 != 0 && en >= 0 && en <= 63)
+            {
+                const int ent = entBase2 + en * 0x1d0;
+                if (*reinterpret_cast<volatile int *>(ent + 0xc4) == 1)
+                {
+                    px = *reinterpret_cast<volatile float *>(ent + 0x1c);
+                    py = *reinterpret_cast<volatile float *>(ent + 0x20);
+                }
+            }
+            drawName = "waypoint_bomb";
+        }
+
         // v47: '!' prefix = PLANTED site label from the sd publisher
         // ("!a"/"!b"). Per the followed team, like the bare-label path:
         // following the attacking team -> green lettered DEFEND (they
@@ -1210,8 +1235,8 @@ cg::cg()
     Dvar_RegisterString("compass_native_diag", "", DVAR_FLAG_NONE,
         "v25 gate counters: h=hook hits, f=follow fail, m=matrix fail, d=draws");
 
-    Dvar_RegisterInt("compass_hook_v", 49, 0, 100, 0,
-        "Codxe compass hook build marker (v49 -- dom/sab relative tokens, caster_followed publish)");
+    Dvar_RegisterInt("compass_hook_v", 50, 0, 100, 0,
+        "Codxe compass hook build marker (v50 -- entity-tracked bomb carrier icon)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
