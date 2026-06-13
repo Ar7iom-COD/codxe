@@ -786,17 +786,6 @@ void Image_Replace_2D(GfxImage *image, const DDSImage &ddsImage)
         UINT address = baseAddress;
         if (mipLevel > 0)
         {
-            // FIX (X360 promod overlay): some fastfile textures report mip
-            // levels in their desc but XGGetTextureLayout returns mipAddress=0
-            // (no separate mip allocation). The unguarded add then tiles the
-            // mip into near-NULL memory -> hard freeze at map load (seen with
-            // rank_sgt1, Xenia log: 'Writing mip level 1 to address 0x00000000').
-            // Base level is already written at this point; stop here.
-            if (mipAddress == 0)
-            {
-                DbgPrint("Image_Replace_2D: mipAddress is 0, skipping mip levels for '%s'\n", image->name);
-                break;
-            }
             UINT mipLevelOffset = XGGetMipLevelOffset(image->texture.basemap, 0, mipLevel);
             address = mipAddress + mipLevelOffset;
         }
