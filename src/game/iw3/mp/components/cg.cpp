@@ -221,6 +221,124 @@ static void DrawCasterStats()
     }
 }
 
+// ============================================================================
+// v60: DLL-drawn HP bars. GSC hudelem bars RETIRED: the +10 cap elems of
+// gsc v109 overflowed the 31-slot current team-hudelem pool (red names and
+// the stats publisher died mid-creation, on-box). Zero hudelems here:
+// GSC publishes caster_hp (10 pipe fields, int 1-100, empty = no bar) and
+// caster_bar_rgb1/rgb2 ("r g b" floats). Geometry via caster_bar_* ints
+// (render pixels), set by GSC like the caster_stats_* anchors.
+// Body = material "white" stretched (sharp at any width); cap = donor
+// materials rank_sgt1 (right bulge, allies) / rank_rec1 (left, axis),
+// drawn minified -- the codxe image_loader replaces their pixels from
+// images/*.dds at map load.
+dvar_s *caster_bar_xl = nullptr;   // allies bar LEFT edge
+dvar_s *caster_bar_xr = nullptr;   // axis bar RIGHT edge
+dvar_s *caster_bar_y = nullptr;    // row 0 top
+dvar_s *caster_bar_dy = nullptr;   // row step
+dvar_s *caster_bar_w = nullptr;    // full-HP bar width
+dvar_s *caster_bar_h = nullptr;    // bar height
+dvar_s *caster_bar_cap = nullptr;  // cap piece width
+
+static int s_barBodyMat = 0;
+
+// v61 build fix: DrawCasterBars sits above the compass-section
+// definitions it uses. Forward-declare the resolver and hoist the
+// R_DrawStretchPic pointer here (single definition; the compass
+// section below now only carries the documenting comment).
+static int ResolveMaterialStrict(const char *name);
+// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material).
+typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
+static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
+    reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
+
+static void ParseRGB(const char *s, float *out)
+{
+    out[0] = out[1] = out[2] = 1.0f;
+    if (s == nullptr || *s == '\0')
+        return;
+    float v[3] = {1.0f, 1.0f, 1.0f};
+    int i = 0;
+    const char *p = s;
+    while (i < 3 && *p != '\0')
+    {
+        v[i] = static_cast<float>(atof(p));
+        while (*p != '\0' && *p != ' ')
+            ++p;
+        while (*p == ' ')
+            ++p;
+        ++i;
+    }
+    out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
+}
+
+static void DrawCasterBars()
+{
+    const char *s = Dvar_GetString("caster_hp");
+    if (s == nullptr || *s == '\0')
+        return;
+    // same overlay gates as the stat text (map recency + menu catcher)
+    if (s_frameCounter - s_lastMapBlitFrame > 60u)
+        return;
+    const uint32_t catchers = *reinterpret_cast<volatile uint32_t *>(0x82435a18u);
+    if ((catchers & 0x10u) != 0)
+        return;
+
+    if (s_barBodyMat == 0)
+        s_barBodyMat = ResolveMaterialStrict("white");
+    if (s_barBodyMat == 0)
+        return;
+
+    const float xl = static_cast<float>((caster_bar_xl != nullptr) ? caster_bar_xl->current.integer : 40);
+    const float xr = static_cast<float>((caster_bar_xr != nullptr) ? caster_bar_xr->current.integer : 1240);
+    const float y0 = static_cast<float>((caster_bar_y != nullptr) ? caster_bar_y->current.integer : 399);
+    const float dy = static_cast<float>((caster_bar_dy != nullptr) ? caster_bar_dy->current.integer : 27);
+    const float fw = static_cast<float>((caster_bar_w != nullptr) ? caster_bar_w->current.integer : 300);
+    const float fh = static_cast<float>((caster_bar_h != nullptr) ? caster_bar_h->current.integer : 21);
+    const float cw = static_cast<float>((caster_bar_cap != nullptr) ? caster_bar_cap->current.integer : 14);
+
+    float col1[4]; float col2[4];
+    ParseRGB(Dvar_GetString("caster_bar_rgb1"), col1);
+    ParseRGB(Dvar_GetString("caster_bar_rgb2"), col2);
+    col1[3] = 0.85f; col2[3] = 0.85f;
+
+    int row = 0;
+    const char *p = s;
+    while (row < 10)
+    {
+        const char *q = p;
+        while (*q != '\0' && *q != '|')
+            ++q;
+        if (q > p)
+        {
+            int hp = atoi(p);
+            if (hp > 100) hp = 100;
+            if (hp > 0)
+            {
+                const bool axis = (row >= 5);
+                const float *col = axis ? col2 : col1;
+                float len = fw * static_cast<float>(hp) / 100.0f;
+                if (len < cw) len = cw;  // cap alone at minimum
+                const float fy = y0 + static_cast<float>(row % 5) * dy;
+                // v64: caps RETIRED (rounded capsule experiment abandoned
+                // -- magnification/mirror churn not worth it). Plain flat
+                // rectangle, "white" material, full bar length. Mirror
+                // kept so each table hugs its outer edge: allies grow
+                // right from xl, axis grow left from xr.
+                (void)cw;
+                if (!axis)
+                    R_DrawStretchPic_fn(xl, fy, len, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barBodyMat);
+                else
+                    R_DrawStretchPic_fn(xr - len, fy, len, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barBodyMat);
+            }
+        }
+        if (*q == '\0')
+            break;
+        p = q + 1;
+        ++row;
+    }
+}
+
 Detour BG_CalculateWeaponPosition_IdleAngles_Detour;
 
 void BG_CalculateWeaponPosition_IdleAngles_Hook(weaponState_t *ws, float *angles)
@@ -551,10 +669,8 @@ static CompassProject_fn_t const CompassProject_fn =
 typedef void (*CompassMatrixXform_fn_t)(float *, float *, float *, float *, float *, int, int);
 static CompassMatrixXform_fn_t const CompassMatrixXform_fn =
     reinterpret_cast<CompassMatrixXform_fn_t>(0x822B36E8u);
-// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material).
-typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
-static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
-    reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
+// R_DrawStretchPic pointer: HOISTED above DrawCasterBars (v61 build
+// fix) -- single definition now lives there.
 
 struct compassRectDef_s
 {
@@ -1217,6 +1333,7 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
 
             s_inNativeBlit = true;
             DrawNativeSpecCompass(x, y, w, h);
+            DrawCasterBars();  // v61: HP bars, same render phase as the compass
             s_inNativeBlit = false;
             return;
         }
@@ -1329,6 +1446,19 @@ cg::cg()
         "Gap between the K and D stat sub-columns (text space)");
     caster_stats_hdr = Dvar_RegisterBool("caster_stats_hdr", true, 0,
         "Draw the Kills / Deaths header row above the stat columns");
+    Dvar_RegisterString("caster_hp", "", DVAR_FLAG_NONE,
+        "v60: 10 pipe fields, int hp 1-100 per visible bar, empty = hidden");
+    Dvar_RegisterString("caster_bar_rgb1", "0.25 0.5 0.95", DVAR_FLAG_NONE,
+        "v60: allies bar color, r g b floats");
+    Dvar_RegisterString("caster_bar_rgb2", "0.9 0.2 0.2", DVAR_FLAG_NONE,
+        "v60: axis bar color, r g b floats");
+    caster_bar_xl = Dvar_RegisterInt("caster_bar_xl", 40, -200, 2000, 0, "v60 allies bar left edge px");
+    caster_bar_xr = Dvar_RegisterInt("caster_bar_xr", 1240, -200, 2000, 0, "v60 axis bar right edge px");
+    caster_bar_y = Dvar_RegisterInt("caster_bar_y", 399, 0, 2000, 0, "v60 bar row0 top px");
+    caster_bar_dy = Dvar_RegisterInt("caster_bar_dy", 27, 1, 200, 0, "v60 bar row step px");
+    caster_bar_w = Dvar_RegisterInt("caster_bar_w", 300, 10, 1000, 0, "v60 full bar width px");
+    caster_bar_h = Dvar_RegisterInt("caster_bar_h", 21, 2, 100, 0, "v60 bar height px");
+    caster_bar_cap = Dvar_RegisterInt("caster_bar_cap", 14, 0, 100, 0, "v60 cap width px");
     caster_hdr_scale = Dvar_RegisterInt("caster_hdr_scale", 100, 25, 150, 0,
         "Header text scale, percent of the stat row size");
 
@@ -1337,8 +1467,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 59, 0, 100, 0,
-        "Codxe compass hook build marker (v59 -- probe reports material resolve)");
+    Dvar_RegisterInt("compass_hook_v", 64, 0, 100, 0,
+        "Codxe compass hook build marker (v64 -- flat rectangle bars, caps retired)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1454,12 +1584,17 @@ cg::cg()
                     s_playerArrowMat = -2;
                     s_statFont = nullptr;   // v51
                     s_statFontIdx = -1;
+                    s_barBodyMat = 0;   // v61: bar materials, same staleness
                 }
             }
 
             // v45: caster stat columns (gated inside on caster_stats
             // non-empty + no engine menu open).
             DrawCasterStats();
+            // v61: DrawCasterBars() MOVED to the R_DrawStretchPic detour.
+            // Calling R_DrawStretchPic_fn from this frame tick is the
+            // wrong render phase (broke the caster compass on-box, v60).
+            // R_AddCmdDrawText (stats above) is command-add and stays.
         });
 }
 
