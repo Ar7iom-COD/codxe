@@ -241,8 +241,6 @@ dvar_s *caster_bar_h = nullptr;    // bar height
 dvar_s *caster_bar_cap = nullptr;  // cap piece width
 
 static int s_barBodyMat = 0;
-static int s_barCapMatR = 0;  // rank_sgt1, bulges right
-static int s_barCapMatL = 0;  // rank_rec1, bulges left
 
 // v61 build fix: DrawCasterBars sits above the compass-section
 // definitions it uses. Forward-declare the resolver and hoist the
@@ -288,10 +286,6 @@ static void DrawCasterBars()
 
     if (s_barBodyMat == 0)
         s_barBodyMat = ResolveMaterialStrict("white");
-    if (s_barCapMatR == 0)
-        s_barCapMatR = ResolveMaterialStrict("rank_sgt1");
-    if (s_barCapMatL == 0)
-        s_barCapMatL = ResolveMaterialStrict("rank_rec1");
     if (s_barBodyMat == 0)
         return;
 
@@ -326,18 +320,16 @@ static void DrawCasterBars()
                 float len = fw * static_cast<float>(hp) / 100.0f;
                 if (len < cw) len = cw;  // cap alone at minimum
                 const float fy = y0 + static_cast<float>(row % 5) * dy;
-                const float bodyW = len - cw;
-                // v62 (A1): BOTH teams left-anchored, body left + cap
-                // right (reference shape, tab on the right). Allies
-                // origin = xl. Axis table lives on the right of screen,
-                // so its left origin = xr - full bar width; bars grow
-                // from there and deplete rightward like allies. The
-                // v108 leftward-mirror is RETIRED.
-                const float ox = axis ? (xr - fw) : xl;
-                if (bodyW > 0.5f)
-                    R_DrawStretchPic_fn(ox, fy, bodyW, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barBodyMat);
-                if (s_barCapMatR != 0)
-                    R_DrawStretchPic_fn(ox + bodyW, fy, cw, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barCapMatR);
+                // v64: caps RETIRED (rounded capsule experiment abandoned
+                // -- magnification/mirror churn not worth it). Plain flat
+                // rectangle, "white" material, full bar length. Mirror
+                // kept so each table hugs its outer edge: allies grow
+                // right from xl, axis grow left from xr.
+                (void)cw;
+                if (!axis)
+                    R_DrawStretchPic_fn(xl, fy, len, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barBodyMat);
+                else
+                    R_DrawStretchPic_fn(xr - len, fy, len, fh, 0.0f, 0.0f, 1.0f, 1.0f, col, s_barBodyMat);
             }
         }
         if (*q == '\0')
@@ -1475,8 +1467,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 62, 0, 100, 0,
-        "Codxe compass hook build marker (v62 -- A1 both bars left-anchored)");
+    Dvar_RegisterInt("compass_hook_v", 64, 0, 100, 0,
+        "Codxe compass hook build marker (v64 -- flat rectangle bars, caps retired)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1593,8 +1585,6 @@ cg::cg()
                     s_statFont = nullptr;   // v51
                     s_statFontIdx = -1;
                     s_barBodyMat = 0;   // v61: bar materials, same staleness
-                    s_barCapMatR = 0;
-                    s_barCapMatL = 0;
                 }
             }
 
