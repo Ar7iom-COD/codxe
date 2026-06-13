@@ -244,6 +244,16 @@ static int s_barBodyMat = 0;
 static int s_barCapMatR = 0;  // rank_sgt1, bulges right
 static int s_barCapMatL = 0;  // rank_rec1, bulges left
 
+// v61 build fix: DrawCasterBars sits above the compass-section
+// definitions it uses. Forward-declare the resolver and hoist the
+// R_DrawStretchPic pointer here (single definition; the compass
+// section below now only carries the documenting comment).
+static int ResolveMaterialStrict(const char *name);
+// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material).
+typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
+static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
+    reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
+
 static void ParseRGB(const char *s, float *out)
 {
     out[0] = out[1] = out[2] = 1.0f;
@@ -670,10 +680,8 @@ static CompassProject_fn_t const CompassProject_fn =
 typedef void (*CompassMatrixXform_fn_t)(float *, float *, float *, float *, float *, int, int);
 static CompassMatrixXform_fn_t const CompassMatrixXform_fn =
     reinterpret_cast<CompassMatrixXform_fn_t>(0x822B36E8u);
-// R_DrawStretchPic (8216BAE8): (x,y,w,h, s0,t0,s1,t1, color, material).
-typedef void (*R_DrawStretchPic_fn_t)(float, float, float, float, float, float, float, float, const float *, int);
-static R_DrawStretchPic_fn_t const R_DrawStretchPic_fn =
-    reinterpret_cast<R_DrawStretchPic_fn_t>(0x8216BAE8u);
+// R_DrawStretchPic pointer: HOISTED above DrawCasterBars (v61 build
+// fix) -- single definition now lives there.
 
 struct compassRectDef_s
 {
