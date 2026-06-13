@@ -445,8 +445,8 @@ struct LocalizeEntry_
     const char *name;
 };
 
-static const char LOC_OLDSCHOOL_NEW[] = "Promod Live 2.11";
-static const char LOC_HARDCORE_NEW[]  = "Practice";
+static const char LOC_OLDSCHOOL_NEW[] = "Promod Live 2.11:";
+static const char LOC_HARDCORE_NEW[]  = "Practice:";
 
 static void Localize_Override(XAssetEntry *entry)
 {
@@ -454,20 +454,16 @@ static void Localize_Override(XAssetEntry *entry)
     if (!loc || !loc->value || !loc->name)
         return;
 
-    if (strcmp(loc->value, "Old School Mode") == 0)
+    // Keys confirmed via xenia.log near-miss pass (values carry a trailing colon).
+    if (strcmp(loc->name, "MPUI_OLDSCHOOL_PRE") == 0 || strcmp(loc->name, "MPUI_RULES_OLDSCHOOL") == 0)
     {
         DbgPrint("LOC swap: key=%s old=[%s] new=[%s]\n", loc->name, loc->value, LOC_OLDSCHOOL_NEW);
         loc->value = LOC_OLDSCHOOL_NEW;
     }
-    else if (strcmp(loc->value, "Hardcore Mode") == 0)
+    else if (strcmp(loc->name, "MPUI_HARDCORE_PRE") == 0 || strcmp(loc->name, "MPUI_RULES_HARDCORE") == 0)
     {
         DbgPrint("LOC swap: key=%s old=[%s] new=[%s]\n", loc->name, loc->value, LOC_HARDCORE_NEW);
         loc->value = LOC_HARDCORE_NEW;
-    }
-    else if (strstr(loc->value, "Old School") || strstr(loc->value, "Hardcore"))
-    {
-        // Near-miss: label text differs from our exact match. Log key+value for v2.
-        DbgPrint("LOC near-miss: key=%s value=[%s]\n", loc->name, loc->value);
     }
 }
 
@@ -480,16 +476,6 @@ XAssetEntry *DB_LinkXAssetEntry_Hook(XAssetEntry *newEntry, int allowOverride)
 
     if (newEntry->asset.type == ASSET_TYPE_LOCALIZE_ENTRY)
         Localize_Override(newEntry);
-
-    // TEMP evidence pass: find CoD4 / Infinity Ward logo material names for
-    // the GSC shoutcaster HUD (precacheShader/setShader). Remove once known.
-    if (newEntry->asset.type == ASSET_TYPE_MATERIAL)
-    {
-        // Material starts with MaterialInfo { const char *name; ... }
-        const char *mtlName = *reinterpret_cast<const char **>(newEntry->asset.header.data);
-        if (mtlName && (strstr(mtlName, "logo") || strstr(mtlName, "infinity") || strstr(mtlName, "iw_")))
-            DbgPrint("MTL: %s\n", mtlName);
-    }
 
     if (mpsp::is_sp_map)
     {
