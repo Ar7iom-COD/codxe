@@ -39,6 +39,7 @@ dvar_s *classmenu_py = nullptr;
 dvar_s *classmenu_pitch = nullptr;
 dvar_s *classmenu_ph = nullptr;
 dvar_s *classmenu_fade = nullptr;
+dvar_s *classmenu_solid = nullptr;
 dvar_s *classmenu_a0 = nullptr;
 dvar_s *classmenu_a1 = nullptr;
 
@@ -1331,53 +1332,64 @@ static void DrawClassMenuPanels()
     if (s_gradMat == 0)
     {
         const int g = ResolveMaterialStrict("gradient_fadein");
-        // white fallback: if the gradient is absent we still get solid panels,
-        // which at least confirms coords/selection/separator on the first deploy.
-        s_gradMat = (g != 0) ? g : s_whiteMat;
+        s_gradMat = (g != 0) ? g : s_whiteMat; // white fallback so the body still shows
     }
-    if (s_gradMat == 0)
+    if (s_whiteMat == 0)
+        s_whiteMat = R_RegisterMaterial_fn(4, "white");
+    if (s_gradMat == 0 || s_whiteMat == 0)
         return;
 
-    const float sx = scrPlaceFullUnsafe.scaleVirtualToFull[0];
-    const float sy = scrPlaceFullUnsafe.scaleVirtualToFull[1];
+    // v68: geometry in per-mille of the real screen (0..1000), NOT 640x480
+    // virtual. The GSC menu hud maps x at ~half scaleVirtualToFull[0], so a
+    // shared virtual basis put the panels ~2x too wide / too far right. Screen
+    // fractions decouple us from the GSC hud scale entirely -- we just dial the
+    // panels onto wherever the GSC text lands.
+    const float scrW = scrPlaceFullUnsafe.scaleVirtualToFull[0] * 640.0f;
+    const float scrH = scrPlaceFullUnsafe.scaleVirtualToFull[1] * 480.0f;
+
+    const float pxR   = ((classmenu_px    != nullptr) ? classmenu_px->current.integer    : 244) / 1000.0f * scrW; // right edge
+    const float pw    = ((classmenu_pw    != nullptr) ? classmenu_pw->current.integer    : 175) / 1000.0f * scrW; // width
+    const float pyT   = ((classmenu_py    != nullptr) ? classmenu_py->current.integer    : 360) / 1000.0f * scrH; // first row top
+    const float pitch = ((classmenu_pitch != nullptr) ? classmenu_pitch->current.integer :  34) / 1000.0f * scrH;
+    const float ph    = ((classmenu_ph    != nullptr) ? classmenu_ph->current.integer    :  28) / 1000.0f * scrH;
 
     int n = (classmenu_n != nullptr) ? classmenu_n->current.integer : 7;
     if (n < 1) n = 1;
     if (n > 16) n = 16;
     const int idx = (classmenu_idx != nullptr) ? classmenu_idx->current.integer : -1;
     const int sep = (classmenu_sep != nullptr) ? classmenu_sep->current.integer : 4;
-    const float px = (float)((classmenu_px != nullptr) ? classmenu_px->current.integer : 300);
-    const float pw = (float)((classmenu_pw != nullptr) ? classmenu_pw->current.integer : 230);
-    const float py = (float)((classmenu_py != nullptr) ? classmenu_py->current.integer : 170);
-    const float pitch = (float)((classmenu_pitch != nullptr) ? classmenu_pitch->current.integer : 17);
-    const float ph = (float)((classmenu_ph != nullptr) ? classmenu_ph->current.integer : 15);
+    int solidPct = (classmenu_solid != nullptr) ? classmenu_solid->current.integer : 60;
+    if (solidPct < 0) solidPct = 0; if (solidPct > 100) solidPct = 100;
     const bool flip = (classmenu_fade != nullptr) && classmenu_fade->current.enabled;
-    const float a0 = ((classmenu_a0 != nullptr) ? classmenu_a0->current.integer : 32) / 100.0f;
-    const float a1 = ((classmenu_a1 != nullptr) ? classmenu_a1->current.integer : 75) / 100.0f;
+    const float a0 = ((classmenu_a0 != nullptr) ? classmenu_a0->current.integer : 45) / 100.0f;
+    const float a1 = ((classmenu_a1 != nullptr) ? classmenu_a1->current.integer : 80) / 100.0f;
 
-    float col[4] = {0.62f, 0.62f, 0.66f, 1.0f};
-    // gradient_fadein fades L->R by default; swap s to make it opaque on the
-    // right (under right-aligned text). classmenu_fade flips it if it's reversed.
-    const float s0 = flip ? 0.0f : 1.0f;
-    const float s1 = flip ? 1.0f : 0.0f;
-    const float leftv = px - pw;
+    const float solidW  = pw * (solidPct / 100.0f); // opaque body, right portion
+    const float fadeW   = pw - solidW;              // gradient strip, left portion
+    const float pxL     = pxR - pw;                 // panel left edge
+    const float pxBody  = pxR - solidW;             // solid left edge = fade right edge
+    // fade strip: transparent at far-left, opaque where it meets the solid body.
+    const float s0 = flip ? 0.0f : 1.0f; // far-left sample
+    const float s1 = flip ? 1.0f : 0.0f; // meets-the-body sample
 
+    float col[4] = {0.60f, 0.60f, 0.64f, 1.0f};
     for (int i = 0; i < n; ++i)
     {
-        const float topv = py + i * pitch;
+        const float topY = pyT + i * pitch;
         col[3] = (i == idx) ? a1 : a0;
-        R_DrawStretchPic_fn(leftv * sx, topv * sy, pw * sx, ph * sy,
-                            s0, 0.0f, s1, 1.0f, col, s_gradMat);
+        R_DrawStretchPic_fn(pxBody, topY, solidW, ph, 0.0f, 0.0f, 1.0f, 1.0f, col, s_whiteMat);
+        if (fadeW > 0.5f)
+            R_DrawStretchPic_fn(pxL, topY, fadeW, ph, s0, 0.0f, s1, 1.0f, col, s_gradMat);
     }
 
     if (sep >= 0 && sep < n - 1)
     {
-        const float midv = py + sep * pitch + ph + (pitch - ph) * 0.5f;
-        const float sepHv = 2.0f;
-        const float sepWv = pw * 0.65f;
-        float scol[4] = {0.62f, 0.62f, 0.66f, a0 * 0.8f};
-        R_DrawStretchPic_fn((px - sepWv) * sx, (midv - sepHv * 0.5f) * sy,
-                            sepWv * sx, sepHv * sy, s0, 0.0f, s1, 1.0f, scol, s_gradMat);
+        const float midY = pyT + sep * pitch + ph + (pitch - ph) * 0.5f;
+        const float sh = (scrH / 480.0f) * 2.0f; // ~2 virtual px tall
+        float scol[4] = {0.60f, 0.60f, 0.64f, a0 * 0.8f};
+        R_DrawStretchPic_fn(pxBody, midY - sh * 0.5f, solidW, sh, 0.0f, 0.0f, 1.0f, 1.0f, scol, s_whiteMat);
+        if (fadeW > 0.5f)
+            R_DrawStretchPic_fn(pxL, midY - sh * 0.5f, fadeW, sh, s0, 0.0f, s1, 1.0f, scol, s_gradMat);
     }
 }
 
@@ -1510,14 +1522,15 @@ cg::cg()
     classmenu_idx = Dvar_RegisterInt("classmenu_idx", -1, -1, 16, 0, "GSC: selected class row index");
     classmenu_n = Dvar_RegisterInt("classmenu_n", 7, 1, 16, 0, "GSC: class row count");
     classmenu_sep = Dvar_RegisterInt("classmenu_sep", 4, -1, 16, 0, "Separator after this row index (-1 none); 4 = after Secondary");
-    classmenu_px = Dvar_RegisterInt("classmenu_px", 300, 0, 640, 0, "Panel right edge x (virtual 640x480)");
-    classmenu_pw = Dvar_RegisterInt("classmenu_pw", 230, 10, 640, 0, "Panel width (virtual)");
-    classmenu_py = Dvar_RegisterInt("classmenu_py", 170, 0, 480, 0, "First-row panel top y (virtual)");
-    classmenu_pitch = Dvar_RegisterInt("classmenu_pitch", 17, 1, 100, 0, "Row pitch (virtual)");
-    classmenu_ph = Dvar_RegisterInt("classmenu_ph", 15, 1, 100, 0, "Panel height (virtual)");
-    classmenu_fade = Dvar_RegisterBool("classmenu_fade", false, 0, "Flip gradient_fadein horizontally if it fades the wrong way");
-    classmenu_a0 = Dvar_RegisterInt("classmenu_a0", 32, 0, 100, 0, "Panel alpha %, unselected rows");
-    classmenu_a1 = Dvar_RegisterInt("classmenu_a1", 75, 0, 100, 0, "Panel alpha %, selected row");
+    classmenu_px = Dvar_RegisterInt("classmenu_px", 244, 0, 1000, 0, "Panel right edge (per-mille of screen width)");
+    classmenu_pw = Dvar_RegisterInt("classmenu_pw", 175, 5, 1000, 0, "Panel width (per-mille of screen width)");
+    classmenu_py = Dvar_RegisterInt("classmenu_py", 360, 0, 1000, 0, "First-row panel top (per-mille of screen height)");
+    classmenu_pitch = Dvar_RegisterInt("classmenu_pitch", 34, 1, 200, 0, "Row pitch (per-mille of screen height)");
+    classmenu_ph = Dvar_RegisterInt("classmenu_ph", 28, 1, 200, 0, "Panel height (per-mille of screen height)");
+    classmenu_solid = Dvar_RegisterInt("classmenu_solid", 60, 0, 100, 0, "Solid body width as pct of panel (rest fades left)");
+    classmenu_fade = Dvar_RegisterBool("classmenu_fade", false, 0, "Flip the left fade strip if it fades the wrong way");
+    classmenu_a0 = Dvar_RegisterInt("classmenu_a0", 45, 0, 100, 0, "Panel alpha pct, unselected rows");
+    classmenu_a1 = Dvar_RegisterInt("classmenu_a1", 80, 0, 100, 0, "Panel alpha pct, selected row");
 
     compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
@@ -1609,7 +1622,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 67, 0, 100, 0,
+    Dvar_RegisterInt("compass_hook_v", 68, 0, 100, 0,
         "Codxe compass hook build marker (v66 -- cap flip excludes the wide back-bar cap)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
