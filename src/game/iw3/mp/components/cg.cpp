@@ -35,6 +35,7 @@ dvar_s *classmenu_cap = nullptr;   // v70 chamfered left cap on/off
 dvar_s *classmenu_capw = nullptr;  // v70 cap width (per-mille screen W)
 dvar_s *classmenu_caps = nullptr;  // v70 cap s-flip (mirror horizontally)
 dvar_s *classmenu_capt = nullptr;  // v70 cap t-flip (mirror vertically)
+dvar_s *classmenu_capright = nullptr; // v80 chamfer cap on the right (text) end vs left
 dvar_s *classmenu_cr = nullptr;    // v70 panel red   (0-255)
 dvar_s *classmenu_cg = nullptr;    // v70 panel green (0-255)
 dvar_s *classmenu_cb = nullptr;    // v70 panel blue  (0-255)
@@ -1379,24 +1380,42 @@ static void DrawClassMenuPanels()
     const float s0 = flip ? 0.0f : 1.0f; // far-left sample
     const float s1 = flip ? 1.0f : 0.0f; // meets-the-body sample
 
-    // v70: native chamfered left end. The fade strip stops capW short of
-    // pxL; a button_highlight_end cap (its texture alpha is the chamfer)
-    // fills that gap, so the bottom-left reaches pxL while the top-left
-    // stays cut back -- the ~8px top-left chamfer measured off the X360
-    // shot. s/t mirroring are dvars: orientation is a GSC redeploy, not a
-    // rebuild. s_capMat is resolved by the header-cap blit path already;
-    // resolve here too for the on-top fallback path.
+    // v80: native row bars cut the TOP-RIGHT corner at the text (right) end and
+    // fade out on the LEFT (far end) -- the mirror of the header's far-end cut.
+    // The chamfer cap (button_highlight_end, the same donor native uses) sits on
+    // the RIGHT so it caps the SOLID part of the bar (no floating tab on the
+    // faded end); the body is pulled back by capW so the cap forms the chamfered
+    // end, and the fade strip fills the whole left portion. classmenu_capright
+    // toggles the side; caps/capt still orient which corner the chamfer cuts.
     const bool  capOn = (classmenu_cap == nullptr) || classmenu_cap->current.enabled;
     if (capOn && s_capMat == 0)
         s_capMat = ResolveMaterialStrict("button_highlight_end");
     const float capW  = (capOn && s_capMat != 0)
         ? (((classmenu_capw != nullptr) ? classmenu_capw->current.integer : 5) / 1000.0f * scrW) : 0.0f;
+    const bool  capRight = (classmenu_capright == nullptr) || classmenu_capright->current.enabled;
     const bool  capSFlip = (classmenu_caps == nullptr) || classmenu_caps->current.enabled;
     const bool  capTFlip = (classmenu_capt != nullptr) && classmenu_capt->current.enabled;
     const float cs0 = capSFlip ? 1.0f : 0.0f, cs1 = capSFlip ? 0.0f : 1.0f;
     const float ct0 = capTFlip ? 1.0f : 0.0f, ct1 = capTFlip ? 0.0f : 1.0f;
-    const float fadeLeft = pxL + capW;        // fade strip stops short for the cap
-    const float fadeWc   = pxBody - fadeLeft; // adjusted fade width
+    // x-layout depends on which end carries the cap.
+    float capX, bodyX, bodyW, fadeX, fadeW;
+    if (capRight)
+    {
+        capX  = pxR - capW;                 // cap at the right (text) end
+        bodyX = pxBody;
+        bodyW = (pxR - capW) - pxBody;       // body stops short for the cap
+        fadeX = pxL;                         // fade fills the whole left portion
+        fadeW = pxBody - pxL;
+    }
+    else
+    {
+        capX  = pxL;                         // legacy: cap at the left end
+        bodyX = pxBody;
+        bodyW = solidW;
+        fadeX = pxL + capW;
+        fadeW = pxBody - fadeX;
+    }
+    if (bodyW < 0.0f) bodyW = 0.0f;
 
     const float cr = ((classmenu_cr != nullptr) ? classmenu_cr->current.integer : 150) / 255.0f;
     const float cg = ((classmenu_cg != nullptr) ? classmenu_cg->current.integer : 165) / 255.0f;
@@ -1406,11 +1425,12 @@ static void DrawClassMenuPanels()
     {
         const float topY = pyT + i * pitch;
         col[3] = (i == idx) ? a1 : a0;
-        R_DrawStretchPic_fn(pxBody, topY, solidW, ph, 0.0f, 0.0f, 1.0f, 1.0f, col, s_whiteMat);
-        if (fadeWc > 0.5f)
-            R_DrawStretchPic_fn(fadeLeft, topY, fadeWc, ph, s0, 0.0f, s1, 1.0f, col, s_gradMat);
+        if (bodyW > 0.5f)
+            R_DrawStretchPic_fn(bodyX, topY, bodyW, ph, 0.0f, 0.0f, 1.0f, 1.0f, col, s_whiteMat);
+        if (fadeW > 0.5f)
+            R_DrawStretchPic_fn(fadeX, topY, fadeW, ph, s0, 0.0f, s1, 1.0f, col, s_gradMat);
         if (capW > 0.5f)
-            R_DrawStretchPic_fn(pxL, topY, capW, ph, cs0, ct0, cs1, ct1, col, s_capMat);
+            R_DrawStretchPic_fn(capX, topY, capW, ph, cs0, ct0, cs1, ct1, col, s_capMat);
     }
 
     if (sep >= 0 && sep < n - 1)
@@ -1418,9 +1438,10 @@ static void DrawClassMenuPanels()
         const float midY = pyT + sep * pitch + ph + (pitch - ph) * 0.5f;
         const float sh = (scrH / 480.0f) * 2.0f; // ~2 virtual px tall
         float scol[4] = {cr, cg, cb, a0 * 0.8f};
-        R_DrawStretchPic_fn(pxBody, midY - sh * 0.5f, solidW, sh, 0.0f, 0.0f, 1.0f, 1.0f, scol, s_whiteMat);
-        if (fadeWc > 0.5f)
-            R_DrawStretchPic_fn(fadeLeft, midY - sh * 0.5f, fadeWc, sh, s0, 0.0f, s1, 1.0f, scol, s_gradMat);
+        if (bodyW > 0.5f)
+            R_DrawStretchPic_fn(bodyX, midY - sh * 0.5f, bodyW, sh, 0.0f, 0.0f, 1.0f, 1.0f, scol, s_whiteMat);
+        if (fadeW > 0.5f)
+            R_DrawStretchPic_fn(fadeX, midY - sh * 0.5f, fadeW, sh, s0, 0.0f, s1, 1.0f, scol, s_gradMat);
     }
 }
 
@@ -1567,6 +1588,7 @@ cg::cg()
     classmenu_capw = Dvar_RegisterInt("classmenu_capw", 5, 0, 100, 0, "Chamfer cap width, per-mille of screen W");
     classmenu_caps = Dvar_RegisterBool("classmenu_caps", true, 0, "Chamfer cap: mirror horizontally (chamfer to the left)");
     classmenu_capt = Dvar_RegisterBool("classmenu_capt", false, 0, "Chamfer cap: mirror vertically (flip chamfer top/bottom)");
+    classmenu_capright = Dvar_RegisterBool("classmenu_capright", true, 0, "Chamfer cap on the right (text) end vs the left end");
     classmenu_cr = Dvar_RegisterInt("classmenu_cr", 150, 0, 255, 0, "Panel colour red (0-255)");
     classmenu_cg = Dvar_RegisterInt("classmenu_cg", 165, 0, 255, 0, "Panel colour green (0-255)");
     classmenu_cb = Dvar_RegisterInt("classmenu_cb", 175, 0, 255, 0, "Panel colour blue (0-255)");
@@ -1673,7 +1695,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 70, 0, 100, 0,
+    Dvar_RegisterInt("compass_hook_v", 80, 0, 100, 0,
         "Codxe compass hook build marker (v66 -- cap flip excludes the wide back-bar cap)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
