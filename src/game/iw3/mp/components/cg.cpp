@@ -18,6 +18,12 @@ dvar_s *cg_draw_player_info = nullptr;
 
 dvar_s *cg_no_muzzleflash = nullptr;
 
+// v65 class-menu cap chamfer flip. GSC sets this true while the GSC class
+// menu is open; the R_DrawStretchPic detour then V-flips every
+// button_highlight_end cap blit so its chamfer sits bottom-right (native
+// X360) instead of top-right. Body rects use "white" and are untouched.
+dvar_s *menu_capflip = nullptr;
+
 // v15 follow-spec compass test. 0x849f4288 (per-client, stride 0x14a0) is the
 // ACTIVE HUD MENU GROUP id, written by Function_821EF880 (puVar2[0x526]=group).
 // Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
@@ -241,6 +247,7 @@ dvar_s *caster_bar_h = nullptr;    // bar height
 dvar_s *caster_bar_cap = nullptr;  // cap piece width
 
 static int s_barBodyMat = 0;
+static int s_capMat = 0; // v65: button_highlight_end handle for the menu cap V-flip
 
 // v61 build fix: DrawCasterBars sits above the compass-section
 // definitions it uses. Forward-declare the resolver and hoist the
@@ -1312,6 +1319,27 @@ static bool s_inNativeBlit = false;
 void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t0, float s1, float t1,
                            const float *color, int material)
 {
+    // v65: class-menu cap chamfer V-flip. The GSC highlight/header/back caps
+    // use button_highlight_end with the chamfer on the texture's TOP edge;
+    // native X360 menus put it on the BOTTOM edge. GSC setshader cannot flip a
+    // hud shader (negative dims ignored on the hudelem path -- RETIRED), but
+    // every GSC hudelem shader blit reaches THIS function and it carries
+    // explicit texcoords. So when GSC says the class menu is open
+    // (menu_capflip) and the blit is the cap material, swap the two t values
+    // (t0<->t1) to mirror the texture vertically. s0/s1 untouched -> chamfer
+    // stays on the RIGHT, only moves top->bottom. Body rects use "white"
+    // (different material) and pass through unchanged.
+    if (!s_inNativeBlit && menu_capflip != nullptr && menu_capflip->current.enabled)
+    {
+        if (s_capMat == 0)
+            s_capMat = ResolveMaterialStrict("button_highlight_end");
+        if (s_capMat != 0 && material == s_capMat)
+        {
+            R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t1, s1, t0, color, material);
+            return;
+        }
+    }
+
     if (!s_inNativeBlit && compass_native != nullptr && compass_native->current.enabled)
     {
         const int mapHandle = RegisterCompassMapMaterial();
@@ -1376,6 +1404,9 @@ cg::cg()
     // Muzzle flash toggle. Applied by nulling weaponDef->viewFlashEffect as data
     // from the OnCG_DrawActive event (no detour, no runtime code patch).
     cg_no_muzzleflash = Dvar_RegisterBool("cg_no_muzzleflash", false, 0, "Disable first-person muzzle flash");
+
+    menu_capflip = Dvar_RegisterBool("menu_capflip", false, 0,
+        "GSC: class menu open -> V-flip button_highlight_end caps (native bottom-right chamfer)");
 
     compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
@@ -1467,8 +1498,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 64, 0, 100, 0,
-        "Codxe compass hook build marker (v64 -- flat rectangle bars, caps retired)");
+    Dvar_RegisterInt("compass_hook_v", 65, 0, 100, 0,
+        "Codxe compass hook build marker (v65 -- class-menu cap chamfer V-flip)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1585,6 +1616,7 @@ cg::cg()
                     s_statFont = nullptr;   // v51
                     s_statFontIdx = -1;
                     s_barBodyMat = 0;   // v61: bar materials, same staleness
+                    s_capMat = 0;       // v65: cap material, same staleness
                 }
             }
 
