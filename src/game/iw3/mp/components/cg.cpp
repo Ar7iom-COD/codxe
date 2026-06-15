@@ -1373,7 +1373,6 @@ static void DrawClassMenuPanels()
     const float a1 = ((classmenu_a1 != nullptr) ? classmenu_a1->current.integer : 80) / 100.0f;
 
     const float solidW  = pw * (solidPct / 100.0f); // opaque body, right portion
-    const float fadeW   = pw - solidW;              // gradient strip, left portion
     const float pxL     = pxR - pw;                 // panel left edge
     const float pxBody  = pxR - solidW;             // solid left edge = fade right edge
     // fade strip: transparent at far-left, opaque where it meets the solid body.
