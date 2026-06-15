@@ -24,6 +24,24 @@ dvar_s *cg_no_muzzleflash = nullptr;
 // X360) instead of top-right. Body rects use "white" and are untouched.
 dvar_s *menu_capflip = nullptr;
 
+// v67 class-menu faded row panels (native look, stage 1). GSC sets
+// classmenu_panels while the class menu is open and publishes the selected
+// index / row count; the DLL draws per-row gradient_fadein bars. Geometry is
+// in GSC virtual 640x480 units (scaled by scaleVirtualToFull), all dvar-tunable
+// so layout is a GSC redeploy, not a DLL rebuild.
+dvar_s *classmenu_panels = nullptr;
+dvar_s *classmenu_idx = nullptr;
+dvar_s *classmenu_n = nullptr;
+dvar_s *classmenu_sep = nullptr;
+dvar_s *classmenu_px = nullptr;
+dvar_s *classmenu_pw = nullptr;
+dvar_s *classmenu_py = nullptr;
+dvar_s *classmenu_pitch = nullptr;
+dvar_s *classmenu_ph = nullptr;
+dvar_s *classmenu_fade = nullptr;
+dvar_s *classmenu_a0 = nullptr;
+dvar_s *classmenu_a1 = nullptr;
+
 // v15 follow-spec compass test. 0x849f4288 (per-client, stride 0x14a0) is the
 // ACTIVE HUD MENU GROUP id, written by Function_821EF880 (puVar2[0x526]=group).
 // Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
@@ -1293,6 +1311,76 @@ static void DrawNativeSpecCompass(float bx, float by, float bw, float bh)
 
 }
 
+// --- v67: class-menu faded row panels (stage 1) ------------------------------
+// Native CHOOSE-TEAM look: each row is a gradient_fadein bar (opaque toward the
+// text edge, fading off the other way), the selected row brighter, with a thin
+// separator after a configurable row. GSC publishes the live state via dvars;
+// geometry is GSC virtual 640x480 units scaled to full by scaleVirtualToFull.
+//
+// Stage 1 draws from OnCG_DrawActive, which runs AFTER the hud pass, so these
+// land ON TOP of the GSC row text -- hence the deliberately low default alpha so
+// the text still reads through. Stage 2 moves the draw behind the text by
+// piggybacking the menu's background blit in the R_DrawStretchPic detour.
+static int s_gradMat = 0;
+
+static void DrawClassMenuPanels()
+{
+    if (classmenu_panels == nullptr || !classmenu_panels->current.enabled)
+        return;
+
+    if (s_gradMat == 0)
+    {
+        const int g = ResolveMaterialStrict("gradient_fadein");
+        // white fallback: if the gradient is absent we still get solid panels,
+        // which at least confirms coords/selection/separator on the first deploy.
+        s_gradMat = (g != 0) ? g : s_whiteMat;
+    }
+    if (s_gradMat == 0)
+        return;
+
+    const float sx = scrPlaceFullUnsafe.scaleVirtualToFull[0];
+    const float sy = scrPlaceFullUnsafe.scaleVirtualToFull[1];
+
+    int n = (classmenu_n != nullptr) ? classmenu_n->current.integer : 7;
+    if (n < 1) n = 1;
+    if (n > 16) n = 16;
+    const int idx = (classmenu_idx != nullptr) ? classmenu_idx->current.integer : -1;
+    const int sep = (classmenu_sep != nullptr) ? classmenu_sep->current.integer : 4;
+    const float px = (float)((classmenu_px != nullptr) ? classmenu_px->current.integer : 300);
+    const float pw = (float)((classmenu_pw != nullptr) ? classmenu_pw->current.integer : 230);
+    const float py = (float)((classmenu_py != nullptr) ? classmenu_py->current.integer : 170);
+    const float pitch = (float)((classmenu_pitch != nullptr) ? classmenu_pitch->current.integer : 17);
+    const float ph = (float)((classmenu_ph != nullptr) ? classmenu_ph->current.integer : 15);
+    const bool flip = (classmenu_fade != nullptr) && classmenu_fade->current.enabled;
+    const float a0 = ((classmenu_a0 != nullptr) ? classmenu_a0->current.integer : 32) / 100.0f;
+    const float a1 = ((classmenu_a1 != nullptr) ? classmenu_a1->current.integer : 75) / 100.0f;
+
+    float col[4] = {0.62f, 0.62f, 0.66f, 1.0f};
+    // gradient_fadein fades L->R by default; swap s to make it opaque on the
+    // right (under right-aligned text). classmenu_fade flips it if it's reversed.
+    const float s0 = flip ? 0.0f : 1.0f;
+    const float s1 = flip ? 1.0f : 0.0f;
+    const float leftv = px - pw;
+
+    for (int i = 0; i < n; ++i)
+    {
+        const float topv = py + i * pitch;
+        col[3] = (i == idx) ? a1 : a0;
+        R_DrawStretchPic_fn(leftv * sx, topv * sy, pw * sx, ph * sy,
+                            s0, 0.0f, s1, 1.0f, col, s_gradMat);
+    }
+
+    if (sep >= 0 && sep < n - 1)
+    {
+        const float midv = py + sep * pitch + ph + (pitch - ph) * 0.5f;
+        const float sepHv = 2.0f;
+        const float sepWv = pw * 0.65f;
+        float scol[4] = {0.62f, 0.62f, 0.66f, a0 * 0.8f};
+        R_DrawStretchPic_fn((px - sepWv) * sx, (midv - sepHv * 0.5f) * sy,
+                            sepWv * sx, sepHv * sy, s0, 0.0f, s1, 1.0f, scol, s_gradMat);
+    }
+}
+
 // --- v24: R_DrawStretchPic detour -- the spec 2D-pass execution point --------
 //
 // Detour safety verified in Ghidra: 0x8216BAE8 opens
@@ -1329,11 +1417,18 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
     // (t0<->t1) to mirror the texture vertically. s0/s1 untouched -> chamfer
     // stays on the RIGHT, only moves top->bottom. Body rects use "white"
     // (different material) and pass through unchanged.
+    //
+    // v66: only flip the SLIM/TALL caps (header 10x38, selection 8x26). The
+    // bottom Back-bar cap is WIDE (76x58) and flipping it inverted the bottom
+    // panel; excluding it (h > w*1.5 is false for the wide cap) leaves it in
+    // its original orientation. The test is scale-invariant -- the slim caps
+    // stay h/w ~3+ and the back cap stays h/w ~0.76 after any aspect scaling,
+    // so the 1.5 threshold sits safely in the gap.
     if (!s_inNativeBlit && menu_capflip != nullptr && menu_capflip->current.enabled)
     {
         if (s_capMat == 0)
             s_capMat = ResolveMaterialStrict("button_highlight_end");
-        if (s_capMat != 0 && material == s_capMat)
+        if (s_capMat != 0 && material == s_capMat && h > w * 1.5f)
         {
             R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t1, s1, t0, color, material);
             return;
@@ -1407,6 +1502,22 @@ cg::cg()
 
     menu_capflip = Dvar_RegisterBool("menu_capflip", false, 0,
         "GSC: class menu open -> V-flip button_highlight_end caps (native bottom-right chamfer)");
+
+    // v67 class-menu faded row panels. classmenu_panels/idx/n are published by
+    // GSC; the rest are layout knobs (GSC virtual 640x480 units) so you can
+    // calibrate from a screenshot via a GSC redeploy, no DLL rebuild.
+    classmenu_panels = Dvar_RegisterBool("classmenu_panels", false, 0, "GSC: class menu open -> draw faded row panels");
+    classmenu_idx = Dvar_RegisterInt("classmenu_idx", -1, -1, 16, 0, "GSC: selected class row index");
+    classmenu_n = Dvar_RegisterInt("classmenu_n", 7, 1, 16, 0, "GSC: class row count");
+    classmenu_sep = Dvar_RegisterInt("classmenu_sep", 4, -1, 16, 0, "Separator after this row index (-1 none); 4 = after Secondary");
+    classmenu_px = Dvar_RegisterInt("classmenu_px", 300, 0, 640, 0, "Panel right edge x (virtual 640x480)");
+    classmenu_pw = Dvar_RegisterInt("classmenu_pw", 230, 10, 640, 0, "Panel width (virtual)");
+    classmenu_py = Dvar_RegisterInt("classmenu_py", 170, 0, 480, 0, "First-row panel top y (virtual)");
+    classmenu_pitch = Dvar_RegisterInt("classmenu_pitch", 17, 1, 100, 0, "Row pitch (virtual)");
+    classmenu_ph = Dvar_RegisterInt("classmenu_ph", 15, 1, 100, 0, "Panel height (virtual)");
+    classmenu_fade = Dvar_RegisterBool("classmenu_fade", false, 0, "Flip gradient_fadein horizontally if it fades the wrong way");
+    classmenu_a0 = Dvar_RegisterInt("classmenu_a0", 32, 0, 100, 0, "Panel alpha %, unselected rows");
+    classmenu_a1 = Dvar_RegisterInt("classmenu_a1", 75, 0, 100, 0, "Panel alpha %, selected row");
 
     compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
@@ -1498,8 +1609,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 65, 0, 100, 0,
-        "Codxe compass hook build marker (v65 -- class-menu cap chamfer V-flip)");
+    Dvar_RegisterInt("compass_hook_v", 67, 0, 100, 0,
+        "Codxe compass hook build marker (v66 -- cap flip excludes the wide back-bar cap)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1617,12 +1728,17 @@ cg::cg()
                     s_statFontIdx = -1;
                     s_barBodyMat = 0;   // v61: bar materials, same staleness
                     s_capMat = 0;       // v65: cap material, same staleness
+                    s_gradMat = 0;      // v67: class-menu gradient material
                 }
             }
 
             // v45: caster stat columns (gated inside on caster_stats
             // non-empty + no engine menu open).
             DrawCasterStats();
+            // v67: class-menu faded row panels (stage 1; on-top low-alpha,
+            // z-order moves behind the text in stage 2). Self-gates on
+            // classmenu_panels.
+            DrawClassMenuPanels();
             // v61: DrawCasterBars() MOVED to the R_DrawStretchPic detour.
             // Calling R_DrawStretchPic_fn from this frame tick is the
             // wrong render phase (broke the caster compass on-box, v60).
