@@ -1595,37 +1595,45 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
     {
         if (s_capMat == 0)
             s_capMat = ResolveMaterialStrict("button_highlight_end");
-        if (s_capMat != 0 && material == s_capMat && h > w * 1.5f)
+        // v83: route header vs footer cap by SCREEN POSITION, not aspect
+        // ratio. A clean shallow chamfer needs a TALL/NARROW cap -- the
+        // button_highlight_end ramp only renders a clean diagonal when tall,
+        // like the 10x75 header cap; a wide/short footer cap renders a near-
+        // vertical notch. But a tall/narrow footer cap is "slim" (h>1.5w), so
+        // the old aspect test mis-routed it into the header branch (the wrong
+        // flip, and the width-10 reversion bug). The header cap sits at the
+        // top of the screen and the footer cap at the bottom, so a mid-screen
+        // Y split separates them regardless of either cap's aspect. y is in
+        // real screen pixels here (same space DrawClassMenuPanels feeds).
+        if (s_capMat != 0 && material == s_capMat)
         {
-            R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t1, s1, t0, color, material);
-            // v71: the header cap is a GSC hudelem at sort -2 -- it blits
-            // BEFORE the sort-999 body text. Piggyback the class row panels
-            // here so they paint behind the text/(A) instead of over them
-            // (the OnCG_DrawActive draw is after the hud pass = on top).
-            // DrawClassMenuPanels uses the raw R_DrawStretchPic_fn pointer,
-            // so it does not re-enter this detour; the guard is belt-and-braces.
-            if (classmenu_behind != nullptr && classmenu_behind->current.enabled)
+            const float scrH = scrPlaceFullUnsafe.scaleVirtualToFull[1] * 480.0f;
+            const bool isFooter = (y > scrH * 0.6f);
+            if (isFooter)
             {
-                s_inNativeBlit = true;
-                DrawClassMenuPanels();
-                s_inNativeBlit = false;
+                const bool ft = (menu_footcap_t != nullptr) && menu_footcap_t->current.enabled;
+                const bool fs = (menu_footcap_s != nullptr) && menu_footcap_s->current.enabled;
+                const float fs0 = fs ? s1 : s0, fs1 = fs ? s0 : s1;
+                const float ft0 = ft ? t1 : t0, ft1 = ft ? t0 : t1;
+                R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, fs0, ft0, fs1, ft1, color, material);
+                return;
             }
-            return;
-        }
-        // Wide footer cap: GSC cannot flip a hud shader (negative dims are
-        // ignored on the hudelem path), so mirror the bottom-panel chamfer
-        // HERE. t-swap = vertical flip, s-swap = horizontal flip; both are
-        // dvar-gated so the footer curve can be dialed to mirror the header
-        // without another rebuild. Only the footer cap is a WIDE cap that
-        // reaches this detour (header cap is slim; row caps bypass it).
-        if (s_capMat != 0 && material == s_capMat && h <= w * 1.5f)
-        {
-            const bool ft = (menu_footcap_t != nullptr) && menu_footcap_t->current.enabled;
-            const bool fs = (menu_footcap_s != nullptr) && menu_footcap_s->current.enabled;
-            const float fs0 = fs ? s1 : s0, fs1 = fs ? s0 : s1;
-            const float ft0 = ft ? t1 : t0, ft1 = ft ? t0 : t1;
-            R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, fs0, ft0, fs1, ft1, color, material);
-            return;
+            if (h > w * 1.5f)
+            {
+                R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t1, s1, t0, color, material);
+                // v71: header cap is a GSC hudelem at sort -2 -- blits BEFORE
+                // the sort-999 body text. Piggyback the row panels here so they
+                // paint behind the text/(A). DrawClassMenuPanels uses the raw
+                // R_DrawStretchPic_fn pointer so it does not re-enter; guard is
+                // belt-and-braces.
+                if (classmenu_behind != nullptr && classmenu_behind->current.enabled)
+                {
+                    s_inNativeBlit = true;
+                    DrawClassMenuPanels();
+                    s_inNativeBlit = false;
+                }
+                return;
+            }
         }
     }
 
@@ -1830,8 +1838,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 82, 0, 100, 0,
-        "Codxe compass hook build marker (v81 -- native select-button glyph probe)");
+    Dvar_RegisterInt("compass_hook_v", 83, 0, 100, 0,
+        "Codxe compass hook build marker (v83 -- footer cap routed by screen Y, not aspect)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
