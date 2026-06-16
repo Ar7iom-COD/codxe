@@ -23,6 +23,8 @@ dvar_s *cg_no_muzzleflash = nullptr;
 // button_highlight_end cap blit so its chamfer sits bottom-right (native
 // X360) instead of top-right. Body rects use "white" and are untouched.
 dvar_s *menu_capflip = nullptr;
+dvar_s *menu_footcap_t = nullptr; // footer chamfer: vertical flip (t-swap)
+dvar_s *menu_footcap_s = nullptr; // footer chamfer: horizontal flip (s-swap)
 
 // v67 class-menu faded row panels (native look, stage 1). GSC sets
 // classmenu_panels while the class menu is open and publishes the selected
@@ -1610,6 +1612,21 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
             }
             return;
         }
+        // Wide footer cap: GSC cannot flip a hud shader (negative dims are
+        // ignored on the hudelem path), so mirror the bottom-panel chamfer
+        // HERE. t-swap = vertical flip, s-swap = horizontal flip; both are
+        // dvar-gated so the footer curve can be dialed to mirror the header
+        // without another rebuild. Only the footer cap is a WIDE cap that
+        // reaches this detour (header cap is slim; row caps bypass it).
+        if (s_capMat != 0 && material == s_capMat && h <= w * 1.5f)
+        {
+            const bool ft = (menu_footcap_t != nullptr) && menu_footcap_t->current.enabled;
+            const bool fs = (menu_footcap_s != nullptr) && menu_footcap_s->current.enabled;
+            const float fs0 = fs ? s1 : s0, fs1 = fs ? s0 : s1;
+            const float ft0 = ft ? t1 : t0, ft1 = ft ? t0 : t1;
+            R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, fs0, ft0, fs1, ft1, color, material);
+            return;
+        }
     }
 
     if (!s_inNativeBlit && compass_native != nullptr && compass_native->current.enabled)
@@ -1689,6 +1706,8 @@ cg::cg()
     classmenu_capw = Dvar_RegisterInt("classmenu_capw", 5, 0, 100, 0, "Chamfer cap width, per-mille of screen W");
     classmenu_caps = Dvar_RegisterBool("classmenu_caps", true, 0, "Chamfer cap: mirror horizontally (chamfer to the left)");
     classmenu_capt = Dvar_RegisterBool("classmenu_capt", false, 0, "Chamfer cap: mirror vertically (flip chamfer top/bottom)");
+    menu_footcap_t = Dvar_RegisterBool("menu_footcap_t", false, 0, "Footer chamfer: vertical flip (mirror header curve)");
+    menu_footcap_s = Dvar_RegisterBool("menu_footcap_s", false, 0, "Footer chamfer: horizontal flip");
     classmenu_capright = Dvar_RegisterBool("classmenu_capright", true, 0, "Chamfer cap on the right (text) end vs the left end");
     classmenu_cr = Dvar_RegisterInt("classmenu_cr", 150, 0, 255, 0, "Panel colour red (0-255)");
     classmenu_cg = Dvar_RegisterInt("classmenu_cg", 165, 0, 255, 0, "Panel colour green (0-255)");
@@ -1811,7 +1830,7 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 81, 0, 100, 0,
+    Dvar_RegisterInt("compass_hook_v", 82, 0, 100, 0,
         "Codxe compass hook build marker (v81 -- native select-button glyph probe)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
