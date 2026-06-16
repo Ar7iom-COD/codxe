@@ -52,6 +52,21 @@ dvar_s *classmenu_solid = nullptr;
 dvar_s *classmenu_a0 = nullptr;
 dvar_s *classmenu_a1 = nullptr;
 
+// v81 native select-button glyph probe. The GSC (A) used a binding glyph
+// ([{+gostand}]) / @PLATFORM_UI_SELECTBUTTON in a hudelem -- blank pre-game
+// because the binding-glyph path is wired only in the live CG input layer.
+// This draws the SAME native localized glyph string via R_AddCmdDrawText (the
+// DLL text path proven by the caster stat columns), bypassing that gating.
+// classmenu_glyph_dump prints the resolved bytes as hex so we can read exactly
+// what the glyph is and whether it resolves/renders in the dead state.
+dvar_s *classmenu_glyph = nullptr;
+dvar_s *classmenu_glyph_font = nullptr;
+dvar_s *classmenu_glyph_x = nullptr;
+dvar_s *classmenu_glyph_y = nullptr;
+dvar_s *classmenu_glyph_dy = nullptr;
+dvar_s *classmenu_glyph_scale = nullptr;
+dvar_s *classmenu_glyph_dump = nullptr;
+
 // v15 follow-spec compass test. 0x849f4288 (per-client, stride 0x14a0) is the
 // ACTIVE HUD MENU GROUP id, written by Function_821EF880 (puVar2[0x526]=group).
 // Group 0 = in-game HUD (contains the compass ownerdraw), 7 = scoreboard,
@@ -1445,6 +1460,92 @@ static void DrawClassMenuPanels()
     }
 }
 
+// --- v81: native select-button glyph via the DLL text path -------------------
+static Font_s *s_glyphFont = nullptr;
+static int s_glyphFontIdx = -1;
+static const char *s_selGlyphStr = nullptr;
+
+static void DrawClassMenuSelGlyph()
+{
+    if (classmenu_glyph == nullptr || !classmenu_glyph->current.enabled)
+        return;
+    if (classmenu_panels == nullptr || !classmenu_panels->current.enabled)
+        return; // only while the GSC class menu is open
+
+    // Resolve the native localized glyph string once. Localized-string pointer
+    // (process-stable), so NOT flushed by the v46 4s material tick.
+    if (s_selGlyphStr == nullptr)
+    {
+        char ref[] = "PLATFORM_UI_SELECTBUTTON";
+        s_selGlyphStr = UI_SafeTranslateString(ref);
+    }
+    const char *g = (s_selGlyphStr != nullptr) ? s_selGlyphStr : "";
+
+    int fidx = (classmenu_glyph_font != nullptr) ? classmenu_glyph_font->current.integer : 5;
+    if (fidx < 0 || fidx > 6)
+        fidx = 5;
+    if (s_glyphFont == nullptr || fidx != s_glyphFontIdx)
+    {
+        s_glyphFont = R_RegisterFont(kCasterFonts[fidx]);
+        if (s_glyphFont == nullptr)
+            s_glyphFont = R_RegisterFont("fonts/consoleFont");
+        s_glyphFontIdx = fidx;
+    }
+    if (s_glyphFont == nullptr)
+        return;
+
+    const float x  = static_cast<float>((classmenu_glyph_x  != nullptr) ? classmenu_glyph_x->current.integer  : 360);
+    const float y0 = static_cast<float>((classmenu_glyph_y  != nullptr) ? classmenu_glyph_y->current.integer  : 300);
+    const float dy = static_cast<float>((classmenu_glyph_dy != nullptr) ? classmenu_glyph_dy->current.integer : 30);
+    const float sc = static_cast<float>(
+        (classmenu_glyph_scale != nullptr) ? classmenu_glyph_scale->current.integer : 100) / 100.0f;
+    const int idx = (classmenu_idx != nullptr) ? classmenu_idx->current.integer : -1;
+
+    static const float col[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (idx >= 0)
+    {
+        const float y = y0 + static_cast<float>(idx) * dy;
+        R_AddCmdDrawText(g, 32, s_glyphFont, x, y, sc, sc, 0.0f, col, 0);
+    }
+
+    // Diagnostic: dump the resolved glyph string bytes as hex, so we see what
+    // it actually is and whether it is non-empty in the dead state.
+    if (classmenu_glyph_dump != nullptr && classmenu_glyph_dump->current.enabled)
+    {
+        char info[160];
+        static const char hexd[] = "0123456789ABCDEF";
+        int o = 0;
+        const char *pre = "SELGLYPH len=";
+        for (int i = 0; pre[i] != '\0'; ++i)
+            info[o++] = pre[i];
+        int n = 0;
+        while (g[n] != '\0' && n < 16)
+            ++n;
+        if (n >= 10)
+        {
+            info[o++] = static_cast<char>('0' + n / 10);
+            info[o++] = static_cast<char>('0' + n % 10);
+        }
+        else
+        {
+            info[o++] = static_cast<char>('0' + n);
+        }
+        info[o++] = ' ';
+        info[o++] = ':';
+        for (int i = 0; i < n; ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(g[i]);
+            info[o++] = ' ';
+            info[o++] = hexd[(c >> 4) & 0xF];
+            info[o++] = hexd[c & 0xF];
+        }
+        info[o] = '\0';
+        static Font_s *dumpFont = R_RegisterFont("fonts/consoleFont");
+        static const float dcol[4] = {1.0f, 1.0f, 0.3f, 1.0f};
+        R_AddCmdDrawText(info, 160, dumpFont, 10.f, 190.f, 1.0f, 1.0f, 0.0f, dcol, 0);
+    }
+}
+
 // --- v24: R_DrawStretchPic detour -- the spec 2D-pass execution point --------
 //
 // Detour safety verified in Ghidra: 0x8216BAE8 opens
@@ -1605,6 +1706,21 @@ cg::cg()
     classmenu_a0 = Dvar_RegisterInt("classmenu_a0", 45, 0, 100, 0, "Panel alpha pct, unselected rows");
     classmenu_a1 = Dvar_RegisterInt("classmenu_a1", 80, 0, 100, 0, "Panel alpha pct, selected row");
 
+    classmenu_glyph = Dvar_RegisterBool("classmenu_glyph", true, 0,
+        "Draw the native select-button (A) glyph at the selected row via DLL text");
+    classmenu_glyph_font = Dvar_RegisterInt("classmenu_glyph_font", 5, 0, 6, 0,
+        "Select-glyph font: 0 console 1 small 2 normal 3 bold 4 objective 5 big 6 extraBig");
+    classmenu_glyph_x = Dvar_RegisterInt("classmenu_glyph_x", 360, -200, 2000, 0,
+        "Select-glyph x (R_AddCmdDrawText text space)");
+    classmenu_glyph_y = Dvar_RegisterInt("classmenu_glyph_y", 300, 0, 2000, 0,
+        "Select-glyph y of row 0 (text space)");
+    classmenu_glyph_dy = Dvar_RegisterInt("classmenu_glyph_dy", 30, 1, 200, 0,
+        "Select-glyph row pitch (text space)");
+    classmenu_glyph_scale = Dvar_RegisterInt("classmenu_glyph_scale", 100, 10, 400, 0,
+        "Select-glyph text scale, percent");
+    classmenu_glyph_dump = Dvar_RegisterBool("classmenu_glyph_dump", true, 0,
+        "Dump the resolved select-glyph string bytes as hex on-screen (probe)");
+
     compass_group0 = Dvar_RegisterBool("compass_group0", false, 0, "Retired: legacy follow-spec HUD group force (no-op)");
 
     // v24 native spec compass: enabled by GSC (caster_radar) while casting;
@@ -1695,8 +1811,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 80, 0, 100, 0,
-        "Codxe compass hook build marker (v66 -- cap flip excludes the wide back-bar cap)");
+    Dvar_RegisterInt("compass_hook_v", 81, 0, 100, 0,
+        "Codxe compass hook build marker (v81 -- native select-button glyph probe)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
@@ -1826,6 +1942,9 @@ cg::cg()
             // fallback, used only when classmenu_behind is off.
             if (classmenu_behind == nullptr || !classmenu_behind->current.enabled)
                 DrawClassMenuPanels();
+            // v81: native select-button glyph probe (command-add text, like the
+            // stat columns); self-gated on classmenu_glyph + classmenu_panels.
+            DrawClassMenuSelGlyph();
             // v61: DrawCasterBars() MOVED to the R_DrawStretchPic detour.
             // Calling R_DrawStretchPic_fn from this frame tick is the
             // wrong render phase (broke the caster compass on-box, v60).
