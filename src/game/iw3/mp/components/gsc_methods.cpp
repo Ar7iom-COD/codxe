@@ -187,6 +187,23 @@ void GScr_SetBrushModel(scr_entref_t entref)
     SV_LinkEntity(ent);
 }
 
+// Class-menu HUD ownership flags, read by cg.cpp's ApplyClassMenuHudHide.
+// GSC calls markmenuhud() right after creating each menu hudelem and
+// unmarkmenuhud() right before destroying it (slot-reuse safety).
+bool g_menuOwnedHud[1024] = {};
+
+void HECmd_MarkMenuHud(scr_entref_t entref)
+{
+    if (entref.entnum < 1024)
+        g_menuOwnedHud[entref.entnum] = true;
+}
+
+void HECmd_UnmarkMenuHud(scr_entref_t entref)
+{
+    if (entref.entnum < 1024)
+        g_menuOwnedHud[entref.entnum] = false;
+}
+
 gsc_methods::gsc_methods()
 {
     // Player entity methods
@@ -207,6 +224,10 @@ gsc_methods::gsc_methods()
     // Script entity methods
     Scr_AddMethod("clonebrushmodeltoscriptmodel", GScr_CloneBrushModelToScriptModel, 0);
     Scr_AddMethod("setbrushmodel", GScr_SetBrushModel, 0);
+
+    // Class-menu HUD ownership tags (paired with cg.cpp ApplyClassMenuHudHide)
+    Scr_AddMethod("markmenuhud", HECmd_MarkMenuHud, 0);
+    Scr_AddMethod("unmarkmenuhud", HECmd_UnmarkMenuHud, 0);
 }
 
 gsc_methods::~gsc_methods()
