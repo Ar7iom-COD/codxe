@@ -1703,7 +1703,7 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
 // --- Hide promod's level HUD while the GSC class menu is open ----------------
 //
 // promod's banner / "Match War" / strat / score are level hudelems
-// (newHudElem -> clientNum -1). Our own menu rows/footer are per-client
+// (newHudElem -> clientNum 0x3FF). Our own menu rows/footer are per-client
 // (self createFontString -> clientNum 0). So while classmenu_panels is set
 // (GSC raises it on menu open), we zero color.a on every IN-USE clientNum==-1
 // element and leave client 0 untouched -- promod's HUD precisely, none of ours.
@@ -1725,9 +1725,9 @@ static void ApplyClassMenuHudHide()
         for (int i = 0; i < 1024; ++i)
         {
             game_hudelem_s *elem = &g_hudelems[i];
-            if (elem->elem.text == 0)        // free / unused slot
+            if (elem->elem.type == 0)        // free / unused slot
                 continue;
-            if (elem->clientNum != -1)       // -1 = level elem (promod); 0 = our menu
+            if (elem->clientNum != 0x3FF)    // 0x3FF = broadcast/level (promod); 0 = our menu
                 continue;
             if (elem->elem.color.a == 0)     // already hidden by something else
                 continue;
@@ -1748,7 +1748,7 @@ static void ApplyClassMenuHudHide()
                 continue;
             game_hudelem_s *elem = &g_hudelems[i];
             // Only restore if the slot is still the same in-use element we hid.
-            if (elem->elem.text != 0 && elem->clientNum == -1 && elem->elem.color.a == 0)
+            if (elem->elem.type != 0 && elem->clientNum == 0x3FF && elem->elem.color.a == 0)
                 elem->elem.color.a = s_savedHudAlpha[i];
             s_savedHudAlphaValid[i] = false;
         }
