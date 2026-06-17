@@ -9,6 +9,9 @@ namespace mp
 {
 dvar_s *bg_bobIdle = nullptr;
 
+// Menu-owned hudelem slots (tagged by GSC markmenuhud); defined in gsc_hud_elem.cpp.
+extern bool g_menuOwnedHud[1024];
+
 dvar_s *cg_scoreboardLabel_Score = nullptr;
 dvar_s *cg_scoreboardLabel_Kills = nullptr;
 dvar_s *cg_scoreboardLabel_Assists = nullptr;
@@ -1727,7 +1730,9 @@ static void ApplyClassMenuHudHide()
             game_hudelem_s *elem = &g_hudelems[i];
             if (elem->elem.type == 0)        // free / unused slot
                 continue;
-            if (elem->clientNum != 0x3FF)    // 0x3FF = broadcast/level (promod); 0 = our menu
+            if (elem->clientNum != 0x3FF && elem->clientNum != 0)  // host-visible: level + per-client
+                continue;
+            if (g_menuOwnedHud[i])           // our own menu chrome -- never hide
                 continue;
             if (elem->elem.color.a == 0)     // already hidden by something else
                 continue;
@@ -1748,7 +1753,7 @@ static void ApplyClassMenuHudHide()
                 continue;
             game_hudelem_s *elem = &g_hudelems[i];
             // Only restore if the slot is still the same in-use element we hid.
-            if (elem->elem.type != 0 && elem->clientNum == 0x3FF && elem->elem.color.a == 0)
+            if (elem->elem.type != 0 && (elem->clientNum == 0x3FF || elem->clientNum == 0) && elem->elem.color.a == 0)
                 elem->elem.color.a = s_savedHudAlpha[i];
             s_savedHudAlphaValid[i] = false;
         }
