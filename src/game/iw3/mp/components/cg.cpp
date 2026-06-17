@@ -1700,6 +1700,62 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
     R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, s0, t0, s1, t1, color, material);
 }
 
+// --- Hide promod's level HUD while the GSC class menu is open ----------------
+//
+// promod's banner / "Match War" / strat / score are level hudelems
+// (newHudElem -> clientNum -1). Our own menu rows/footer are per-client
+// (self createFontString -> clientNum 0). So while classmenu_panels is set
+// (GSC raises it on menu open), we zero color.a on every IN-USE clientNum==-1
+// element and leave client 0 untouched -- promod's HUD precisely, none of ours.
+//
+// Same save/restore shape as ApplyMuzzleFlashState: promod sets these alphas
+// once, so a plain zero would stick forever. We stash the original alpha on
+// first hide and put it back on close. Pool + bound + in-use test lifted from
+// gsc_hud_elem.cpp (g_hudelems, 1024, elem.text != 0).
+static unsigned char s_savedHudAlpha[1024];
+static bool s_savedHudAlphaValid[1024];
+static bool s_hudHideApplied = false;
+
+static void ApplyClassMenuHudHide()
+{
+    const bool want = (classmenu_panels != nullptr) && classmenu_panels->current.enabled;
+
+    if (want)
+    {
+        for (int i = 0; i < 1024; ++i)
+        {
+            game_hudelem_s *elem = &g_hudelems[i];
+            if (elem->elem.text == 0)        // free / unused slot
+                continue;
+            if (elem->clientNum != -1)       // -1 = level elem (promod); 0 = our menu
+                continue;
+            if (elem->elem.color.a == 0)     // already hidden by something else
+                continue;
+            if (!s_savedHudAlphaValid[i])
+            {
+                s_savedHudAlpha[i] = elem->elem.color.a;
+                s_savedHudAlphaValid[i] = true;
+            }
+            elem->elem.color.a = 0;
+        }
+        s_hudHideApplied = true;
+    }
+    else if (s_hudHideApplied)
+    {
+        for (int i = 0; i < 1024; ++i)
+        {
+            if (!s_savedHudAlphaValid[i])
+                continue;
+            game_hudelem_s *elem = &g_hudelems[i];
+            // Only restore if the slot is still the same in-use element we hid.
+            if (elem->elem.text != 0 && elem->clientNum == -1 && elem->elem.color.a == 0)
+                elem->elem.color.a = s_savedHudAlpha[i];
+            s_savedHudAlphaValid[i] = false;
+        }
+        s_hudHideApplied = false;
+    }
+}
+
 cg::cg()
 {
     Menus_OpenByName_Detour = Detour(Menus_OpenByName, Menus_OpenByName_Hook);
