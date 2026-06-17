@@ -1896,6 +1896,7 @@ cg::cg()
         []()
         {
             ApplyMuzzleFlashState();
+            ApplyClassMenuHudHide();
             PublishCasterBounds();
 
             if (cg_draw_player_info->current.enabled)
