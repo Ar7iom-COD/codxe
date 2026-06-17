@@ -1,292 +1,236 @@
+// cod4x
+
 #include "pch.h"
-#include "gsc_functions.h"
 #include "g_scr_main.h"
-#include "events.h"
+#include "gsc_methods.h"
 
 namespace iw3
 {
 namespace mp
 {
 
-#define MAX_SCRIPT_FILEHANDLES 8
-
-struct ScriptFileHandle_t
+int CL_IsKeyPressed(const int localClientNum, const char *keyName)
 {
-    FILE *fh;
-    char filename[256];
-};
-
-static ScriptFileHandle_t s_scriptFiles[MAX_SCRIPT_FILEHANDLES];
-
-static std::string BuildScriptFilePath(const char *filename)
-{
-    // If already absolute, use as-is
-    if ((filename[0] && filename[1] == ':') || strncmp(filename, "game:\\", 6) == 0)
-        return filename;
-
-    std::string base = Config::GetModBasePath();
-    if (base.empty())
-    {
-        return filename;
-    }
-
-    // Normalize forward slashes to backslashes for Xbox 360
-    std::string rel(filename);
-    for (size_t i = 0; i < rel.size(); ++i)
-        if (rel[i] == '/')
-            rel[i] = '\\';
-
-    std::string result = base + "\\" + rel;
-    return result;
+    const int keynum = Key_StringToKeynum(keyName);
+    if (keynum >= 0)
+        return playerKeys[0].keys[keynum].down;
+    else
+        return 0;
 }
 
-static void CloseAllScriptFiles()
+void PlayerCmd_ButtonPressed(scr_entref_t entref)
 {
-    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
-    {
-        if (s_scriptFiles[i].fh)
-        {
-            fclose(s_scriptFiles[i].fh);
-            memset(&s_scriptFiles[i], 0, sizeof(ScriptFileHandle_t));
-        }
-    }
+    if (entref.classnum != 0)
+        Scr_ObjectError("not an entity");
+
+    const char *button = Scr_GetString(0);
+    if (!button || !*button)
+        Scr_Error("usage: <client> buttonPressed(<button name>)");
+
+    const int keypressed = CL_IsKeyPressed(0, button);
+    return Scr_AddInt(keypressed);
 }
 
-static void GScr_FS_TestFile()
+void PlayerCmd_SprintButtonPressed(scr_entref_t entref)
 {
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_SPRINT) != 0);
+}
+
+void PlayerCmd_LeanLeftButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_LEANLEFT) != 0);
+}
+
+void PlayerCmd_LeanRightButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_LEANRIGHT) != 0);
+}
+
+void PlayerCmd_JumpButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_JUMP) != 0);
+}
+
+void PlayerCmd_HoldBreathButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_HOLDBREATH) != 0);
+}
+
+void PlayerCmd_NightVisionButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    Scr_AddInt(((ent->client->buttonsSinceLastFrame | ent->client->buttons) & KEY_MASK_NIGHTVISION) != 0);
+}
+
+void PlayerCmd_ForwardButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    const client_t *cl = &svsHeader->clients[ent->s.number];
+
+    Scr_AddInt(cl->lastUsercmd.forwardmove > 0);
+}
+
+void PlayerCmd_BackButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    const client_t *cl = &svsHeader->clients[ent->s.number];
+
+    Scr_AddInt(cl->lastUsercmd.forwardmove < 0);
+}
+
+void PlayerCmd_LeftButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    const client_t *cl = &svsHeader->clients[ent->s.number];
+
+    Scr_AddInt(cl->lastUsercmd.rightmove < 0);
+}
+
+void PlayerCmd_RightButtonPressed(scr_entref_t entref)
+{
+    const gentity_s *ent = GetPlayerEntity(entref);
+    const client_t *cl = &svsHeader->clients[ent->s.number];
+
+    Scr_AddInt(cl->lastUsercmd.rightmove > 0);
+}
+
+void PlayerCmd_SetVelocity(scr_entref_t entref)
+{
+    gentity_s *ent = GetPlayerEntity(entref);
+
     if (Scr_GetNumParam() != 1)
-        Scr_Error("Usage: fs_testfile(<filename>)");
+        Scr_Error("Usage: <client> SetVelocity( vec3 )\n");
 
-    const char *filename = Scr_GetString(0);
-    std::string fullpath = BuildScriptFilePath(filename);
-    FILE *f = fopen(fullpath.c_str(), "r");
-    if (f)
+    float velocity[3] = {0};
+
+    Scr_GetVector(0, velocity);
+
+    ent->client->ps.velocity[0] = velocity[0];
+    ent->client->ps.velocity[1] = velocity[1];
+    ent->client->ps.velocity[2] = velocity[2];
+}
+
+void PlayerCmd_SetStance(scr_entref_t entref)
+{
+    gentity_s *ent = GetPlayerEntity(entref);
+
+    if (Scr_GetNumParam() != 1)
+        Scr_Error("usage: <client> SetStance( <stance> )\n");
+
+    const char *stanceStr = Scr_GetString(0);
+
+    int event = -1;
+    int newPmFlags = ent->client->ps.pm_flags;
+
+    if (!I_stricmp(stanceStr, "stand"))
     {
-        fclose(f);
-        Scr_AddInt(1);
+        event = EV_STANCE_FORCE_STAND;
+        newPmFlags = (newPmFlags & ~0x3) | CL_STANCE_STAND;
+    }
+    else if (!I_stricmp(stanceStr, "crouch"))
+    {
+        event = EV_STANCE_FORCE_CROUCH;
+        newPmFlags = (newPmFlags & ~0x3) | CL_STANCE_CROUCH;
+    }
+    else if (!I_stricmp(stanceStr, "prone"))
+    {
+        event = EV_STANCE_FORCE_PRONE;
+        newPmFlags = (newPmFlags & ~0x3) | CL_STANCE_PRONE;
     }
     else
     {
-        Scr_AddInt(0);
+        Scr_ParamError(0, "stance must be 'stand', 'crouch', or 'prone'");
     }
+
+    // Update server-side stance flags
+    ent->client->ps.pm_flags = newPmFlags;
+
+    // Send event to client to sync stance visually
+    G_AddEvent(ent, event, 0);
 }
 
-static void GScr_FS_FOpen()
+void GScr_CloneBrushModelToScriptModel(scr_entref_t entref)
 {
-    if (Scr_GetNumParam() != 2)
-        Scr_Error("Usage: fs_fopen(<filename>, <mode>)");
+    gentity_s *scriptEnt = GetEntity(entref);
+    gentity_s *brushEnt = Scr_GetEntity(0);
 
-    const char *filename = Scr_GetString(0);
-    const char *mode_str = Scr_GetString(1);
-    const char *fmode;
-
-    if (!stricmp(mode_str, "read"))
-        fmode = "rt";
-    else if (!stricmp(mode_str, "write"))
-        fmode = "wt";
-    else if (!stricmp(mode_str, "append"))
-        fmode = "at";
-    else
-    {
-        Scr_Error("fs_fopen: invalid mode. Valid modes are: read, write, append");
-        return;
-    }
-
-    std::string fullpath = BuildScriptFilePath(filename);
-
-    // Create parent directories for write/append modes
-    if (fmode[0] == 'w' || fmode[0] == 'a')
-    {
-        char dirpath[256];
-        strncpy(dirpath, fullpath.c_str(), sizeof(dirpath) - 1);
-        dirpath[sizeof(dirpath) - 1] = '\0';
-        char *last_slash = strrchr(dirpath, '\\');
-        if (last_slash)
-        {
-            *last_slash = '\0';
-            filesystem::create_nested_dirs(dirpath);
-        }
-    }
-
-    for (int i = 0; i < MAX_SCRIPT_FILEHANDLES; ++i)
-    {
-        if (!s_scriptFiles[i].fh)
-        {
-            s_scriptFiles[i].fh = fopen(fullpath.c_str(), fmode);
-            if (!s_scriptFiles[i].fh)
-            {
-                Scr_AddInt(0);
-                return;
-            }
-            strncpy(s_scriptFiles[i].filename, filename, sizeof(s_scriptFiles[i].filename) - 1);
-            Scr_AddInt(i + 1);
-            return;
-        }
-    }
-
-    Scr_Error("fs_fopen: exceeded maximum open file handles");
+    SV_UnlinkEntity(scriptEnt);
+    scriptEnt->s.index = brushEnt->s.index;
+    int contents = scriptEnt->r.contents;
+    SV_SetBrushModel(scriptEnt);
+    scriptEnt->r.contents |= contents;
+    SV_LinkEntity(scriptEnt);
 }
 
-static void GScr_FS_FClose()
+void GScr_SetBrushModel(scr_entref_t entref)
 {
     if (Scr_GetNumParam() != 1)
-        Scr_Error("Usage: fs_fclose(<filehandle>)");
+        Scr_Error("usage: <entity> SetBrushModel( <index> )\n");
 
-    int fh = Scr_GetInt(0);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_fclose: invalid filehandle");
+    gentity_s *ent = GetEntity(entref);
+    const int index = Scr_GetInt(0);
 
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (slot.fh)
+    if (index < 0 || (unsigned int)index >= cm->numSubModels)
     {
-        fclose(slot.fh);
-        memset(&slot, 0, sizeof(ScriptFileHandle_t));
+        Scr_ParamError(0, "brush model index out of range");
     }
+
+    SV_UnlinkEntity(ent);
+    ent->s.index = index;
+
+    SV_SetBrushModel(ent);
+    SV_LinkEntity(ent);
 }
 
-static void GScr_FS_ReadLine()
+// Class-menu HUD ownership flags, read by cg.cpp's ApplyClassMenuHudHide.
+// GSC calls markmenuhud() right after creating each menu hudelem and
+// unmarkmenuhud() right before destroying it (slot-reuse safety).
+bool g_menuOwnedHud[1024] = {};
+
+void HECmd_MarkMenuHud(scr_entref_t entref)
 {
-    if (Scr_GetNumParam() != 1)
-        Scr_Error("Usage: fs_readline(<filehandle>)");
-
-    int fh = Scr_GetInt(0);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_readline: invalid filehandle");
-
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (!slot.fh)
-        Scr_Error("fs_readline: filehandle is not open");
-
-    char buffer[8192];
-    if (!fgets(buffer, sizeof(buffer), slot.fh))
-    {
-        Scr_AddUndefined();
-        return;
-    }
-
-    int len = strlen(buffer);
-    if (len > 0 && buffer[len - 1] == '\n')
-        buffer[len - 1] = '\0';
-
-    Scr_AddString(buffer);
+    if (entref.entnum < 1024)
+        g_menuOwnedHud[entref.entnum] = true;
 }
 
-static void GScr_FS_WriteLine()
+void HECmd_UnmarkMenuHud(scr_entref_t entref)
 {
-    if (Scr_GetNumParam() != 2)
-        Scr_Error("Usage: fs_writeline(<filehandle>, <data>)");
-
-    int fh = Scr_GetInt(0);
-    if (fh < 1 || fh > MAX_SCRIPT_FILEHANDLES)
-        Scr_Error("fs_writeline: invalid filehandle");
-
-    ScriptFileHandle_t &slot = s_scriptFiles[fh - 1];
-    if (!slot.fh)
-        Scr_Error("fs_writeline: filehandle is not open");
-
-    const char *data = Scr_GetString(1);
-    if (fprintf(slot.fh, "%s\n", data) < 0)
-    {
-        Scr_AddInt(0);
-        return;
-    }
-
-    Scr_AddInt(1);
+    if (entref.entnum < 1024)
+        g_menuOwnedHud[entref.entnum] = false;
 }
-/**
- * Checks if a 3D point is contained within an axis-aligned bounding box
- */
-bool IsPointInBounds(const float mins[3], const float maxs[3], const float point[3])
+
+gsc_methods::gsc_methods()
 {
-    return (point[0] >= mins[0] && point[0] <= maxs[0]) && (point[1] >= mins[1] && point[1] <= maxs[1]) &&
-           (point[2] >= mins[2] && point[2] <= maxs[2]);
+    // Player entity methods
+    Scr_AddMethod("buttonpressed", PlayerCmd_ButtonPressed, 0); // Host-only
+    Scr_AddMethod("sprintbreathbuttonpressed", PlayerCmd_SprintButtonPressed, 0);
+    Scr_AddMethod("leanleftbuttonpressed", PlayerCmd_LeanLeftButtonPressed, 0);
+    Scr_AddMethod("leanrightbuttonpressed", PlayerCmd_LeanRightButtonPressed, 0);
+    Scr_AddMethod("jumpbuttonpressed", PlayerCmd_JumpButtonPressed, 0);
+    Scr_AddMethod("holdbreathbuttonpressed", PlayerCmd_HoldBreathButtonPressed, 0);
+    Scr_AddMethod("nightvisionbuttonpressed", PlayerCmd_NightVisionButtonPressed, 0);
+    Scr_AddMethod("forwardbuttonpressed", PlayerCmd_ForwardButtonPressed, 0);
+    Scr_AddMethod("backbuttonpressed", PlayerCmd_BackButtonPressed, 0);
+    Scr_AddMethod("leftbuttonpressed", PlayerCmd_LeftButtonPressed, 0);
+    Scr_AddMethod("rightbuttonpressed", PlayerCmd_RightButtonPressed, 0);
+    Scr_AddMethod("setvelocity", PlayerCmd_SetVelocity, 0);
+    Scr_AddMethod("setstance", PlayerCmd_SetStance, 0);
+
+    // Script entity methods
+    Scr_AddMethod("clonebrushmodeltoscriptmodel", GScr_CloneBrushModelToScriptModel, 0);
+    Scr_AddMethod("setbrushmodel", GScr_SetBrushModel, 0);
+
+    // Class-menu HUD ownership tags (paired with cg.cpp ApplyClassMenuHudHide)
+    Scr_AddMethod("markmenuhud", HECmd_MarkMenuHud, 0);
+    Scr_AddMethod("unmarkmenuhud", HECmd_UnmarkMenuHud, 0);
 }
 
-void GSCrGetPlayerclipBrushesContainingPoint()
-{
-    float point[3] = {0};
-    Scr_GetVector(0, point);
-
-    std::vector<int> brushIndices;
-    for (int i = 0; i < cm->numBrushes; ++i)
-    {
-        auto &brush = cm->brushes[i];
-        if (brush.contents & CONTENTS_PLAYERCLIP && IsPointInBounds(brush.mins, brush.maxs, point))
-            brushIndices.push_back(i);
-    }
-
-    Scr_MakeArray();
-    for (size_t i = 0; i < brushIndices.size(); ++i)
-    {
-        Scr_AddInt(brushIndices[i]);
-        Scr_AddArray();
-    }
-}
-
-void GScr_CbufAddText()
-{
-    if (Scr_GetNumParam() != 1)
-    {
-        Scr_Error("Usage: exec(<string>)\n");
-    }
-    // VM strings are null-terminated, so no need to manually terminate
-    // the string here.
-    const char *text = Scr_GetString(0);
-    Cbuf_AddText(0, text);
-}
-
-void Scr_IsArray_f()
-{
-    if (Scr_GetNumParam() != 1)
-    {
-        Scr_Error("usage: isArray(<variable>)");
-        return;
-    }
-
-    Scr_AddInt(Scr_GetType(0) == 1);
-}
-
-void GScr_Float()
-{
-    if (Scr_GetNumParam() != 1)
-    {
-        Scr_Error("Usage: floatVal = float(<float, int, bool or string>);");
-        return;
-    }
-
-    int varType = Scr_GetType(0);
-    if (varType == VAR_FLOAT)
-        Scr_AddFloat(Scr_GetFloat(0));
-    else if (varType == VAR_INTEGER)
-        Scr_AddFloat(1.0f * Scr_GetInt(0));
-    else if (varType == VAR_STRING)
-    {
-        const char *strFloat = Scr_GetString(0);
-        double result = 0.0;
-        if (isdigit(strFloat[0]) || (strFloat[0] == '-' && isdigit(strFloat[1])))
-            result = atof(strFloat);
-        Scr_AddFloat((float)result);
-    }
-    else
-        Scr_ParamError(0, va("cannot cast %s to float", var_typename[varType]));
-}
-
-gsc_functions::gsc_functions()
-{
-    Scr_AddFunction("exec", GScr_CbufAddText, 0);
-    Scr_AddFunction("getplayerclipbrushescontainingpoint", GSCrGetPlayerclipBrushesContainingPoint, 0);
-    Scr_AddFunction("fs_testfile", GScr_FS_TestFile, 0);
-    Scr_AddFunction("fs_fopen", GScr_FS_FOpen, 0);
-    Scr_AddFunction("fs_fclose", GScr_FS_FClose, 0);
-    Scr_AddFunction("fs_readline", GScr_FS_ReadLine, 0);
-    Scr_AddFunction("fs_writeline", GScr_FS_WriteLine, 0);
-    Scr_AddFunction("isarray", Scr_IsArray_f, false);
-    Scr_AddFunction("float", GScr_Float, 0);
-
-    Events::OnVMShutdown(CloseAllScriptFiles);
-}
-
-gsc_functions::~gsc_functions()
+gsc_methods::~gsc_methods()
 {
 }
 } // namespace mp
