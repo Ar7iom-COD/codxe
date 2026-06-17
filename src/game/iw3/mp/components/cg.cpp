@@ -1611,12 +1611,45 @@ void R_DrawStretchPic_Hook(float x, float y, float w, float h, float s0, float t
             const bool isFooter = (y > scrH * 0.6f);
             if (isFooter)
             {
-                const bool ft = (menu_footcap_t != nullptr) && menu_footcap_t->current.enabled;
-                const bool fs = (menu_footcap_s != nullptr) && menu_footcap_s->current.enabled;
-                const float fs0 = fs ? s1 : s0, fs1 = fs ? s0 : s1;
-                const float ft0 = ft ? t1 : t0, ft1 = ft ? t0 : t1;
-                R_DrawStretchPic_Detour.GetOriginal<R_DrawStretchPic_fn_t>()(x, y, w, h, fs0, ft0, fs1, ft1, color, material);
-                return;
+                // v84: button_highlight_end only renders a clean chamfer when
+                // tall/narrow; a shallow footer ramp needs a WIDE cap, which
+                // collapses the texture into the notch (the long-standing
+                // footer-shape bug). So drop the texture here and draw the
+                // diagonal as a SOLID triangle via R_DrawRotQuad (the same
+                // rotated-quad drawer the compass arrows use) -- clean at any
+                // angle. The cap hudelem rect (x,y,w,h) is the ramp box: full
+                // height at the lip end (left), descending to the base over w;
+                // angle = atan(h/w), set by the GSC cap width. menu_footcap_t
+                // flips the ramp vertically (down-ramp default vs up-ramp).
+                if (s_whiteMat == 0)
+                    s_whiteMat = R_RegisterMaterial_fn(4, "white");
+                if (s_whiteMat != 0)
+                {
+                    const bool flipV = (menu_footcap_t != nullptr) && menu_footcap_t->current.enabled;
+                    // Triangle as a degenerate quad: the 4th corner repeats the
+                    // 3rd so the quad collapses to one triangle whether the
+                    // engine fans (0,1,2)+(0,2,3) or strips (0,1,2)+(1,2,3) it.
+                    // Winding matches DrawNativeArrow (proven to render).
+                    float c[8];
+                    if (!flipV)
+                    {
+                        // down-ramp: top descends to the right (cut top-right).
+                        c[0] = x;     c[1] = y;         // TL
+                        c[2] = x + w; c[3] = y + h;     // BR
+                        c[4] = x;     c[5] = y + h;     // BL
+                        c[6] = x;     c[7] = y + h;     // BL (repeat -> triangle)
+                    }
+                    else
+                    {
+                        // up-ramp: bottom rises to the right (cut bottom-right).
+                        c[0] = x;     c[1] = y;         // TL
+                        c[2] = x + w; c[3] = y;         // TR
+                        c[4] = x;     c[5] = y + h;     // BL
+                        c[6] = x;     c[7] = y + h;     // BL (repeat -> triangle)
+                    }
+                    R_DrawRotQuad_fn(c, color, s_whiteMat);
+                }
+                return; // texture cap suppressed
             }
             if (h > w * 1.5f)
             {
@@ -1714,8 +1747,8 @@ cg::cg()
     classmenu_capw = Dvar_RegisterInt("classmenu_capw", 5, 0, 100, 0, "Chamfer cap width, per-mille of screen W");
     classmenu_caps = Dvar_RegisterBool("classmenu_caps", true, 0, "Chamfer cap: mirror horizontally (chamfer to the left)");
     classmenu_capt = Dvar_RegisterBool("classmenu_capt", false, 0, "Chamfer cap: mirror vertically (flip chamfer top/bottom)");
-    menu_footcap_t = Dvar_RegisterBool("menu_footcap_t", false, 0, "Footer chamfer: vertical flip (mirror header curve)");
-    menu_footcap_s = Dvar_RegisterBool("menu_footcap_s", false, 0, "Footer chamfer: horizontal flip");
+    menu_footcap_t = Dvar_RegisterBool("menu_footcap_t", false, 0, "Footer ramp (v84 triangle): 0 = down-ramp (cut top-right), 1 = up-ramp");
+    menu_footcap_s = Dvar_RegisterBool("menu_footcap_s", false, 0, "Footer cap: unused with the v84 solid-triangle ramp");
     classmenu_capright = Dvar_RegisterBool("classmenu_capright", true, 0, "Chamfer cap on the right (text) end vs the left end");
     classmenu_cr = Dvar_RegisterInt("classmenu_cr", 150, 0, 255, 0, "Panel colour red (0-255)");
     classmenu_cg = Dvar_RegisterInt("classmenu_cg", 165, 0, 255, 0, "Panel colour green (0-255)");
@@ -1838,8 +1871,8 @@ cg::cg()
 
     // Build marker -- proves this cg.cpp compiled into the running codxe DLL.
     // GSC gates compass_native enablement on this being >= 24.
-    Dvar_RegisterInt("compass_hook_v", 83, 0, 100, 0,
-        "Codxe compass hook build marker (v83 -- footer cap routed by screen Y, not aspect)");
+    Dvar_RegisterInt("compass_hook_v", 84, 0, 100, 0,
+        "Codxe compass hook build marker (v84 -- footer cap is a solid triangle via R_DrawRotQuad)");
 
     UI_SafeTranslateString_Detour = Detour(UI_SafeTranslateString, UI_SafeTranslateString_Hook);
     UI_SafeTranslateString_Detour.Install();
